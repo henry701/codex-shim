@@ -52,6 +52,10 @@ _FALLBACK_MCP_URLS: dict[str, str] = {
 
 _CONFIG_CACHE: dict[str, Any] | None = None
 
+_DISCOVERY_CACHE: dict[str, tuple[float, list[dict[str, Any]]]] = {}
+_DISCOVERY_TTL_SECONDS = 300.0
+_DISCOVERY_ERROR_TTL_SECONDS = 30.0
+
 
 def _config_path() -> Path:
     return Path(os.environ.get("CODEX_CONFIG_PATH") or Path.home() / ".codex" / "config.toml")
@@ -139,6 +143,74 @@ def known_mcp_servers() -> list[str]:
     return list({*urls.keys(), *_FALLBACK_MCP_URLS.keys()})
 
 
+def _iter_server_urls() -> list[tuple[str, str]]:
+    result: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for name, url in _read_codex_mcp_servers().items():
+        if name in seen or not isinstance(url, str) or not url:
+            continue
+        seen.add(name)
+        result.append((name, url))
+    for name, url in _FALLBACK_MCP_URLS.items():
+        if name in seen:
+            continue
+        seen.add(name)
+        result.append((name, url))
+    return result
+
+
+def invalidate_discovery_cache() -> None:
+    _DISCOVERY_CACHE.clear()
+
+
+async def pre_discover_mcp_tools(force: bool = False) -> list[dict[str, Any]]:
+    import time
+
+    now = time.time()
+    if not force:
+        cached = _DISCOVERY_CACHE.get("__tools__")
+        if cached is not None:
+            cached_at, cached_tools = cached
+            if cached_tools and now - cached_at < _DISCOVERY_TTL_SECONDS:
+                return cached_tools
+            if not cached_tools and now - cached_at < _DISCOVERY_ERROR_TTL_SECONDS:
+                return []
+
+    all_tools: list[dict[str, Any]] = []
+    for server_name, url in _iter_server_urls():
+        try:
+            tools = await call_mcp_tools_list(url)
+        except Exception:
+            continue
+        for tool in tools:
+            if not isinstance(tool, dict):
+                continue
+            name = tool.get("name", "")
+            if not isinstance(name, str) or not name:
+                continue
+            if not name.startswith(f"{server_name}__"):
+                name = f"{server_name}__{name}"
+            description = tool.get("description", "")
+            if not isinstance(description, str):
+                description = ""
+            parameters = tool.get("inputSchema")
+            if not isinstance(parameters, dict):
+                parameters = {"type": "object", "properties": {}}
+            all_tools.append(
+                {
+                    "type": "function",
+                    "function": {
+                        "name": name,
+                        "description": description.strip()[:500],
+                        "parameters": parameters,
+                    },
+                }
+            )
+
+    _DISCOVERY_CACHE["__tools__"] = (now, all_tools)
+    return all_tools
+
+
 async def call_mcp_tools_list(url: str) -> list[dict[str, Any]]:
     body = {
         "jsonrpc": "2.0",
@@ -178,6 +250,93 @@ async def call_mcp_tools_list(url: str) -> list[dict[str, Any]]:
     except json.JSONDecodeError:
         return []
     return _extract_tools_from_jsonrpc(data) or []
+
+
+async def call_mcp_tool(url: str, tool_name: str, arguments: dict[str, Any]) -> str:
+    body = {
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "tools/call",
+        "params": {
+            "name": tool_name,
+            "arguments": arguments,
+        },
+    }
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/json, text/event-stream",
+    }
+    try:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as session:
+            async with session.post(url, json=body, headers=headers) as resp:
+                if resp.status >= 400:
+                    return json.dumps({"error": f"MCP server returned HTTP {resp.status}"})
+                text = await resp.text()
+    except (aiohttp.ClientError, TimeoutError, OSError) as exc:
+        return json.dumps({"error": f"MCP call failed: {exc}"})
+
+    payload_data: Any = None
+    for line in text.splitlines():
+        line = line.strip()
+        if not line.startswith("data:"):
+            continue
+        chunk = line[len("data:"):].strip()
+        if not chunk or chunk == "[DONE]":
+            continue
+        try:
+            payload_data = json.loads(chunk)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(payload_data, dict):
+            break
+    if payload_data is None:
+        try:
+            payload_data = json.loads(text)
+        except json.JSONDecodeError:
+            return json.dumps({"error": "MCP server returned non-JSON response", "raw": text[:500]})
+
+    return _format_mcp_tool_result(payload_data)
+
+
+def _format_mcp_tool_result(payload: Any) -> str:
+    if not isinstance(payload, dict):
+        return json.dumps({"error": "MCP response was not an object"})
+    if "error" in payload:
+        err = payload["error"]
+        if isinstance(err, dict):
+            message = err.get("message") or json.dumps(err)
+            code = err.get("code")
+            return json.dumps({"error": f"MCP error {code}: {message}"} if code is not None else {"error": message})
+        return json.dumps({"error": str(err)})
+    result = payload.get("result")
+    if not isinstance(result, dict):
+        return json.dumps(result)
+    content = result.get("content")
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            if isinstance(item, dict):
+                if item.get("type") == "text":
+                    parts.append(str(item.get("text", "")))
+                else:
+                    parts.append(json.dumps(item))
+        if parts:
+            return "\n".join(parts)
+    if "text" in result and isinstance(result["text"], str):
+        return result["text"]
+    return json.dumps(result)
+
+
+def is_mcp_tool_call(name: str) -> str | None:
+    if not isinstance(name, str) or not name.startswith("mcp__"):
+        return None
+    body = name[len("mcp__"):]
+    if "__" not in body:
+        return None
+    server, _, tool = body.partition("__")
+    if not server or not tool:
+        return None
+    return f"mcp__{server}"
 
 
 def _extract_tools_from_jsonrpc(data: Any) -> list[dict[str, Any]] | None:

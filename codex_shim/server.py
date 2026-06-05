@@ -205,7 +205,8 @@ class ShimServer:
             forwarded["model"] = route.model
             if "messages" in forwarded:
                 forwarded["messages"] = _normalize_roles(forwarded["messages"])
-            _inject_tool_search_if_mcp(forwarded)
+            discovered = await _pre_discover_if_mcp(forwarded)
+            _inject_tool_search_if_mcp(forwarded, discovered)
             return await self._post_openai_chat(request, route, forwarded, as_responses=False)
         if route.is_anthropic:
             forwarded = chat_to_anthropic(body, route.model, route.max_output_tokens)
@@ -237,7 +238,8 @@ class ShimServer:
             return await self._chatgpt_passthrough(request, body, response_model_override=model)
         route = self._route(body)
         if route.is_openai_chat:
-            forwarded = responses_to_chat(body, route.model)
+            discovered = await _pre_discover_if_mcp(body)
+            forwarded = responses_to_chat(body, route.model, discovered_mcp_tools=discovered)
             return await self._post_openai_chat(request, route, forwarded, as_responses=True)
         if route.is_anthropic:
             forwarded = responses_to_anthropic(body, route.model, route.max_output_tokens)
@@ -269,14 +271,15 @@ class ShimServer:
         route = self._route(body)
         compact_body = _compact_request_body(body, route.model)
         if route.is_openai_chat:
-            forwarded = responses_to_chat(compact_body, route.model)
+            discovered = await _pre_discover_if_mcp(body)
+            forwarded = responses_to_chat(compact_body, route.model, discovered_mcp_tools=discovered)
             forwarded["stream"] = False
             response = await self._post_openai_chat(request, route, forwarded, as_responses=True)
             return await _as_compact_response(response, route.slug)
         if route.is_anthropic:
             forwarded = responses_to_anthropic(compact_body, route.model, route.max_output_tokens)
             forwarded["stream"] = False
-            response = await self._post_anthropic(request, route, forwarded, as_responses=True)
+            response = await self._post_openai_chat(request, route, forwarded, as_responses=True)
             return await _as_compact_response(response, route.slug)
         raise web.HTTPBadGateway(text=f"Unsupported model provider: {route.provider}")
 
@@ -449,15 +452,36 @@ class ShimServer:
         Lets the picker expose OpenAI GPT models (ChatGPT subscription) as
         first-class models alongside configured BYOK entries.
         """
+        requested = response_model_override or str(body.get("model") or "")
         auth_path = DEFAULT_CODEX_AUTH.expanduser()
         try:
             auth = json.loads(auth_path.read_text())
         except FileNotFoundError:
+            fallback = await self._maybe_passthrough_byok_fallback(
+                request,
+                body,
+                requested=requested,
+                response_slug=requested,
+                status=401,
+                detail="~/.codex/auth.json not found",
+            )
+            if fallback is not None:
+                return fallback
             raise web.HTTPUnauthorized(text="~/.codex/auth.json not found")
         tokens = auth.get("tokens") or {}
         access_token = tokens.get("access_token")
         account_id = tokens.get("account_id") or ""
         if not access_token:
+            fallback = await self._maybe_passthrough_byok_fallback(
+                request,
+                body,
+                requested=requested,
+                response_slug=requested,
+                status=401,
+                detail="auth.json has no access_token",
+            )
+            if fallback is not None:
+                return fallback
             raise web.HTTPUnauthorized(text="auth.json has no access_token")
         forwarded = _sanitize_chatgpt_passthrough_body(body)
         forwarded["model"] = upstream_model or CHATGPT_MODEL_SLUG
@@ -474,7 +498,21 @@ class ShimServer:
         async with ClientSession(timeout=self.timeout) as session:
             upstream = await session.post(url, json=forwarded, headers=headers)
             if upstream.status >= 400:
-                return await _error_response(upstream)
+                text = await upstream.text()
+                status = upstream.status
+                content_type = upstream.content_type or "text/plain"
+                upstream.release()
+                fallback = await self._maybe_passthrough_byok_fallback(
+                    request,
+                    body,
+                    requested=requested,
+                    response_slug=requested,
+                    status=status,
+                    detail=text,
+                )
+                if fallback is not None:
+                    return fallback
+                return web.Response(status=status, text=text, content_type=content_type)
             if not forwarded.get("stream"):
                 payload = await upstream.json(content_type=None)
                 _rewrite_response_model(payload, response_model_override)
@@ -513,15 +551,38 @@ class ShimServer:
         body: dict[str, Any],
         upstream_model: str | None = None,
     ) -> web.StreamResponse:
+        requested = str(body.get("model") or "")
         auth_path = DEFAULT_CODEX_AUTH.expanduser()
         try:
             auth = json.loads(auth_path.read_text())
         except FileNotFoundError:
+            fallback = await self._maybe_passthrough_byok_fallback(
+                request,
+                body,
+                requested=requested,
+                response_slug=requested,
+                status=401,
+                detail="~/.codex/auth.json not found",
+                compact=True,
+            )
+            if fallback is not None:
+                return fallback
             raise web.HTTPUnauthorized(text="~/.codex/auth.json not found")
         tokens = auth.get("tokens") or {}
         access_token = tokens.get("access_token")
         account_id = tokens.get("account_id") or ""
         if not access_token:
+            fallback = await self._maybe_passthrough_byok_fallback(
+                request,
+                body,
+                requested=requested,
+                response_slug=requested,
+                status=401,
+                detail="auth.json has no access_token",
+                compact=True,
+            )
+            if fallback is not None:
+                return fallback
             raise web.HTTPUnauthorized(text="auth.json has no access_token")
         forwarded = _sanitize_chatgpt_passthrough_body(body)
         original_model = str(forwarded.get("model") or "")
@@ -540,7 +601,22 @@ class ShimServer:
         async with ClientSession(timeout=self.timeout) as session:
             upstream = await session.post(url, json=forwarded, headers=headers)
             if upstream.status >= 400:
-                return await _error_response(upstream)
+                text = await upstream.text()
+                status = upstream.status
+                content_type = upstream.content_type or "text/plain"
+                upstream.release()
+                fallback = await self._maybe_passthrough_byok_fallback(
+                    request,
+                    body,
+                    requested=requested,
+                    response_slug=original_model or requested,
+                    status=status,
+                    detail=text,
+                    compact=True,
+                )
+                if fallback is not None:
+                    return fallback
+                return web.Response(status=status, text=text, content_type=content_type)
             payload = await upstream.json(content_type=None)
         _rewrite_response_model(payload, original_model or None)
         return web.json_response(payload)
@@ -724,26 +800,267 @@ class ShimServer:
             )
         return route
 
-    async def _post_openai_chat(
-        self, request: web.Request, route: ShimModel, body: dict[str, Any], as_responses: bool
+    def _passthrough_fallback_slug(self, requested: str) -> str | None:
+        return self.settings.passthrough_error_fallback().get(requested)
+
+    async def _dispatch_byok_responses(
+        self,
+        request: web.Request,
+        body: dict[str, Any],
+        *,
+        response_slug: str | None = None,
     ) -> web.StreamResponse:
+        route = self._route(body)
+        client_slug = response_slug or route.slug
+        if route.is_openai_chat:
+            discovered = await _pre_discover_if_mcp(body)
+            forwarded = responses_to_chat(body, route.model, discovered_mcp_tools=discovered)
+            return await self._post_openai_chat(
+                request, route, forwarded, as_responses=True, response_slug=client_slug
+            )
+        if route.is_anthropic:
+            forwarded = responses_to_anthropic(body, route.model, route.max_output_tokens)
+            return await self._post_anthropic(
+                request, route, forwarded, as_responses=True, response_slug=client_slug
+            )
+        raise web.HTTPBadGateway(text=f"Unsupported model provider: {route.provider}")
+
+    async def _dispatch_byok_compact_responses(
+        self,
+        request: web.Request,
+        body: dict[str, Any],
+        *,
+        response_slug: str | None = None,
+    ) -> web.StreamResponse:
+        route = self._route(body)
+        client_slug = response_slug or route.slug
+        compact_body = _compact_request_body(body, route.model)
+        if route.is_openai_chat:
+            discovered = await _pre_discover_if_mcp(body)
+            forwarded = responses_to_chat(compact_body, route.model, discovered_mcp_tools=discovered)
+            forwarded["stream"] = False
+            response = await self._post_openai_chat(
+                request, route, forwarded, as_responses=True, response_slug=client_slug
+            )
+            return await _as_compact_response(response, client_slug)
+        if route.is_anthropic:
+            forwarded = responses_to_anthropic(compact_body, route.model, route.max_output_tokens)
+            forwarded["stream"] = False
+            response = await self._post_anthropic(
+                request, route, forwarded, as_responses=True, response_slug=client_slug
+            )
+            return await _as_compact_response(response, client_slug)
+        raise web.HTTPBadGateway(text=f"Unsupported model provider: {route.provider}")
+
+    async def _maybe_passthrough_byok_fallback(
+        self,
+        request: web.Request,
+        body: dict[str, Any],
+        *,
+        requested: str,
+        response_slug: str,
+        status: int,
+        detail: str,
+        compact: bool = False,
+    ) -> web.StreamResponse | None:
+        fallback_slug = self._passthrough_fallback_slug(requested)
+        if not fallback_slug:
+            return None
+        print(
+            f"[fallback] {requested} chatgpt passthrough {status} -> {fallback_slug}: {detail[:200]}",
+            flush=True,
+        )
+        fallback_body = dict(body)
+        fallback_body["model"] = fallback_slug
+        try:
+            if compact:
+                return await self._dispatch_byok_compact_responses(
+                    request, fallback_body, response_slug=response_slug
+                )
+            return await self._dispatch_byok_responses(
+                request, fallback_body, response_slug=response_slug
+            )
+        except web.HTTPException as exc:
+            print(
+                f"[fallback] {requested} -> {fallback_slug} failed ({exc.status}): {exc.text[:200]}",
+                flush=True,
+            )
+            return None
+
+    async def _post_openai_chat(
+        self, request: web.Request, route: ShimModel, body: dict[str, Any], as_responses: bool,
+        *, response_slug: str | None = None,
+    ) -> web.StreamResponse:
+        client_slug = response_slug or route.slug
         url = _join_url(route.base_url, "/chat/completions")
-        headers = _openai_headers(route)
         _dump_debug_request(route.slug, url, body)
+        if body.get("stream"):
+            payload = await self._run_chat_loop(route, body)
+            if isinstance(payload, dict) and payload.get("error"):
+                return web.json_response(
+                    {"error": payload["error"]},
+                    status=502,
+                )
+            return await self._stream_chat_payload(
+                request, route, payload, as_responses, response_slug=client_slug
+            )
         async with ClientSession(timeout=self.timeout) as session:
-            upstream = await session.post(url, json=body, headers=headers)
+            upstream = await session.post(url, json=body, headers=_openai_headers(route))
             if upstream.status >= 400:
                 return await _error_response(upstream, slug=route.slug)
-            if body.get("stream"):
-                return await self._stream_openai_chat(
-                    request, upstream, route, as_responses, response_slug=client_slug
-                )
             payload = await upstream.json(content_type=None)
         if as_responses:
             response_payload = chat_completion_to_response(payload, client_slug)
             response_payload = await mcp_search.augment_response_with_tool_search(response_payload)
             return web.json_response(response_payload)
         return web.json_response(payload)
+
+    async def _run_chat_loop(
+        self, route: ShimModel, body: dict[str, Any], max_turns: int = 6
+    ) -> dict[str, Any]:
+        messages = list(body.get("messages", []))
+        chat_body = {k: v for k, v in body.items() if k != "stream"}
+        chat_body["stream"] = False
+        url = _join_url(route.base_url, "/chat/completions")
+        headers = _openai_headers(route)
+        async with ClientSession(timeout=self.timeout) as session:
+            for _ in range(max_turns):
+                turn_body = {**chat_body, "messages": messages}
+                upstream = await session.post(url, json=turn_body, headers=headers)
+                if upstream.status >= 400:
+                    text = await upstream.text()
+                    return {"error": f"upstream returned {upstream.status}: {text[:200]}"}
+                payload = await upstream.json(content_type=None)
+                tool_calls = self._extract_mcp_tool_calls(payload)
+                if not tool_calls:
+                    return payload
+                messages = await self._build_followup_messages(messages, payload, tool_calls)
+        return payload
+
+    @staticmethod
+    def _extract_mcp_tool_calls(payload: dict[str, Any]) -> list[tuple[dict[str, Any], str]]:
+        choice = (payload.get("choices") or [{}])[0]
+        message = choice.get("message") or {}
+        out: list[tuple[dict[str, Any], str]] = []
+        for tc in message.get("tool_calls") or []:
+            if not isinstance(tc, dict):
+                continue
+            name = (tc.get("function") or {}).get("name") or ""
+            server = mcp_search.is_mcp_tool_call(name)
+            if server:
+                out.append((tc, server))
+        return out
+
+    @staticmethod
+    async def _dispatch_one_mcp_call(
+        tc: dict[str, Any], server: str
+    ) -> str:
+        fn = tc.get("function") or {}
+        name = fn.get("name") or ""
+        args_str = fn.get("arguments", "{}") or "{}"
+        try:
+            args = json.loads(args_str) if isinstance(args_str, str) and args_str.strip() else {}
+            if not isinstance(args, dict):
+                args = {"_value": args}
+        except json.JSONDecodeError:
+            args = {"_raw": args_str}
+        tool = name[len(server) + 2:]
+        url = mcp_search.resolve_mcp_url(server)
+        if not url:
+            return json.dumps({"error": f"Unknown MCP server '{server}'"})
+        return await mcp_search.call_mcp_tool(url, tool, args)
+
+    @classmethod
+    async def _build_followup_messages(
+        cls,
+        messages: list[dict[str, Any]],
+        payload: dict[str, Any],
+        mcp_calls: list[tuple[dict[str, Any], str]],
+    ) -> list[dict[str, Any]]:
+        choice = (payload.get("choices") or [{}])[0]
+        message = choice.get("message") or {}
+        all_calls = list(message.get("tool_calls") or [])
+        mcp_ids = {tc.get("id") for tc, _ in mcp_calls}
+        assistant_msg: dict[str, Any] = {
+            "role": "assistant",
+            "content": message.get("content") or None,
+            "tool_calls": all_calls,
+        }
+        if message.get("reasoning_content"):
+            assistant_msg["reasoning_content"] = message["reasoning_content"]
+        new_messages = list(messages) + [assistant_msg]
+        for tc, server in mcp_calls:
+            result = await cls._dispatch_one_mcp_call(tc, server)
+            new_messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": tc.get("id"),
+                    "content": result,
+                }
+            )
+        for tc in all_calls:
+            if tc.get("id") in mcp_ids:
+                continue
+            name = (tc.get("function") or {}).get("name") or ""
+            new_messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": tc.get("id"),
+                    "content": json.dumps({"error": f"unsupported call: {name}"}),
+                }
+            )
+        return new_messages
+
+    async def _stream_chat_payload(
+        self,
+        request: web.Request,
+        route: ShimModel,
+        payload: dict[str, Any],
+        as_responses: bool,
+        *,
+        response_slug: str | None = None,
+    ) -> web.StreamResponse:
+        client_slug = response_slug or route.slug
+        response = _sse_response()
+        await response.prepare(request)
+        if as_responses:
+            state = ResponsesStreamState(client_slug)
+            await state.start(response)
+        try:
+            if as_responses:
+                choice = (payload.get("choices") or [{}])[0]
+                message = choice.get("message") or {}
+                fake_chunk = {
+                    "choices": [{"index": 0, "delta": message, "finish_reason": choice.get("finish_reason")}],
+                    "usage": payload.get("usage"),
+                }
+                await state.write_chat_delta(response, fake_chunk)
+            else:
+                chunk = {
+                    "id": payload.get("id", f"chatcmpl-{int(time.time() * 1000)}"),
+                    "object": "chat.completion.chunk",
+                    "created": payload.get("created", int(time.time())),
+                    "model": payload.get("model", client_slug),
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": (payload.get("choices") or [{}])[0].get("message") or {},
+                            "finish_reason": (payload.get("choices") or [{}])[0].get("finish_reason"),
+                        }
+                    ],
+                }
+                await _write_sse(response, chunk)
+            if as_responses:
+                await state.finish(response)
+            else:
+                await _safe_write(response, b"data: [DONE]\n\n")
+        except ClientDisconnected:
+            pass
+        try:
+            await response.write_eof()
+        except Exception:
+            pass
+        return response
 
     async def _post_anthropic(
         self, request: web.Request, route: ShimModel, body: dict[str, Any], as_responses: bool,
@@ -757,54 +1074,28 @@ class ShimServer:
             if upstream.status >= 400:
                 return await _error_response(upstream)
             if body.get("stream"):
-                return await self._stream_anthropic(request, upstream, route, as_responses)
+                return await self._stream_anthropic(
+                    request, upstream, route, as_responses, response_slug=client_slug
+                )
             payload = await upstream.json(content_type=None)
         if as_responses:
-            return web.json_response(anthropic_to_response(payload, route.slug))
-        return web.json_response(anthropic_to_chat_response(payload, route.slug))
-
-    async def _stream_openai_chat(
-        self, request: web.Request, upstream, route: ShimModel, as_responses: bool
-    ) -> web.StreamResponse:
-        response = _sse_response()
-        await response.prepare(request)
-        if as_responses:
-            state = ResponsesStreamState(route.slug)
-        try:
-            if as_responses:
-                await state.start(response)
-            async for line in _sse_lines(upstream):
-                if line == "[DONE]":
-                    break
-                try:
-                    event = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if as_responses:
-                    await state.write_chat_delta(response, event)
-                else:
-                    await _write_sse(response, event)
-            if as_responses:
-                await state.finish(response)
-            else:
-                await _safe_write(response, b"data: [DONE]\n\n")
-        except ClientDisconnected:
-            pass
-        finally:
-            upstream.release()
-        try:
-            await response.write_eof()
-        except Exception:
-            pass
-        return response
+            return web.json_response(anthropic_to_response(payload, client_slug))
+        return web.json_response(anthropic_to_chat_response(payload, client_slug))
 
     async def _stream_anthropic(
-        self, request: web.Request, upstream, route: ShimModel, as_responses: bool
+        self,
+        request: web.Request,
+        upstream,
+        route: ShimModel,
+        as_responses: bool,
+        *,
+        response_slug: str | None = None,
     ) -> web.StreamResponse:
+        client_slug = response_slug or route.slug
         response = _sse_response()
         await response.prepare(request)
         if as_responses:
-            state = ResponsesStreamState(route.slug)
+            state = ResponsesStreamState(client_slug)
         try:
             if as_responses:
                 await state.start(response)
@@ -818,7 +1109,7 @@ class ShimServer:
                 if as_responses:
                     await state.write_anthropic_delta(response, event)
                 else:
-                    await _write_sse(response, _anthropic_stream_to_chat_chunk(event, route.slug))
+                    await _write_sse(response, _anthropic_stream_to_chat_chunk(event, client_slug))
             if as_responses:
                 await state.finish(response)
             else:
@@ -880,6 +1171,25 @@ def _rewrite_response_model(payload: Any, model: str | None) -> None:
     elif isinstance(payload, list):
         for item in payload:
             _rewrite_response_model(item, model)
+
+
+# Desktop accumulates `response.reasoning_summary_text.delta` during the turn.
+# llama.cpp often emits reasoning in one large chunk; split so the UI updates live.
+_REASONING_DELTA_CHUNK_CHARS = 80
+
+
+def _iter_reasoning_delta_chunks(text: str, chunk_size: int = _REASONING_DELTA_CHUNK_CHARS) -> list[str]:
+    if not text:
+        return []
+    if len(text) <= chunk_size:
+        return [text]
+    chunks: list[str] = []
+    start = 0
+    while start < len(text):
+        end = min(start + chunk_size, len(text))
+        chunks.append(text[start:end])
+        start = end
+    return chunks
 
 
 class ResponsesStreamState:
@@ -1010,21 +1320,27 @@ class ResponsesStreamState:
         for call in delta.get("tool_calls") or []:
             await self._chat_tool_delta(response, call)
 
+    async def _emit_reasoning_summary_deltas(
+        self, response: web.StreamResponse, state: dict[str, Any], text: str
+    ) -> None:
+        for delta in _iter_reasoning_delta_chunks(text):
+            await _write_sse(
+                response,
+                {
+                    "type": "response.reasoning_summary_text.delta",
+                    "item_id": state["id"],
+                    "output_index": state["output_index"],
+                    "summary_index": 0,
+                    "delta": delta,
+                },
+            )
+
     async def _chat_reasoning_delta(self, response: web.StreamResponse, text: str) -> None:
         state = self.reasoning_blocks.get(("chat",))
         if state is None:
             state = await self._open_reasoning(response, key=("chat",))
         state["text"] += text
-        await _write_sse(
-            response,
-            {
-                "type": "response.reasoning_summary_text.delta",
-                "item_id": state["id"],
-                "output_index": state["output_index"],
-                "summary_index": 0,
-                "delta": text,
-            },
-        )
+        await self._emit_reasoning_summary_deltas(response, state, text)
 
     async def _chat_tool_delta(self, response: web.StreamResponse, call: dict[str, Any]) -> None:
         index = int(call.get("index", 0))
@@ -1111,16 +1427,7 @@ class ResponsesStreamState:
                 txt = delta.get("thinking") or ""
                 if txt:
                     state["text"] += txt
-                    await _write_sse(
-                        response,
-                        {
-                            "type": "response.reasoning_summary_text.delta",
-                            "item_id": state["id"],
-                            "output_index": state["output_index"],
-                            "summary_index": 0,
-                            "delta": txt,
-                        },
-                    )
+                    await self._emit_reasoning_summary_deltas(response, state, txt)
             elif dtype == "signature_delta":
                 state = self.reasoning_blocks.get(("anthropic_thinking", idx))
                 if state is None:
@@ -1328,16 +1635,7 @@ class ResponsesStreamState:
             },
         )
         if initial_text:
-            await _write_sse(
-                response,
-                {
-                    "type": "response.reasoning_summary_text.delta",
-                    "item_id": item_id,
-                    "output_index": output_index,
-                    "summary_index": 0,
-                    "delta": initial_text,
-                },
-            )
+            await self._emit_reasoning_summary_deltas(response, state, initial_text)
         return state
 
     async def _close_reasoning(self, response: web.StreamResponse, state: dict[str, Any]) -> None:
@@ -1375,6 +1673,8 @@ class ResponsesStreamState:
                 "signature": state.get("signature", ""),
             }
         encrypted = _encode_thinking_payload(payload)
+        # Streamed deltas drive live UI; completed summary must be populated
+        # because Desktop replaces the whole reasoning item on item/completed.
         return {
             "id": state["id"],
             "type": "reasoning",
@@ -1418,6 +1718,8 @@ class ResponsesStreamState:
                 collected.append((self.message_index, self._message_item("completed")))
             for state in self.tool_calls.values():
                 collected.append((state["output_index"], self._tool_item(state, "completed")))
+            for entry in self.tool_outputs.values():
+                collected.append((entry["output_index"], entry["item"]))
             collected.sort(key=lambda pair: pair[0])
             output = [item for _, item in collected]
         payload = {
@@ -1709,7 +2011,16 @@ def _chat_tools_have_mcp(tools: Any) -> bool:
     return False
 
 
-def _inject_tool_search_if_mcp(body: dict[str, Any]) -> None:
+async def _pre_discover_if_mcp(body: dict[str, Any]) -> list[dict[str, Any]]:
+    if not _chat_tools_have_mcp(body.get("tools")):
+        return []
+    return await mcp_search.pre_discover_mcp_tools()
+
+
+def _inject_tool_search_if_mcp(
+    body: dict[str, Any],
+    discovered: list[dict[str, Any]] | None = None,
+) -> None:
     if not _chat_tools_have_mcp(body.get("tools")):
         return
     tools = body.get("tools")
@@ -1722,8 +2033,6 @@ def _inject_tool_search_if_mcp(body: dict[str, Any]) -> None:
                  and t["function"].get("name") == mcp_search.MCP_TOOL_SEARCH_NAME))
         for t in tools
     )
-    if already:
-        return
     filtered: list[dict[str, Any]] = []
     for t in tools:
         if not isinstance(t, dict):
@@ -1736,7 +2045,23 @@ def _inject_tool_search_if_mcp(body: dict[str, Any]) -> None:
         if isinstance(name, str) and name.startswith("mcp__") and name.count("__") == 1:
             continue
         filtered.append(t)
-    body["tools"] = [mcp_search.MCP_TOOL_SEARCH_DEFINITION, *filtered]
+    prefix: list[dict[str, Any]] = []
+    if discovered:
+        existing = {
+            (t.get("function") or {}).get("name") or t.get("name")
+            for t in filtered
+            if isinstance(t, dict)
+        }
+        for t in discovered:
+            if not isinstance(t, dict):
+                continue
+            fn = t.get("function") or {}
+            name = fn.get("name") or t.get("name")
+            if not isinstance(name, str) or not name or name in existing:
+                continue
+            existing.add(name)
+            prefix.append(t)
+    body["tools"] = [*prefix, mcp_search.MCP_TOOL_SEARCH_DEFINITION, *filtered]
 
 
 def _dump_debug_request(slug: str, url: str, body: dict[str, Any]) -> None:

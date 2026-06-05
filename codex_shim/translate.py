@@ -14,11 +14,11 @@ _THINKING_MAGIC = SHIM_ENCRYPTED_CONTENT_PREFIX
 
 MCP_TOOL_HINT = (
     "MCP tool-calling convention: tools are exposed as mcp__<server>__<tool> with double underscore "
-    "(e.g. mcp__jina__search, mcp__exa__web_search_exa). Do NOT call bare server names like mcp__jina — "
-    "that returns 'unsupported call'. To discover what tools a server offers, call the `tool_search_call` "
-    "tool with the MCP server's bare name as the query (e.g. tool_search_call(query='mcp__jina')); the "
-    "result will list the available mcp__<server>__<tool> names, then call them directly. "
-    "If a tool returns 'unsupported call: X', do not retry X; pick a different approach."
+    "(e.g. mcp__exa__web_search_exa). Do NOT call bare server names like mcp__exa — "
+    "that returns 'unsupported call'. Call tools by their full mcp__<server>__<tool> name. "
+    "If a tool returns 'unsupported call: X', do not retry X; pick a different approach. "
+    "If you cannot find an MCP tool you need, call `tool_search_call` with the bare server name "
+    "(e.g. tool_search_call(query='mcp__exa')) to discover available tools."
 )
 
 
@@ -52,7 +52,12 @@ def _decode_thinking_blob(encoded: Any) -> dict[str, Any] | None:
     return data
 
 
-def responses_to_chat(body: dict[str, Any], upstream_model: str) -> dict[str, Any]:
+def responses_to_chat(
+    body: dict[str, Any],
+    upstream_model: str,
+    *,
+    discovered_mcp_tools: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
     messages = []
     instructions_text = _content_to_text(body.get("instructions")) if body.get("instructions") else ""
     has_mcp = _tools_have_mcp(body.get("tools"))
@@ -88,22 +93,30 @@ def responses_to_chat(body: dict[str, Any], upstream_model: str) -> dict[str, An
 
     tools = _responses_tools_to_chat_tools(body.get("tools"))
     if has_mcp:
-        # Strip bare `mcp__<server>` server-marker entries from the model-visible
-        # tools list so the model is forced to call tool_search_call first and
-        # then the full `mcp__<server>__<tool>` name on the next turn. The
-        # marker entries still flow through Codex Desktop's own UI; we only
-        # hide them from the local model.
         filtered: list[dict[str, Any]] = []
         for tool in tools:
             fn = tool.get("function") or {}
             name = fn.get("name") or tool.get("name") or ""
-            # Bare server markers (e.g. `mcp__jina`) have exactly one `__`
-            # pair (the prefix). Full tool names (e.g. `mcp__jina__read_url`)
-            # have two.
             if isinstance(name, str) and name.startswith("mcp__") and name.count("__") == 1:
                 continue
             filtered.append(tool)
-        tools = [mcp_search.MCP_TOOL_SEARCH_DEFINITION, *filtered]
+        prefix: list[dict[str, Any]] = []
+        if discovered_mcp_tools:
+            existing = {
+                (t.get("function") or {}).get("name") or t.get("name")
+                for t in filtered
+                if isinstance(t, dict)
+            }
+            for tool in discovered_mcp_tools:
+                if not isinstance(tool, dict):
+                    continue
+                fn = tool.get("function") or {}
+                name = fn.get("name") or tool.get("name")
+                if not isinstance(name, str) or not name or name in existing:
+                    continue
+                existing.add(name)
+                prefix.append(tool)
+        tools = [*prefix, mcp_search.MCP_TOOL_SEARCH_DEFINITION, *filtered]
     if tools:
         chat["tools"] = tools
         tool_choice = _responses_tool_choice_to_chat(body.get("tool_choice"), body.get("tools"))
