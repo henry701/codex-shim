@@ -4,11 +4,36 @@ import json
 import re
 from typing import Any
 
+from . import mcp_search
+
 
 THINK_RE = re.compile(r"<think>.*?</think>", re.IGNORECASE | re.DOTALL)
 
 SHIM_ENCRYPTED_CONTENT_PREFIX = "anthropic-thinking-v1:"
 _THINKING_MAGIC = SHIM_ENCRYPTED_CONTENT_PREFIX
+
+MCP_TOOL_HINT = (
+    "MCP tool-calling convention: tools are exposed as mcp__<server>__<tool> with double underscore "
+    "(e.g. mcp__jina__search, mcp__exa__web_search_exa). Do NOT call bare server names like mcp__jina — "
+    "that returns 'unsupported call'. To discover what tools a server offers, call the `tool_search_call` "
+    "tool with the MCP server's bare name as the query (e.g. tool_search_call(query='mcp__jina')); the "
+    "result will list the available mcp__<server>__<tool> names, then call them directly. "
+    "If a tool returns 'unsupported call: X', do not retry X; pick a different approach."
+)
+
+
+def _tools_have_mcp(tools: Any) -> bool:
+    if not isinstance(tools, list):
+        return False
+    for t in tools:
+        if not isinstance(t, dict):
+            continue
+        name = t.get("name")
+        if not name and isinstance(t.get("function"), dict):
+            name = t["function"].get("name")
+        if isinstance(name, str) and name.startswith("mcp__"):
+            return True
+    return False
 
 
 def _decode_thinking_blob(encoded: Any) -> dict[str, Any] | None:
@@ -29,9 +54,12 @@ def _decode_thinking_blob(encoded: Any) -> dict[str, Any] | None:
 
 def responses_to_chat(body: dict[str, Any], upstream_model: str) -> dict[str, Any]:
     messages = []
-    instructions = body.get("instructions")
-    if instructions:
-        messages.append({"role": "system", "content": _content_to_text(instructions)})
+    instructions_text = _content_to_text(body.get("instructions")) if body.get("instructions") else ""
+    has_mcp = _tools_have_mcp(body.get("tools"))
+    if has_mcp:
+        instructions_text = MCP_TOOL_HINT + ("\n\n" + instructions_text if instructions_text else "")
+    if instructions_text:
+        messages.append({"role": "system", "content": instructions_text})
     pending_reasoning: str | None = None
     for m in _responses_input_to_messages(body.get("input")):
         if m.get("_reasoning_only"):
@@ -59,6 +87,23 @@ def responses_to_chat(body: dict[str, Any], upstream_model: str) -> dict[str, An
     _copy_if_present(body, chat, "reasoning_effort")
 
     tools = _responses_tools_to_chat_tools(body.get("tools"))
+    if has_mcp:
+        # Strip bare `mcp__<server>` server-marker entries from the model-visible
+        # tools list so the model is forced to call tool_search_call first and
+        # then the full `mcp__<server>__<tool>` name on the next turn. The
+        # marker entries still flow through Codex Desktop's own UI; we only
+        # hide them from the local model.
+        filtered: list[dict[str, Any]] = []
+        for tool in tools:
+            fn = tool.get("function") or {}
+            name = fn.get("name") or tool.get("name") or ""
+            # Bare server markers (e.g. `mcp__jina`) have exactly one `__`
+            # pair (the prefix). Full tool names (e.g. `mcp__jina__read_url`)
+            # have two.
+            if isinstance(name, str) and name.startswith("mcp__") and name.count("__") == 1:
+                continue
+            filtered.append(tool)
+        tools = [mcp_search.MCP_TOOL_SEARCH_DEFINITION, *filtered]
     if tools:
         chat["tools"] = tools
         tool_choice = _responses_tool_choice_to_chat(body.get("tool_choice"), body.get("tools"))

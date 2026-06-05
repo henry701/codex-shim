@@ -21,6 +21,7 @@ from .cursor_passthrough import (
     iter_cursor_agent_events,
 )
 from . import router as router_module
+from . import mcp_search
 from .hostguard import build_allowed_hosts, host_guard_middleware
 from .settings import (
     CHATGPT_MODEL_SLUG,
@@ -204,6 +205,7 @@ class ShimServer:
             forwarded["model"] = route.model
             if "messages" in forwarded:
                 forwarded["messages"] = _normalize_roles(forwarded["messages"])
+            _inject_tool_search_if_mcp(forwarded)
             return await self._post_openai_chat(request, route, forwarded, as_responses=False)
         if route.is_anthropic:
             forwarded = chat_to_anthropic(body, route.model, route.max_output_tokens)
@@ -733,15 +735,21 @@ class ShimServer:
             if upstream.status >= 400:
                 return await _error_response(upstream, slug=route.slug)
             if body.get("stream"):
-                return await self._stream_openai_chat(request, upstream, route, as_responses)
+                return await self._stream_openai_chat(
+                    request, upstream, route, as_responses, response_slug=client_slug
+                )
             payload = await upstream.json(content_type=None)
         if as_responses:
-            return web.json_response(chat_completion_to_response(payload, route.slug))
+            response_payload = chat_completion_to_response(payload, client_slug)
+            response_payload = await mcp_search.augment_response_with_tool_search(response_payload)
+            return web.json_response(response_payload)
         return web.json_response(payload)
 
     async def _post_anthropic(
-        self, request: web.Request, route: ShimModel, body: dict[str, Any], as_responses: bool
+        self, request: web.Request, route: ShimModel, body: dict[str, Any], as_responses: bool,
+        *, response_slug: str | None = None,
     ) -> web.StreamResponse:
+        client_slug = response_slug or route.slug
         url = _join_url(route.base_url, "/messages")
         headers = _anthropic_headers(route)
         async with ClientSession(timeout=self.timeout) as session:
@@ -894,6 +902,9 @@ class ResponsesStreamState:
         # anthropic content_block_index. Each entry tracks its assigned
         # output_index, accumulated arguments, name, etc.
         self.tool_calls: dict[int, dict[str, Any]] = {}
+        # Synthesized function_call_output items for shim-handled tool calls
+        # (currently only tool_search_call), keyed by call_id.
+        self.tool_outputs: dict[str, dict[str, Any]] = {}
         # Reasoning (extended thinking) blocks, keyed by upstream index.
         self.reasoning_blocks: dict[Any, dict[str, Any]] = {}
         self.next_output_index = 0
@@ -913,8 +924,70 @@ class ResponsesStreamState:
         for state in sorted(self.tool_calls.values(), key=lambda s: s["output_index"]):
             if not state.get("closed"):
                 await self._close_tool(response, state)
+        await self._handle_tool_search(response)
         await _write_sse(response, {"type": "response.completed", "response": self._response("completed", final=True)})
         await response.write(b"data: [DONE]\n\n")
+
+    async def _handle_tool_search(self, response: web.StreamResponse) -> None:
+        """Resolve any tool_search_call items by running the MCP tools/list
+        lookup on the shim side and emitting paired function_call_output
+        events so Codex Desktop does not need to know about the virtual tool."""
+        for state in sorted(self.tool_calls.values(), key=lambda s: s["output_index"]):
+            if state.get("name") != mcp_search.MCP_TOOL_SEARCH_NAME:
+                continue
+            call_id = state.get("call_id") or state.get("id")
+            if not call_id or call_id in self.tool_outputs:
+                continue
+            raw_args = state.get("arguments", "")
+            if isinstance(raw_args, str):
+                try:
+                    args = json.loads(raw_args) if raw_args.strip() else {}
+                except json.JSONDecodeError:
+                    args = {}
+            elif isinstance(raw_args, dict):
+                args = raw_args
+            else:
+                args = {}
+            query = args.get("query", "") if isinstance(args, dict) else ""
+            if not isinstance(query, str) or not query.strip():
+                result = mcp_search.format_tool_search_error("", "tool_search_call requires a non-empty string 'query' argument")
+            else:
+                result = await mcp_search.execute_tool_search(query)
+            output_index = self.next_output_index
+            self.next_output_index += 1
+            output_item = {
+                "id": f"out_{int(time.time() * 1000)}_{call_id}",
+                "type": "function_call_output",
+                "status": "completed",
+                "call_id": call_id,
+                "output": result,
+            }
+            self.tool_outputs[call_id] = {
+                "output_index": output_index,
+                "item": output_item,
+            }
+            await _write_sse(
+                response,
+                {
+                    "type": "response.output_item.added",
+                    "output_index": output_index,
+                    "item": {
+                        "id": output_item["id"],
+                        "type": "function_call_output",
+                        "status": "in_progress",
+                        "call_id": call_id,
+                        "output": "",
+                    },
+                },
+            )
+            await _write_sse(
+                response,
+                {
+                    "type": "response.output_item.done",
+                    "output_index": output_index,
+                    "item": output_item,
+                },
+            )
 
     # ------------------------------------------------------------------
     # Chat-completions (OpenAI-style) deltas
@@ -1619,6 +1692,51 @@ def _normalize_roles(messages: list[dict]) -> list[dict]:
                 message["role"] = "system"
         result.append(message)
     return result
+
+
+def _chat_tools_have_mcp(tools: Any) -> bool:
+    if not isinstance(tools, list):
+        return False
+    for t in tools:
+        if not isinstance(t, dict):
+            continue
+        fn = t.get("function")
+        name = t.get("name") if isinstance(t.get("name"), str) else None
+        if not name and isinstance(fn, dict):
+            name = fn.get("name")
+        if isinstance(name, str) and name.startswith("mcp__"):
+            return True
+    return False
+
+
+def _inject_tool_search_if_mcp(body: dict[str, Any]) -> None:
+    if not _chat_tools_have_mcp(body.get("tools")):
+        return
+    tools = body.get("tools")
+    if not isinstance(tools, list):
+        return
+    already = any(
+        isinstance(t, dict)
+        and (t.get("name") == mcp_search.MCP_TOOL_SEARCH_NAME
+             or (isinstance(t.get("function"), dict)
+                 and t["function"].get("name") == mcp_search.MCP_TOOL_SEARCH_NAME))
+        for t in tools
+    )
+    if already:
+        return
+    filtered: list[dict[str, Any]] = []
+    for t in tools:
+        if not isinstance(t, dict):
+            filtered.append(t)
+            continue
+        fn = t.get("function")
+        name = t.get("name") if isinstance(t.get("name"), str) else None
+        if not name and isinstance(fn, dict):
+            name = fn.get("name")
+        if isinstance(name, str) and name.startswith("mcp__") and name.count("__") == 1:
+            continue
+        filtered.append(t)
+    body["tools"] = [mcp_search.MCP_TOOL_SEARCH_DEFINITION, *filtered]
 
 
 def _dump_debug_request(slug: str, url: str, body: dict[str, Any]) -> None:
