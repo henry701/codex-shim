@@ -47,7 +47,6 @@ MCP_TOOL_SEARCH_DEFINITION: dict[str, Any] = {
 }
 
 _FALLBACK_MCP_URLS: dict[str, str] = {
-    "mcp__jina": "https://mcp.jina.ai/v1?include_tags=read",
     "mcp__exa": "https://mcp.exa.ai/mcp?tools=web_search_exa",
 }
 

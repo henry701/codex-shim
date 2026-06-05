@@ -85,6 +85,6 @@ def test_format_tool_search_result_keeps_already_prefixed():
 
 
 def test_resolve_mcp_url_uses_fallback_for_known_servers():
-    assert mcp_search.resolve_mcp_url("mcp__jina") is not None
     assert mcp_search.resolve_mcp_url("mcp__exa") is not None
+    assert mcp_search.resolve_mcp_url("mcp__jina") is None
     assert mcp_search.resolve_mcp_url("mcp__unknown_server_xyz") is None
