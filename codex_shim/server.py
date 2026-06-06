@@ -940,7 +940,6 @@ class ShimServer:
                         )
                         upstream.release()
                         break
-                    end_upstream_turn = False
                     try:
                         async for line in _sse_lines(upstream):
                             if line == "[DONE]":
@@ -950,31 +949,11 @@ class ShimServer:
                             except json.JSONDecodeError:
                                 continue
                             if as_responses and state is not None:
-                                if await state.write_chat_delta(response, event):
-                                    end_upstream_turn = True
+                                await state.write_chat_delta(response, event)
                             else:
                                 await _write_sse(response, event)
-                            if end_upstream_turn:
-                                break
                     finally:
-                        if end_upstream_turn and as_responses and state is not None:
-                            tool_names = [
-                                tc.get("name") or ""
-                                for tc in {
-                                    **state.tool_calls,
-                                    **state.mcp_tool_calls,
-                                    **state.tool_search_calls,
-                                }.values()
-                                if _tool_call_arguments_complete(tc)
-                            ]
-                            state.discard_stats.log(
-                                client_slug,
-                                cancelled_upstream=True,
-                                tool_names=tool_names,
-                            )
-                        await _finish_upstream_stream(
-                            upstream, cancelled=end_upstream_turn
-                        )
+                        upstream.release()
                     break
             if as_responses and state is not None:
                 await state.finish(response)
@@ -1140,41 +1119,6 @@ def _should_defer_tool_name(name: str) -> bool:
     return name.startswith("mcp")
 
 
-class _TurnDiscardStats:
-    """Tokens/content skipped when cutting an upstream turn at tool-call boundary."""
-
-    def __init__(self) -> None:
-        self.skipped_content_chars = 0
-        self.skipped_content_preview = ""
-        self.finish_reason: str | None = None
-
-    def record_skipped_content(self, text: str, *, reason: str | None = None) -> None:
-        if not text:
-            return
-        self.skipped_content_chars += len(text)
-        if not self.skipped_content_preview:
-            self.skipped_content_preview = text[:240]
-        if reason:
-            self.finish_reason = reason
-
-    def log(self, model: str, *, cancelled_upstream: bool, tool_names: list[str]) -> None:
-        if not cancelled_upstream and self.skipped_content_chars == 0 and not tool_names:
-            return
-        preview = self.skipped_content_preview.replace("\n", "\\n")
-        if len(self.skipped_content_preview) > 240:
-            preview += "…"
-        print(
-            "[turn-cut] "
-            f"model={model} "
-            f"reason={self.finish_reason or 'tool_calls'} "
-            f"cancelled_upstream={cancelled_upstream} "
-            f"complete_tools={tool_names or []} "
-            f"skipped_content_chars={self.skipped_content_chars} "
-            f"skipped_content_preview={preview!r}",
-            flush=True,
-        )
-
-
 class ResponsesStreamState:
     """Translates upstream chat-completions / anthropic stream events into the
     Codex Desktop Responses-API event sequence. Keeps the message item and
@@ -1198,43 +1142,6 @@ class ResponsesStreamState:
         self.reasoning_blocks: dict[Any, dict[str, Any]] = {}
         self.next_output_index = 0
         self.completed_turns: list[dict[str, Any]] = []
-        self.discard_stats = _TurnDiscardStats()
-        self.post_tool_content_cutoff = False
-
-    def _mark_post_tool_content_cutoff(self) -> None:
-        self.post_tool_content_cutoff = True
-
-    def _pending_tool_calls(self) -> list[dict[str, Any]]:
-        pending: list[dict[str, Any]] = []
-        for tc in (
-            *self.tool_calls.values(),
-            *self.mcp_tool_calls.values(),
-            *self.tool_search_calls.values(),
-        ):
-            if tc.get("closed"):
-                continue
-            if not (tc.get("name") or "").strip():
-                continue
-            pending.append(tc)
-        return pending
-
-    def has_complete_tool_calls(self) -> bool:
-        pending = self._pending_tool_calls()
-        if not pending:
-            return False
-        return all(_tool_call_arguments_complete(tc) for tc in pending)
-
-    def should_end_upstream_turn(self, finish_reason: str | None = None) -> bool:
-        """True when the upstream chat-completions turn must end before more deltas.
-
-        Local backends (llama.cpp) often emit ``finish_reason=tool_calls`` before
-        argument chunks finish, or in the same chunk as a partial JSON fragment.
-        Wait until every open tool call has parseable arguments; once all tools
-        are closed, honour ``finish_reason=tool_calls`` to drop hallucinated text."""
-        pending = self._pending_tool_calls()
-        if pending:
-            return all(_tool_call_arguments_complete(tc) for tc in pending)
-        return (finish_reason or "").lower() == "tool_calls"
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -1286,7 +1193,7 @@ class ResponsesStreamState:
             incomplete.append(f"{name}({len(args)} arg chars)")
         if incomplete:
             print(
-                f"[turn-cut] model={self.model} incomplete_tool_calls_at_stream_end={incomplete}",
+                f"[stream] model={self.model} incomplete_tool_calls_at_stream_end={incomplete}",
                 flush=True,
             )
 
@@ -1304,8 +1211,6 @@ class ResponsesStreamState:
         self.mcp_tool_calls = {}
         self.tool_search_calls = {}
         self.reasoning_blocks = {}
-        self.discard_stats = _TurnDiscardStats()
-        self.post_tool_content_cutoff = False
 
     def _current_turn_dict(self) -> dict[str, Any]:
         return {
@@ -1327,13 +1232,12 @@ class ResponsesStreamState:
         self,
         response: web.StreamResponse,
         chunk: dict[str, Any],
-    ) -> bool:
+    ) -> None:
         usage = chunk.get("usage")
         if isinstance(usage, dict):
             self.usage = normalize_responses_usage(usage)
         choice = (chunk.get("choices") or [{}])[0]
         delta = choice.get("delta") or {}
-        finish_reason = choice.get("finish_reason")
         reasoning = delta.get("reasoning_content") or delta.get("reasoning")
         if reasoning:
             await self._chat_reasoning_delta(response, reasoning)
@@ -1342,22 +1246,12 @@ class ResponsesStreamState:
         message = choice.get("message") or {}
         for call in message.get("tool_calls") or []:
             await self._chat_tool_delta(response, call)
-        end_turn = self.should_end_upstream_turn(finish_reason)
-        if end_turn and finish_reason:
-            self.discard_stats.finish_reason = str(finish_reason)
         content = delta.get("content")
         if content:
-            if self.post_tool_content_cutoff:
-                self.discard_stats.record_skipped_content(
-                    content,
-                    reason=str(finish_reason) if finish_reason else "tool_calls",
-                )
-            else:
-                for state in list(self.reasoning_blocks.values()):
-                    if not state.get("closed"):
-                        await self._close_reasoning(response, state)
-                await self._text_delta(response, content)
-        return end_turn
+            for state in list(self.reasoning_blocks.values()):
+                if not state.get("closed"):
+                    await self._close_reasoning(response, state)
+            await self._text_delta(response, content)
 
     async def _emit_reasoning_summary_deltas(
         self, response: web.StreamResponse, state: dict[str, Any], text: str
@@ -1610,7 +1504,6 @@ class ResponsesStreamState:
                     state = await self._open_tool_search(response, index, state)
                     break
         state["closed"] = True
-        self._mark_post_tool_content_cutoff()
         raw_arguments = state.get("arguments") or ""
         await _write_sse(
             response,
@@ -1733,7 +1626,6 @@ class ResponsesStreamState:
                     state = await self._open_mcp_tool(response, index, state)
                     break
         state["closed"] = True
-        self._mark_post_tool_content_cutoff()
         arguments = state.get("arguments") or ""
         await _write_sse(
             response,
@@ -1972,7 +1864,6 @@ class ResponsesStreamState:
         if state.get("closed") or not _tool_call_arguments_complete(state):
             return
         state["closed"] = True
-        self._mark_post_tool_content_cutoff()
         await _write_sse(
             response,
             {
@@ -2346,16 +2237,6 @@ def _log_incoming_request(endpoint: str, body: dict[str, Any]) -> None:
         )
     except Exception as exc:
         print(f"[req] failed to log: {exc}", flush=True)
-
-
-async def _finish_upstream_stream(upstream, *, cancelled: bool = False) -> None:
-    """Release an upstream chat-completions SSE response.
-
-    When ``cancelled`` is true, close the HTTP body first so backends like
-    llama-server abort in-flight decode instead of running to max_tokens."""
-    if cancelled:
-        upstream.close()
-    upstream.release()
 
 
 async def _sse_lines(upstream) -> Any:

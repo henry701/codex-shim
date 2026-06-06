@@ -105,6 +105,10 @@ def responses_to_chat(
                 continue
             filtered.append(tool)
         tools = [mcp_search.MCP_TOOL_SEARCH_DEFINITION, *filtered]
+        for raw in mcp_search.discovered_tool_search_tools_from_input(body.get("input")):
+            chat_tool = _responses_tool_to_chat_function(raw)
+            if chat_tool is not None:
+                tools = _append_unique_chat_tool(tools, chat_tool)
     if tools:
         chat["tools"] = tools
         tool_choice = _responses_tool_choice_to_chat(body.get("tool_choice"), body.get("tools"))
@@ -473,7 +477,10 @@ def _responses_input_to_messages(value: Any) -> list[dict[str, Any]]:
             if tools is None:
                 content = json.dumps(item, indent=2)
             else:
-                content = json.dumps({"tools": tools}, indent=2)
+                content = json.dumps(
+                    {"tools": mcp_search.flatten_tool_search_tools(tools)},
+                    indent=2,
+                )
             messages.append(
                 {
                     "role": "tool",
@@ -661,6 +668,24 @@ def _content_to_text(content: Any) -> str:
             return str(content.get("text", ""))
         return str(content)
     return str(content)
+
+
+def _append_unique_chat_tool(
+    tools: list[dict[str, Any]],
+    tool: dict[str, Any],
+) -> list[dict[str, Any]]:
+    fn = tool.get("function") or {}
+    name = fn.get("name") or tool.get("name")
+    if not isinstance(name, str) or not name:
+        return tools
+    existing = {
+        (entry.get("function") or {}).get("name") or entry.get("name")
+        for entry in tools
+        if isinstance(entry, dict)
+    }
+    if name in existing:
+        return tools
+    return [*tools, tool]
 
 
 def _responses_tools_to_chat_tools(tools: Any) -> list[dict[str, Any]]:

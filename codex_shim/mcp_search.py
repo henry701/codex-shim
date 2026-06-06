@@ -193,6 +193,88 @@ def normalize_upstream_tool_name(name: str) -> str:
     return _UPSTREAM_TOOL_ALIASES.get(stripped, stripped)
 
 
+def full_mcp_tool_name(namespace: str, tool_name: str) -> str | None:
+    namespace = namespace.strip()
+    tool_name = tool_name.strip()
+    if not namespace or not tool_name:
+        return None
+    if tool_name.startswith("mcp__") and tool_name.count("__") >= 2:
+        return tool_name
+    if not namespace.startswith("mcp__"):
+        namespace = f"mcp__{namespace}"
+    if tool_name.startswith(f"{namespace}__"):
+        return tool_name
+    return f"{namespace}__{tool_name}"
+
+
+def _tool_search_entry_with_full_name(entry: dict[str, Any], full_name: str) -> dict[str, Any]:
+    out = dict(entry)
+    out["type"] = "function"
+    out["name"] = full_name
+    fn = out.get("function")
+    if isinstance(fn, dict):
+        fn_out = dict(fn)
+        fn_out["name"] = full_name
+        out["function"] = fn_out
+    return out
+
+
+def flatten_tool_search_tools(tools: Any) -> list[dict[str, Any]]:
+    """Flatten Codex ``tool_search_output.tools`` to function entries with full ``mcp__`` names."""
+    if not isinstance(tools, list):
+        return []
+    flattened: list[dict[str, Any]] = []
+    for entry in tools:
+        if not isinstance(entry, dict):
+            continue
+        entry_type = str(entry.get("type") or "").strip().lower()
+        if entry_type == "namespace":
+            namespace = str(entry.get("name") or "")
+            for child in entry.get("tools") or []:
+                if not isinstance(child, dict):
+                    continue
+                child_name = str(child.get("name") or "")
+                if not child_name and isinstance(child.get("function"), dict):
+                    child_name = str(child["function"].get("name") or "")
+                full_name = full_mcp_tool_name(namespace, child_name)
+                if full_name:
+                    flattened.append(_tool_search_entry_with_full_name(child, full_name))
+            continue
+        name = str(entry.get("name") or "")
+        fn = entry.get("function")
+        if not name and isinstance(fn, dict):
+            name = str(fn.get("name") or "")
+        namespace = str(entry.get("namespace") or "")
+        if namespace:
+            full_name = full_mcp_tool_name(namespace, name)
+            if full_name:
+                flattened.append(_tool_search_entry_with_full_name(entry, full_name))
+            continue
+        if name.startswith("mcp__") and name.count("__") >= 2:
+            flattened.append(_tool_search_entry_with_full_name(entry, name))
+    return flattened
+
+
+def discovered_tool_search_tools_from_input(input_items: Any) -> list[dict[str, Any]]:
+    """Collect flattened MCP function tools from ``tool_search_output`` items in request input."""
+    if not isinstance(input_items, list):
+        return []
+    discovered: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for item in input_items:
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("type") or "").strip().lower() != "tool_search_output":
+            continue
+        for tool in flatten_tool_search_tools(item.get("tools")):
+            name = str(tool.get("name") or "")
+            if not name or name in seen:
+                continue
+            seen.add(name)
+            discovered.append(tool)
+    return discovered
+
+
 def format_tool_search_result(query: str, tools: list[dict[str, Any]]) -> str:
     cleaned: list[dict[str, Any]] = []
     for tool in tools:

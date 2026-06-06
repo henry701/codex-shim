@@ -175,3 +175,90 @@ def test_normalize_upstream_tool_name_aliases_web_search():
     assert mcp_search.normalize_upstream_tool_name("web_search_exa") == "mcp__exa__web_search_exa"
     assert mcp_search.normalize_upstream_tool_name("web_search") == "mcp__exa__web_search_exa"
     assert mcp_search.normalize_upstream_tool_name("exec_command") == "exec_command"
+
+
+def test_flatten_tool_search_namespace_tools():
+    flattened = mcp_search.flatten_tool_search_tools(
+        [
+            {
+                "type": "namespace",
+                "name": "mcp__exa",
+                "tools": [
+                    {
+                        "type": "function",
+                        "name": "web_search_exa",
+                        "description": "Search the web via Exa.",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"query": {"type": "string"}},
+                            "required": ["query"],
+                        },
+                    }
+                ],
+            }
+        ]
+    )
+    assert len(flattened) == 1
+    assert flattened[0]["name"] == "mcp__exa__web_search_exa"
+    assert flattened[0]["parameters"]["required"] == ["query"]
+
+
+def test_flatten_tool_search_full_name_tools():
+    flattened = mcp_search.flatten_tool_search_tools(
+        [
+            {
+                "type": "function",
+                "name": "mcp__exa__web_search_exa",
+                "description": "Search the web via Exa.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"query": {"type": "string"}},
+                    "required": ["query"],
+                },
+            }
+        ]
+    )
+    assert flattened[0]["name"] == "mcp__exa__web_search_exa"
+
+
+def test_responses_to_chat_injects_discovered_mcp_tools_from_tool_search_output():
+    body = {
+        "model": "slug",
+        "input": [
+            {"role": "user", "content": "news"},
+            {
+                "type": "tool_search_output",
+                "call_id": "search-1",
+                "tools": [
+                    {
+                        "type": "namespace",
+                        "name": "mcp__exa",
+                        "tools": [
+                            {
+                                "type": "function",
+                                "name": "web_search_exa",
+                                "description": "Search the web via Exa.",
+                                "parameters": {
+                                    "type": "object",
+                                    "properties": {"query": {"type": "string"}},
+                                    "required": ["query"],
+                                },
+                            }
+                        ],
+                    }
+                ],
+            },
+        ],
+        "tools": [
+            {"type": "tool_search", "execution": "client", "description": "Search deferred tools"},
+            {"type": "function", "name": "exec_command", "description": "Run shell",
+             "parameters": {"type": "object", "properties": {"cmd": {"type": "string"}}, "required": ["cmd"]}},
+            {"type": "function", "name": "mcp__exa", "description": "Exa MCP server"},
+        ],
+    }
+    out = responses_to_chat(body, "gemma-4-E4B")
+    names = [t["function"]["name"] for t in out["tools"]]
+    assert "mcp__exa__web_search_exa" in names
+    assert "mcp__exa" not in names
+    tool_messages = [m for m in out["messages"] if m.get("role") == "tool"]
+    assert "mcp__exa__web_search_exa" in tool_messages[0]["content"]

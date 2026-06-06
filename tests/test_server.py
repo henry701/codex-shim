@@ -527,7 +527,7 @@ async def test_chat_tool_delta_streams_tool_search_call_to_client():
     assert search_items[0]["arguments"]["query"] == "mcp__exa"
 
 
-async def test_write_chat_delta_skips_content_after_complete_tool_call():
+async def test_write_chat_delta_streams_content_with_complete_tool_in_same_chunk():
     class FakeResponse:
         def __init__(self):
             self.chunks: list[bytes] = []
@@ -537,6 +537,7 @@ async def test_write_chat_delta_skips_content_after_complete_tool_call():
 
     downstream = FakeResponse()
     state = ResponsesStreamState("local-llama")
+    await state.start(downstream)
     await state.write_chat_delta(
         downstream,
         {
@@ -553,15 +554,14 @@ async def test_write_chat_delta_skips_content_after_complete_tool_call():
                                 },
                             }
                         ],
-                        "content": "hallucinated post-tool text",
+                        "content": "Let me run that command.",
                     },
                     "finish_reason": "tool_calls",
                 }
             ]
         },
     )
-    assert state.discard_stats.skipped_content_chars == len("hallucinated post-tool text")
-    assert state.message_text == ""
+    assert state.message_text == "Let me run that command."
 
 
 async def test_write_chat_delta_streams_content_before_tool_call():
@@ -610,7 +610,6 @@ async def test_write_chat_delta_streams_content_before_tool_call():
         },
     )
     assert state.message_text == "Let me search Exa for the latest headline."
-    assert state.discard_stats.skipped_content_chars == 0
     events = _sse_events(b"".join(downstream.chunks).decode())
     text_deltas = [e for e in events if e.get("type") == "response.output_text.delta"]
     assert text_deltas
@@ -651,10 +650,9 @@ async def test_write_chat_delta_streams_content_with_incomplete_tool_in_same_chu
         },
     )
     assert state.message_text == "Let me search..."
-    assert state.discard_stats.skipped_content_chars == 0
 
 
-async def test_write_chat_delta_skips_content_after_tool_closed_in_prior_chunk():
+async def test_write_chat_delta_streams_content_after_tool_closed_in_prior_chunk():
     class FakeResponse:
         async def write(self, data: bytes):
             return None
@@ -696,41 +694,7 @@ async def test_write_chat_delta_skips_content_after_tool_closed_in_prior_chunk()
             ]
         },
     )
-    assert state.discard_stats.skipped_content_chars == len("I'll summarize once results arrive.")
-    assert state.message_text == ""
-
-
-async def test_write_chat_delta_ends_upstream_turn_when_tool_call_complete():
-    class FakeResponse:
-        async def write(self, data: bytes):
-            return None
-
-    downstream = FakeResponse()
-    state = ResponsesStreamState("local-llama")
-    ended = await state.write_chat_delta(
-        downstream,
-        {
-            "choices": [
-                {
-                    "delta": {
-                        "tool_calls": [
-                            {
-                                "index": 0,
-                                "id": "call_exa",
-                                "function": {
-                                    "name": "mcp__exa__web_search_exa",
-                                    "arguments": '{"query":"ukraine war"}',
-                                },
-                            }
-                        ]
-                    },
-                    "finish_reason": "tool_calls",
-                }
-            ]
-        },
-    )
-    assert ended is True
-    assert state.has_complete_tool_calls() is False
+    assert state.message_text == "I'll summarize once results arrive."
 
 
 async def test_mcp_tool_call_emits_namespaced_function_call_when_name_is_chunked():
@@ -840,11 +804,10 @@ async def test_mcp_tool_call_streams_argument_deltas_like_llama():
                 ]
             },
         )
-    ended = await state.write_chat_delta(
+    await state.write_chat_delta(
         downstream,
         {"choices": [{"delta": {}, "finish_reason": "tool_calls"}]},
     )
-    assert ended is True
     await state.finish(downstream)
     events = _sse_events(b"".join(downstream.chunks).decode())
     arg_deltas = [
@@ -919,46 +882,6 @@ async def test_mcp_tool_call_does_not_close_on_finish_reason_with_incomplete_arg
         if e.get("type") == "response.function_call_arguments.done"
     ][-1]
     assert json.loads(done["arguments"]) == {"query": "ukraine"}
-
-
-async def test_write_chat_delta_waits_for_all_tool_calls_before_end():
-    class FakeResponse:
-        async def write(self, data: bytes):
-            return None
-
-    downstream = FakeResponse()
-    state = ResponsesStreamState("local-llama")
-    await state.write_chat_delta(
-        downstream,
-        {
-            "choices": [
-                {
-                    "delta": {
-                        "tool_calls": [
-                            {
-                                "index": 0,
-                                "id": "call_a",
-                                "function": {
-                                    "name": "mcp__exa__web_search_exa",
-                                    "arguments": '{"query":"done"}',
-                                },
-                            },
-                            {
-                                "index": 1,
-                                "id": "call_b",
-                                "function": {
-                                    "name": "tool_search_call",
-                                    "arguments": '{"query":"ex',
-                                },
-                            },
-                        ]
-                    },
-                    "finish_reason": "tool_calls",
-                }
-            ]
-        },
-    )
-    assert state.should_end_upstream_turn("tool_calls") is False
 
 
 async def test_mcp_tool_call_emits_namespaced_function_call():
