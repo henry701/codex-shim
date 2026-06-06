@@ -229,7 +229,7 @@ def test_passthrough_error_fallback_requires_usable_target(tmp_path):
 
 def test_managed_config_escapes_windows_catalog_path(monkeypatch):
     monkeypatch.setattr(cli, "CATALOG_PATH", r"C:\Users\User\codex-shim\.codex-shim\custom_model_catalog.json")
-    top_block, _ = cli._managed_config_blocks("vendor\\model", 8765)
+    top_block, _, _ = cli._managed_config_blocks("vendor\\model", 8765)
     assert 'model = "vendor\\\\model"' in top_block
     assert 'model_catalog_json = "C:\\\\Users\\\\User\\\\codex-shim\\\\.codex-shim\\\\custom_model_catalog.json"' in top_block
 
@@ -257,6 +257,79 @@ def test_install_codex_config_is_idempotent(monkeypatch, tmp_path):
     assert text.count("[model_providers.codex_shim]") == 1
     assert text.count("model_provider = \"codex_shim\"") == 1
     assert text.count("model_catalog_json") == 1
+    assert text.count("[features]") == 1
+    assert text.count("tool_search_always_defer_mcp_tools = true") == 1
+
+
+def test_install_and_restore_manage_tool_search_feature_flag(monkeypatch, tmp_path):
+    settings = tmp_path / "models.json"
+    settings.write_text(
+        json.dumps(
+            {
+                "models": [
+                    {"model": "llama3.2", "display_name": "Llama", "provider": "generic-chat-completion-api", "base_url": "http://127.0.0.1:11434/v1"}
+                ]
+            }
+        )
+    )
+    config_path = tmp_path / ".codex" / "config.toml"
+    config_path.parent.mkdir()
+    config_path.write_text(
+        "[features]\n"
+        "multi_agent = true\n"
+        "tool_search_always_defer_mcp_tools = false\n"
+    )
+    monkeypatch.setattr(cli, "RUNTIME_DIR", tmp_path / ".codex-shim")
+    monkeypatch.setattr(cli, "CODEX_CONFIG_PATH", config_path)
+    monkeypatch.setattr(cli, "CODEX_CONFIG_BACKUP_PATH", tmp_path / ".codex-shim" / "config.toml.before-codex-shim")
+
+    cli.install_codex_config(settings, 8765, "llama3.2")
+    installed = config_path.read_text()
+    assert cli.PREVIOUS_FEATURES_PREFIX in installed
+    assert installed.count("tool_search_always_defer_mcp_tools = true") == 1
+    user_features = cli._extract_section_key_lines(
+        cli._remove_managed_config(installed),
+        cli.MANAGED_FEATURES_SECTION,
+        cli.MANAGED_FEATURE_KEYS,
+    )
+    assert "tool_search_always_defer_mcp_tools" not in user_features
+    assert "multi_agent = true" in installed
+
+    cli.restore_codex_config()
+    restored = config_path.read_text().rstrip() + "\n"
+    assert restored == (
+        "[features]\n"
+        "multi_agent = true\n"
+        "tool_search_always_defer_mcp_tools = false\n"
+    )
+
+
+def test_install_sets_tool_search_feature_when_missing(monkeypatch, tmp_path):
+    settings = tmp_path / "models.json"
+    settings.write_text(
+        json.dumps(
+            {
+                "models": [
+                    {"model": "llama3.2", "display_name": "Llama", "provider": "generic-chat-completion-api", "base_url": "http://127.0.0.1:11434/v1"}
+                ]
+            }
+        )
+    )
+    config_path = tmp_path / ".codex" / "config.toml"
+    config_path.parent.mkdir()
+    config_path.write_text("[features]\napps = true\n")
+    monkeypatch.setattr(cli, "RUNTIME_DIR", tmp_path / ".codex-shim")
+    monkeypatch.setattr(cli, "CODEX_CONFIG_PATH", config_path)
+    monkeypatch.setattr(cli, "CODEX_CONFIG_BACKUP_PATH", tmp_path / ".codex-shim" / "config.toml.before-codex-shim")
+
+    cli.install_codex_config(settings, 8765, "llama3.2")
+    installed = config_path.read_text()
+    assert "tool_search_always_defer_mcp_tools = true" in installed
+    assert cli.PREVIOUS_FEATURES_PREFIX not in installed
+
+    cli.restore_codex_config()
+    restored = config_path.read_text().rstrip() + "\n"
+    assert restored == "[features]\napps = true\n"
 
 
 def test_install_and_restore_preserve_displaced_top_level_config(monkeypatch, tmp_path):

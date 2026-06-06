@@ -165,6 +165,7 @@ def codex_config_overrides(catalog_path: Path, default_slug: str, port: int) -> 
         f'model_providers.{PROVIDER_NAME}.request_max_retries=3',
         f'model_providers.{PROVIDER_NAME}.stream_max_retries=3',
         f'model_providers.{PROVIDER_NAME}.stream_idle_timeout_ms=600000',
+        "features.tool_search_always_defer_mcp_tools=true",
     ]
 
 

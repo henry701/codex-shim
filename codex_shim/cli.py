@@ -53,7 +53,11 @@ WINDOWS_PROCESS_TERMINATE = 0x0001
 WINDOWS_PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 WINDOWS_STILL_ACTIVE = 259
 PREVIOUS_TOP_LEVEL_PREFIX = "# codex-shim previous-top-level = "
+PREVIOUS_FEATURES_PREFIX = "# codex-shim previous-features = "
 MANAGED_TOP_LEVEL_KEYS = {"model", "model_provider", "model_catalog_json"}
+MANAGED_FEATURES_SECTION = "features"
+MANAGED_FEATURE_KEY = "tool_search_always_defer_mcp_tools"
+MANAGED_FEATURE_KEYS = {MANAGED_FEATURE_KEY}
 APP_ASAR_BACKUP_NAME = "app.asar.before-codex-shim-model-picker-patch"
 INFO_PLIST_BACKUP_NAME = "Info.plist.before-codex-shim-model-picker-patch"
 SYSTEM_CODEX_APP = Path("/Applications/Codex.app")
@@ -203,11 +207,27 @@ def install_codex_config(settings_path: Path, port: int, model_slug: str | None 
         previous_top_level = _extract_top_level_key_lines(CODEX_CONFIG_BACKUP_PATH.read_text(), MANAGED_TOP_LEVEL_KEYS)
     cleaned = _remove_top_level_keys(cleaned, MANAGED_TOP_LEVEL_KEYS)
     cleaned = _remove_section(cleaned, f"model_providers.{PROVIDER_NAME}")
+    previous_features = _extract_section_key_lines(cleaned, MANAGED_FEATURES_SECTION, MANAGED_FEATURE_KEYS)
+    if not previous_features:
+        previous_features = _managed_previous_features(original)
+    if not previous_features and CODEX_CONFIG_BACKUP_PATH.exists():
+        previous_features = _extract_section_key_lines(
+            CODEX_CONFIG_BACKUP_PATH.read_text(),
+            MANAGED_FEATURES_SECTION,
+            MANAGED_FEATURE_KEYS,
+        )
+    cleaned = _remove_keys_from_section(cleaned, MANAGED_FEATURES_SECTION, MANAGED_FEATURE_KEYS)
     provider_name = _provider_display_name(models, default_slug, router_config)
-    top_block, provider_block = _managed_config_blocks(
-        default_slug, port, previous_top_level, provider_name=provider_name
+    top_block, provider_block, features_block = _managed_config_blocks(
+        default_slug,
+        port,
+        previous_top_level,
+        provider_name=provider_name,
+        previous_features=previous_features,
     )
-    CODEX_CONFIG_PATH.write_text(top_block + "\n" + cleaned.lstrip() + "\n" + provider_block)
+    CODEX_CONFIG_PATH.write_text(
+        top_block + "\n" + cleaned.lstrip() + "\n" + provider_block + "\n" + features_block
+    )
     print(f"Installed shim config into {CODEX_CONFIG_PATH}.")
 
 
@@ -295,11 +315,19 @@ def restore_codex_config() -> None:
     if CODEX_CONFIG_PATH.exists():
         current = CODEX_CONFIG_PATH.read_text()
         previous_top_level = _managed_previous_top_level(current)
+        previous_features = _managed_previous_features(current)
         if not previous_top_level and CODEX_CONFIG_BACKUP_PATH.exists():
             previous_top_level = _extract_top_level_key_lines(CODEX_CONFIG_BACKUP_PATH.read_text(), MANAGED_TOP_LEVEL_KEYS)
+        if not previous_features and CODEX_CONFIG_BACKUP_PATH.exists():
+            previous_features = _extract_section_key_lines(
+                CODEX_CONFIG_BACKUP_PATH.read_text(),
+                MANAGED_FEATURES_SECTION,
+                MANAGED_FEATURE_KEYS,
+            )
         restored = _remove_managed_config(current)
         restored = _remove_section(restored, f"model_providers.{PROVIDER_NAME}")
         restored = _restore_missing_top_level_keys(restored.lstrip(), previous_top_level)
+        restored = _restore_features_keys(restored, previous_features)
         CODEX_CONFIG_PATH.write_text(restored)
         print(f"Removed shim config from {CODEX_CONFIG_PATH}.")
     if CODEX_CONFIG_BACKUP_PATH.exists():
@@ -650,10 +678,13 @@ def _managed_config_blocks(
     port: int,
     previous_top_level: dict[str, str] | None = None,
     provider_name: str = "Codex Shim",
-) -> tuple[str, str]:
+    previous_features: dict[str, str] | None = None,
+) -> tuple[str, str, str]:
     metadata = ""
     if previous_top_level:
-        metadata = PREVIOUS_TOP_LEVEL_PREFIX + json.dumps(previous_top_level, sort_keys=True) + "\n"
+        metadata += PREVIOUS_TOP_LEVEL_PREFIX + json.dumps(previous_top_level, sort_keys=True) + "\n"
+    if previous_features:
+        metadata += PREVIOUS_FEATURES_PREFIX + json.dumps(previous_features, sort_keys=True) + "\n"
     top_block = f'''{MANAGED_BEGIN}
 {metadata}model = "{_toml_escape(default_slug)}"
 model_provider = "{PROVIDER_NAME}"
@@ -673,7 +704,13 @@ stream_max_retries = 3
 stream_idle_timeout_ms = 600000
 {MANAGED_END}
 '''
-    return top_block, provider_block
+
+    features_block = f'''{MANAGED_BEGIN}
+[{MANAGED_FEATURES_SECTION}]
+{MANAGED_FEATURE_KEY} = true
+{MANAGED_END}
+'''
+    return top_block, provider_block, features_block
 
 
 def _remove_managed_config(text: str) -> str:
@@ -737,6 +774,31 @@ def _managed_previous_top_level(text: str) -> dict[str, str]:
     return {}
 
 
+def _managed_previous_features(text: str) -> dict[str, str]:
+    in_managed = False
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped == MANAGED_BEGIN:
+            in_managed = True
+            continue
+        if stripped == MANAGED_END:
+            in_managed = False
+            continue
+        if in_managed and stripped.startswith(PREVIOUS_FEATURES_PREFIX):
+            encoded = stripped[len(PREVIOUS_FEATURES_PREFIX) :]
+            try:
+                payload = json.loads(encoded)
+            except json.JSONDecodeError:
+                return {}
+            if isinstance(payload, dict):
+                return {
+                    str(k): str(v)
+                    for k, v in payload.items()
+                    if k in MANAGED_FEATURE_KEYS and str(v).strip()
+                }
+    return {}
+
+
 def _restore_missing_top_level_keys(text: str, previous_top_level: dict[str, str]) -> str:
     if not previous_top_level:
         return text
@@ -768,6 +830,94 @@ def _remove_section(text: str, section: str) -> str:
         if not skipping:
             output.append(line)
     return "\n".join(output) + ("\n" if text.endswith("\n") else "")
+
+
+def _section_header(section: str) -> str:
+    return f"[{section}]"
+
+
+def _extract_section_key_lines(text: str, section: str, keys: set[str]) -> dict[str, str]:
+    found: dict[str, str] = {}
+    in_section = False
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("[") and stripped.endswith("]"):
+            in_section = stripped == _section_header(section)
+            continue
+        if not in_section or not stripped or stripped.startswith("#") or "=" not in stripped:
+            continue
+        key = stripped.split("=", 1)[0].strip()
+        if key in keys:
+            found[key] = line
+    return found
+
+
+def _remove_keys_from_section(text: str, section: str, keys: set[str]) -> str:
+    lines = text.splitlines()
+    output: list[str] = []
+    in_section = False
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("[") and stripped.endswith("]"):
+            in_section = stripped == _section_header(section)
+            output.append(line)
+            continue
+        if in_section and stripped and not stripped.startswith("#") and "=" in stripped:
+            key = stripped.split("=", 1)[0].strip()
+            if key in keys:
+                continue
+        output.append(line)
+    return "\n".join(output) + ("\n" if text.endswith("\n") else "")
+
+
+def _restore_features_keys(text: str, previous_features: dict[str, str]) -> str:
+    if not previous_features:
+        return text
+    restored = text
+    for key in MANAGED_FEATURE_KEYS:
+        line = previous_features.get(key)
+        if not line:
+            continue
+        restored = _upsert_key_in_section(restored, MANAGED_FEATURES_SECTION, key, line)
+    return restored
+
+
+def _strip_trailing_blank_lines(lines: list[str]) -> None:
+    while lines and not lines[-1].strip():
+        lines.pop()
+
+
+def _upsert_key_in_section(text: str, section: str, key: str, line: str) -> str:
+    header = _section_header(section)
+    lines = text.splitlines()
+    output: list[str] = []
+    in_section = False
+    inserted = False
+    section_exists = header in {ln.strip() for ln in lines if ln.strip().startswith("[") and ln.strip().endswith("]")}
+    for raw_line in lines:
+        stripped = raw_line.strip()
+        if stripped.startswith("[") and stripped.endswith("]"):
+            if in_section and not inserted:
+                _strip_trailing_blank_lines(output)
+                output.append(line)
+                inserted = True
+            in_section = stripped == header
+            output.append(raw_line)
+            continue
+        if in_section and stripped and not stripped.startswith("#") and "=" in stripped:
+            current_key = stripped.split("=", 1)[0].strip()
+            if current_key == key:
+                output.append(line)
+                inserted = True
+                continue
+        output.append(raw_line)
+    if section_exists:
+        if in_section and not inserted:
+            _strip_trailing_blank_lines(output)
+            output.append(line)
+        return "\n".join(output) + ("\n" if text.endswith("\n") else "")
+    prefix = "\n" if text and not text.endswith("\n") else ""
+    return text.rstrip() + f"{prefix}{header}\n{line}\n"
 
 
 def _popen_daemon(cmd: list[str], log, env: dict[str, str]) -> subprocess.Popen:
