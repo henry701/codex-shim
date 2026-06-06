@@ -564,6 +564,142 @@ async def test_write_chat_delta_skips_content_after_complete_tool_call():
     assert state.message_text == ""
 
 
+async def test_write_chat_delta_streams_content_before_tool_call():
+    class FakeResponse:
+        def __init__(self):
+            self.chunks: list[bytes] = []
+
+        async def write(self, data: bytes):
+            self.chunks.append(data)
+
+    downstream = FakeResponse()
+    state = ResponsesStreamState("local-llama")
+    await state.start(downstream)
+    await state.write_chat_delta(
+        downstream,
+        {
+            "choices": [
+                {
+                    "delta": {
+                        "content": "Let me search Exa for the latest headline.",
+                    }
+                }
+            ]
+        },
+    )
+    await state.write_chat_delta(
+        downstream,
+        {
+            "choices": [
+                {
+                    "delta": {
+                        "tool_calls": [
+                            {
+                                "index": 0,
+                                "id": "call_exa",
+                                "function": {
+                                    "name": "mcp__exa__web_search_exa",
+                                    "arguments": '{"query":"ukraine"}',
+                                },
+                            }
+                        ]
+                    },
+                    "finish_reason": "tool_calls",
+                }
+            ]
+        },
+    )
+    assert state.message_text == "Let me search Exa for the latest headline."
+    assert state.discard_stats.skipped_content_chars == 0
+    events = _sse_events(b"".join(downstream.chunks).decode())
+    text_deltas = [e for e in events if e.get("type") == "response.output_text.delta"]
+    assert text_deltas
+    assert "".join(e["delta"] for e in text_deltas) == state.message_text
+
+
+async def test_write_chat_delta_streams_content_with_incomplete_tool_in_same_chunk():
+    class FakeResponse:
+        def __init__(self):
+            self.chunks: list[bytes] = []
+
+        async def write(self, data: bytes):
+            self.chunks.append(data)
+
+    downstream = FakeResponse()
+    state = ResponsesStreamState("local-llama")
+    await state.start(downstream)
+    await state.write_chat_delta(
+        downstream,
+        {
+            "choices": [
+                {
+                    "delta": {
+                        "content": "Let me search...",
+                        "tool_calls": [
+                            {
+                                "index": 0,
+                                "id": "call_exa",
+                                "function": {
+                                    "name": "mcp__exa__web_search_exa",
+                                    "arguments": '{"query":"uk',
+                                },
+                            }
+                        ],
+                    }
+                }
+            ]
+        },
+    )
+    assert state.message_text == "Let me search..."
+    assert state.discard_stats.skipped_content_chars == 0
+
+
+async def test_write_chat_delta_skips_content_after_tool_closed_in_prior_chunk():
+    class FakeResponse:
+        async def write(self, data: bytes):
+            return None
+
+    downstream = FakeResponse()
+    state = ResponsesStreamState("local-llama")
+    await state.write_chat_delta(
+        downstream,
+        {
+            "choices": [
+                {
+                    "delta": {
+                        "tool_calls": [
+                            {
+                                "index": 0,
+                                "id": "call_exa",
+                                "function": {
+                                    "name": "mcp__exa__web_search_exa",
+                                    "arguments": '{"query":"ukraine"}',
+                                },
+                            }
+                        ]
+                    },
+                    "finish_reason": "tool_calls",
+                }
+            ]
+        },
+    )
+    await state.write_chat_delta(
+        downstream,
+        {
+            "choices": [
+                {
+                    "delta": {
+                        "content": "I'll summarize once results arrive.",
+                    },
+                    "finish_reason": "tool_calls",
+                }
+            ]
+        },
+    )
+    assert state.discard_stats.skipped_content_chars == len("I'll summarize once results arrive.")
+    assert state.message_text == ""
+
+
 async def test_write_chat_delta_ends_upstream_turn_when_tool_call_complete():
     class FakeResponse:
         async def write(self, data: bytes):

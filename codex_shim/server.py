@@ -1199,6 +1199,10 @@ class ResponsesStreamState:
         self.next_output_index = 0
         self.completed_turns: list[dict[str, Any]] = []
         self.discard_stats = _TurnDiscardStats()
+        self.post_tool_content_cutoff = False
+
+    def _mark_post_tool_content_cutoff(self) -> None:
+        self.post_tool_content_cutoff = True
 
     def _pending_tool_calls(self) -> list[dict[str, Any]]:
         pending: list[dict[str, Any]] = []
@@ -1301,6 +1305,7 @@ class ResponsesStreamState:
         self.tool_search_calls = {}
         self.reasoning_blocks = {}
         self.discard_stats = _TurnDiscardStats()
+        self.post_tool_content_cutoff = False
 
     def _current_turn_dict(self) -> dict[str, Any]:
         return {
@@ -1342,7 +1347,7 @@ class ResponsesStreamState:
             self.discard_stats.finish_reason = str(finish_reason)
         content = delta.get("content")
         if content:
-            if end_turn or self.has_complete_tool_calls():
+            if self.post_tool_content_cutoff:
                 self.discard_stats.record_skipped_content(
                     content,
                     reason=str(finish_reason) if finish_reason else "tool_calls",
@@ -1605,6 +1610,7 @@ class ResponsesStreamState:
                     state = await self._open_tool_search(response, index, state)
                     break
         state["closed"] = True
+        self._mark_post_tool_content_cutoff()
         raw_arguments = state.get("arguments") or ""
         await _write_sse(
             response,
@@ -1727,6 +1733,7 @@ class ResponsesStreamState:
                     state = await self._open_mcp_tool(response, index, state)
                     break
         state["closed"] = True
+        self._mark_post_tool_content_cutoff()
         arguments = state.get("arguments") or ""
         await _write_sse(
             response,
@@ -1965,6 +1972,7 @@ class ResponsesStreamState:
         if state.get("closed") or not _tool_call_arguments_complete(state):
             return
         state["closed"] = True
+        self._mark_post_tool_content_cutoff()
         await _write_sse(
             response,
             {
