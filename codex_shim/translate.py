@@ -12,33 +12,6 @@ THINK_RE = re.compile(r"<think>.*?</think>", re.IGNORECASE | re.DOTALL)
 SHIM_ENCRYPTED_CONTENT_PREFIX = "anthropic-thinking-v1:"
 _THINKING_MAGIC = SHIM_ENCRYPTED_CONTENT_PREFIX
 
-MCP_TOOL_HINT = (
-    "MCP tool-calling convention for BYOK/local models:\n"
-    "1. To discover deferred MCP tools, call tool_search_call once with a short token "
-    "(e.g. query='exa' or 'web_search_exa'). Do NOT repeat tool_search_call after it "
-    "returns a full tool name.\n"
-    "2. Invoke MCP tools by full name mcp__<server>__<tool> (e.g. mcp__exa__web_search_exa). "
-    "Do NOT call bare server stubs like mcp__exa — Codex returns 'unsupported call'.\n"
-    "3. For web/news lookup when Exa MCP is available, use mcp__exa__web_search_exa — "
-    "NOT shell_command, command_execution, exec_command, curl, or a native web_search tool.\n"
-    "4. If a call returns 'unsupported call: X', do not retry X; pick a different tool.\n"
-    "5. tool_search_call queries should omit the mcp__ prefix (use 'exa', not 'mcp__exa')."
-)
-
-
-def _tools_have_mcp(tools: Any) -> bool:
-    if not isinstance(tools, list):
-        return False
-    for t in tools:
-        if not isinstance(t, dict):
-            continue
-        name = t.get("name")
-        if not name and isinstance(t.get("function"), dict):
-            name = t["function"].get("name")
-        if isinstance(name, str) and name.startswith("mcp__"):
-            return True
-    return False
-
 
 def _decode_thinking_blob(encoded: Any) -> dict[str, Any] | None:
     import base64
@@ -62,9 +35,6 @@ def responses_to_chat(
 ) -> dict[str, Any]:
     messages = []
     instructions_text = _content_to_text(body.get("instructions")) if body.get("instructions") else ""
-    needs_tool_search = mcp_search.responses_tools_need_tool_search(body.get("tools"))
-    if needs_tool_search:
-        instructions_text = MCP_TOOL_HINT + ("\n\n" + instructions_text if instructions_text else "")
     if instructions_text:
         messages.append({"role": "system", "content": instructions_text})
     pending_reasoning: str | None = None
@@ -94,21 +64,6 @@ def responses_to_chat(
     _copy_if_present(body, chat, "reasoning_effort")
 
     tools = _responses_tools_to_chat_tools(body.get("tools"))
-    if needs_tool_search:
-        filtered: list[dict[str, Any]] = []
-        for tool in tools:
-            fn = tool.get("function") or {}
-            name = fn.get("name") or tool.get("name") or ""
-            if isinstance(name, str) and name.startswith("mcp__") and name.count("__") == 1:
-                continue
-            if name in {"tool_search", mcp_search.MCP_TOOL_SEARCH_NAME}:
-                continue
-            filtered.append(tool)
-        tools = [mcp_search.MCP_TOOL_SEARCH_DEFINITION, *filtered]
-        for raw in mcp_search.discovered_tool_search_tools_from_input(body.get("input")):
-            chat_tool = _responses_tool_to_chat_function(raw)
-            if chat_tool is not None:
-                tools = _append_unique_chat_tool(tools, chat_tool)
     if tools:
         chat["tools"] = tools
         tool_choice = _responses_tool_choice_to_chat(body.get("tool_choice"), body.get("tools"))
@@ -466,7 +421,7 @@ def _responses_input_to_messages(value: Any) -> list[dict[str, Any]]:
                     "id": call_id,
                     "type": "function",
                     "function": {
-                        "name": mcp_search.MCP_TOOL_SEARCH_NAME,
+                        "name": mcp_search.CODEX_TOOL_SEARCH_NAME,
                         "arguments": json.dumps(args) if isinstance(args, dict) else str(args),
                     },
                 }
@@ -670,32 +625,19 @@ def _content_to_text(content: Any) -> str:
     return str(content)
 
 
-def _append_unique_chat_tool(
-    tools: list[dict[str, Any]],
-    tool: dict[str, Any],
-) -> list[dict[str, Any]]:
-    fn = tool.get("function") or {}
-    name = fn.get("name") or tool.get("name")
-    if not isinstance(name, str) or not name:
-        return tools
-    existing = {
-        (entry.get("function") or {}).get("name") or entry.get("name")
-        for entry in tools
-        if isinstance(entry, dict)
-    }
-    if name in existing:
-        return tools
-    return [*tools, tool]
-
-
 def _responses_tools_to_chat_tools(tools: Any) -> list[dict[str, Any]]:
     if not isinstance(tools, list):
         return []
     converted = []
     for tool in tools:
         function_tool = _responses_tool_to_chat_function(tool)
-        if function_tool:
-            converted.append(function_tool)
+        if function_tool is None:
+            continue
+        fn = function_tool.get("function") or {}
+        name = fn.get("name") or ""
+        if mcp_search.is_deferred_mcp_server_stub(name):
+            continue
+        converted.append(function_tool)
     return converted
 
 
@@ -724,6 +666,8 @@ def _responses_tool_function_name(tool: dict[str, Any]) -> str:
     if tool.get("name"):
         return _sanitize_tool_name(str(tool["name"]))
     tool_type = str(tool.get("type") or "").strip().lower()
+    if tool_type == mcp_search.CODEX_TOOL_SEARCH_TYPE:
+        return mcp_search.CODEX_TOOL_SEARCH_NAME
     aliases = {
         "web_search": "web_search",
         "web_search_preview": "web_search",
@@ -736,6 +680,9 @@ def _responses_tool_function_name(tool: dict[str, Any]) -> str:
     if tool_type in aliases:
         return aliases[tool_type]
     if tool_type.startswith("mcp"):
+        name = tool.get("name")
+        if isinstance(name, str) and name:
+            return _sanitize_tool_name(name)
         return _sanitize_tool_name(tool_type)
     return ""
 

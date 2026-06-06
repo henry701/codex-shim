@@ -1,9 +1,4 @@
-"""MCP tool discovery helpers for the codex-shim.
-
-Injects a virtual ``tool_search_call`` tool definition into BYOK upstream
-requests when Codex exposes deferred MCP discovery (``tool_search`` or
-``mcp__*`` server stubs).
-"""
+"""MCP and tool_search helpers for codex-shim Responses ↔ chat-completions translation."""
 
 from __future__ import annotations
 
@@ -12,39 +7,10 @@ import os
 from pathlib import Path
 from typing import Any
 
+CODEX_TOOL_SEARCH_TYPE = "tool_search"
+CODEX_TOOL_SEARCH_NAME = "tool_search"
+# Responses stream/item type emitted by Codex and accepted from upstream aliases.
 MCP_TOOL_SEARCH_NAME = "tool_search_call"
-
-MCP_TOOL_SEARCH_DEFINITION: dict[str, Any] = {
-    "type": "function",
-    "function": {
-        "name": MCP_TOOL_SEARCH_NAME,
-        "description": (
-            "Look up MCP tool names before calling them. Pass `query` as a short "
-            "server or tool token (e.g. 'exa' or 'web_search_exa') to search Codex's "
-            "local deferred-tool index. Returns JSON with full mcp__<server>__<tool> "
-            "names to call on the next turn — call that tool directly; do not repeat "
-            "tool_search_call. Do NOT call bare server stubs like mcp__exa as a tool "
-            "— that fails with 'unsupported call'. Avoid mcp__-prefixed search strings."
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "query": {
-                    "type": "string",
-                    "description": (
-                        "Short search token, e.g. 'exa' to list Exa tools or "
-                        "'web_search_exa' for one tool's description."
-                    ),
-                }
-            },
-            "required": ["query"],
-        },
-    },
-}
-
-_FALLBACK_MCP_URLS: dict[str, str] = {
-    "mcp__exa": "https://mcp.exa.ai/mcp?tools=web_search_exa",
-}
 
 _CONFIG_CACHE: dict[str, Any] | None = None
 
@@ -145,12 +111,11 @@ def resolve_mcp_url(server_name: str) -> str | None:
     urls = _read_codex_mcp_servers()
     if server_name in urls:
         return urls[server_name]
-    return _FALLBACK_MCP_URLS.get(server_name)
+    return None
 
 
 def known_mcp_servers() -> list[str]:
-    urls = _read_codex_mcp_servers()
-    return list({*urls.keys(), *_FALLBACK_MCP_URLS.keys()})
+    return list(_read_codex_mcp_servers().keys())
 
 
 def is_mcp_tool_call(name: str) -> str | None:
@@ -177,20 +142,15 @@ def parse_mcp_function_name(name: str) -> tuple[str, str] | None:
 
 
 def is_tool_search_call(name: str) -> bool:
-    return name == MCP_TOOL_SEARCH_NAME
+    return name in {CODEX_TOOL_SEARCH_NAME, MCP_TOOL_SEARCH_NAME}
 
 
-_UPSTREAM_TOOL_ALIASES: dict[str, str] = {
-    "web_search_exa": "mcp__exa__web_search_exa",
-    "web_search": "mcp__exa__web_search_exa",
-}
+def is_deferred_mcp_server_stub(name: str) -> bool:
+    return isinstance(name, str) and name.startswith("mcp__") and name.count("__") == 1
 
 
 def normalize_upstream_tool_name(name: str) -> str:
-    stripped = name.strip()
-    if not stripped:
-        return stripped
-    return _UPSTREAM_TOOL_ALIASES.get(stripped, stripped)
+    return name.strip()
 
 
 def full_mcp_tool_name(namespace: str, tool_name: str) -> str | None:
@@ -253,26 +213,6 @@ def flatten_tool_search_tools(tools: Any) -> list[dict[str, Any]]:
         if name.startswith("mcp__") and name.count("__") >= 2:
             flattened.append(_tool_search_entry_with_full_name(entry, name))
     return flattened
-
-
-def discovered_tool_search_tools_from_input(input_items: Any) -> list[dict[str, Any]]:
-    """Collect flattened MCP function tools from ``tool_search_output`` items in request input."""
-    if not isinstance(input_items, list):
-        return []
-    discovered: list[dict[str, Any]] = []
-    seen: set[str] = set()
-    for item in input_items:
-        if not isinstance(item, dict):
-            continue
-        if str(item.get("type") or "").strip().lower() != "tool_search_output":
-            continue
-        for tool in flatten_tool_search_tools(item.get("tools")):
-            name = str(tool.get("name") or "")
-            if not name or name in seen:
-                continue
-            seen.add(name)
-            discovered.append(tool)
-    return discovered
 
 
 def format_tool_search_result(query: str, tools: list[dict[str, Any]]) -> str:

@@ -207,7 +207,6 @@ class ShimServer:
             forwarded["model"] = route.model
             if "messages" in forwarded:
                 forwarded["messages"] = _normalize_roles(forwarded["messages"])
-            _inject_tool_search_if_mcp(forwarded)
             return await self._post_openai_chat(request, route, forwarded, as_responses=False)
         if route.is_anthropic:
             forwarded = chat_to_anthropic(body, route.model, route.max_output_tokens)
@@ -2355,39 +2354,6 @@ def _normalize_roles(messages: list[dict]) -> list[dict]:
                 message["role"] = "system"
         result.append(message)
     return result
-
-
-def _inject_tool_search_if_mcp(body: dict[str, Any]) -> None:
-    if not mcp_search.responses_tools_need_tool_search(body.get("tools")):
-        return
-    tools = body.get("tools")
-    if not isinstance(tools, list):
-        return
-    already = any(
-        isinstance(t, dict)
-        and (t.get("name") == mcp_search.MCP_TOOL_SEARCH_NAME
-             or (isinstance(t.get("function"), dict)
-                 and t["function"].get("name") == mcp_search.MCP_TOOL_SEARCH_NAME))
-        for t in tools
-    )
-    if already:
-        return
-    filtered: list[dict[str, Any]] = []
-    for t in tools:
-        if not isinstance(t, dict):
-            filtered.append(t)
-            continue
-        fn = t.get("function")
-        name = t.get("name") if isinstance(t.get("name"), str) else None
-        if not name and isinstance(fn, dict):
-            name = fn.get("name")
-        tool_type = str(t.get("type") or "").strip().lower()
-        if tool_type == "tool_search":
-            continue
-        if isinstance(name, str) and name.startswith("mcp__") and name.count("__") == 1:
-            continue
-        filtered.append(t)
-    body["tools"] = [mcp_search.MCP_TOOL_SEARCH_DEFINITION, *filtered]
 
 
 def _dump_debug_request(slug: str, url: str, body: dict[str, Any]) -> None:

@@ -6,14 +6,36 @@ from codex_shim import mcp_search
 from codex_shim.translate import responses_to_chat
 
 
-def test_mcp_tool_search_definition_is_nested_chat_format():
-    fn = mcp_search.MCP_TOOL_SEARCH_DEFINITION["function"]
-    assert fn["name"] == "tool_search_call"
-    assert "query" in fn["parameters"]["properties"]
-    assert "query" in fn["parameters"]["required"]
+def test_responses_to_chat_translates_native_tool_search():
+    body = {
+        "model": "slug",
+        "input": [{"role": "user", "content": "hi"}],
+        "tools": [
+            {
+                "type": "tool_search",
+                "execution": "client",
+                "description": "Search deferred tools",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"query": {"type": "string"}},
+                    "required": ["query"],
+                },
+            },
+            {"type": "function", "name": "shell_command", "description": "Run shell",
+             "parameters": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}},
+        ],
+    }
+    out = responses_to_chat(body, "gemma-4-E4B")
+    names = [t["function"]["name"] for t in out["tools"]]
+    assert "tool_search" in names
+    assert "tool_search_call" not in names
+    assert "shell_command" in names
+    tool_search = next(t for t in out["tools"] if t["function"]["name"] == "tool_search")
+    assert tool_search["function"]["description"] == "Search deferred tools"
+    assert "query" in tool_search["function"]["parameters"]["properties"]
 
 
-def test_responses_to_chat_injects_tool_search_when_mcp_present():
+def test_responses_to_chat_omits_deferred_mcp_server_stubs():
     body = {
         "model": "slug",
         "instructions": "Be brief.",
@@ -26,10 +48,11 @@ def test_responses_to_chat_injects_tool_search_when_mcp_present():
     }
     out = responses_to_chat(body, "gemma-4-E4B")
     names = [t["function"]["name"] for t in out["tools"]]
-    assert names[0] == "tool_search_call"
+    assert "tool_search_call" not in names
+    assert "tool_search" not in names
     assert "mcp__jina" not in names
-    assert "shell_command" in names
-    assert "MCP tool-calling convention" in out["messages"][0]["content"]
+    assert names == ["shell_command"]
+    assert out["messages"][0]["content"].startswith("Be brief.")
 
 
 def test_responses_to_chat_keeps_full_mcp_tool_names():
@@ -44,7 +67,7 @@ def test_responses_to_chat_keeps_full_mcp_tool_names():
     }
     out = responses_to_chat(body, "gemma-4-E4B")
     names = [t["function"]["name"] for t in out["tools"]]
-    assert "tool_search_call" in names
+    assert "tool_search_call" not in names
     assert "mcp__jina" not in names
     assert "mcp__jina__read_url" in names
 
@@ -61,6 +84,7 @@ def test_responses_to_chat_omits_tool_search_when_no_mcp():
     out = responses_to_chat(body, "gemma-4-E4B")
     names = [t["function"]["name"] for t in out["tools"]]
     assert "tool_search_call" not in names
+    assert "tool_search" not in names
     assert names == ["shell_command"]
 
 
@@ -84,37 +108,11 @@ def test_format_tool_search_result_keeps_already_prefixed():
     assert parsed["tools"][0]["name"] == "mcp__jina__read_url"
 
 
-def test_resolve_mcp_url_uses_fallback_for_known_servers():
-    assert mcp_search.resolve_mcp_url("mcp__exa") is not None
-    assert mcp_search.resolve_mcp_url("mcp__jina") is None
+def test_resolve_mcp_url_reads_config_only():
+    assert mcp_search.resolve_mcp_url("mcp__exa") is None or isinstance(
+        mcp_search.resolve_mcp_url("mcp__exa"), str
+    )
     assert mcp_search.resolve_mcp_url("mcp__unknown_server_xyz") is None
-
-
-def test_responses_to_chat_injects_tool_search_when_native_tool_search_present():
-    body = {
-        "model": "slug",
-        "input": [{"role": "user", "content": "hi"}],
-        "tools": [
-            {
-                "type": "tool_search",
-                "execution": "client",
-                "description": "Search deferred tools",
-                "parameters": {
-                    "type": "object",
-                    "properties": {"query": {"type": "string"}},
-                    "required": ["query"],
-                },
-            },
-            {"type": "function", "name": "shell_command", "description": "Run shell",
-             "parameters": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}},
-        ],
-    }
-    out = responses_to_chat(body, "gemma-4-E4B")
-    names = [t["function"]["name"] for t in out["tools"]]
-    assert names[0] == "tool_search_call"
-    assert "tool_search" not in names
-    assert "shell_command" in names
-    assert "MCP tool-calling convention" in out["messages"][0]["content"]
 
 
 def test_responses_tools_need_tool_search():
@@ -129,30 +127,10 @@ def test_responses_tools_need_tool_search():
     )
 
 
-def test_inject_tool_search_if_mcp_injects_for_native_tool_search():
-    from codex_shim.server import _inject_tool_search_if_mcp
-    body = {
-        "tools": [
-            {"type": "tool_search", "execution": "client", "description": "search"},
-            {"type": "function", "function": {"name": "shell_command"}},
-        ]
-    }
-    _inject_tool_search_if_mcp(body)
-    names = [
-        (t.get("function") or {}).get("name") or t.get("name") or t.get("type")
-        for t in body["tools"]
-    ]
-    assert "tool_search_call" in names
-    assert "tool_search" not in names
-    assert "shell_command" in names
-
-
-def test_inject_tool_search_if_mcp_no_op_without_mcp():
-    from codex_shim.server import _inject_tool_search_if_mcp
-    body = {"tools": [{"type": "function", "function": {"name": "shell_command"}}]}
-    _inject_tool_search_if_mcp(body)
-    names = [(t.get("function") or {}).get("name") for t in body["tools"]]
-    assert names == ["shell_command"]
+def test_is_deferred_mcp_server_stub():
+    assert mcp_search.is_deferred_mcp_server_stub("mcp__exa")
+    assert not mcp_search.is_deferred_mcp_server_stub("mcp__exa__web_search_exa")
+    assert not mcp_search.is_deferred_mcp_server_stub("shell_command")
 
 
 def test_is_mcp_tool_call_parses_full_name():
@@ -165,15 +143,16 @@ def test_is_mcp_tool_call_parses_full_name():
 
 
 def test_is_tool_search_call():
+    assert mcp_search.is_tool_search_call("tool_search")
     assert mcp_search.is_tool_search_call("tool_search_call")
     assert not mcp_search.is_tool_search_call("mcp__exa__web_search_exa")
     assert not mcp_search.is_tool_search_call("exec_command")
     assert not mcp_search.is_tool_search_call("mcp__exa")
 
 
-def test_normalize_upstream_tool_name_aliases_web_search():
-    assert mcp_search.normalize_upstream_tool_name("web_search_exa") == "mcp__exa__web_search_exa"
-    assert mcp_search.normalize_upstream_tool_name("web_search") == "mcp__exa__web_search_exa"
+def test_normalize_upstream_tool_name_is_passthrough():
+    assert mcp_search.normalize_upstream_tool_name("web_search_exa") == "web_search_exa"
+    assert mcp_search.normalize_upstream_tool_name("web_search") == "web_search"
     assert mcp_search.normalize_upstream_tool_name("exec_command") == "exec_command"
 
 
@@ -221,7 +200,7 @@ def test_flatten_tool_search_full_name_tools():
     assert flattened[0]["name"] == "mcp__exa__web_search_exa"
 
 
-def test_responses_to_chat_injects_discovered_mcp_tools_from_tool_search_output():
+def test_responses_to_chat_does_not_inject_discovered_tools_into_tools_array():
     body = {
         "model": "slug",
         "input": [
@@ -258,7 +237,9 @@ def test_responses_to_chat_injects_discovered_mcp_tools_from_tool_search_output(
     }
     out = responses_to_chat(body, "gemma-4-E4B")
     names = [t["function"]["name"] for t in out["tools"]]
-    assert "mcp__exa__web_search_exa" in names
+    assert "mcp__exa__web_search_exa" not in names
     assert "mcp__exa" not in names
+    assert "tool_search" in names
+    assert "exec_command" in names
     tool_messages = [m for m in out["messages"] if m.get("role") == "tool"]
     assert "mcp__exa__web_search_exa" in tool_messages[0]["content"]
