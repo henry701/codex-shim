@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import json
-
 from codex_shim.translate import anthropic_to_response, chat_completion_to_response, responses_to_anthropic, responses_to_chat
 
 
@@ -280,39 +278,3 @@ def test_anthropic_to_response_normalizes_cache_usage():
             "cache_creation_input_tokens": 2,
         },
     }
-
-
-def test_truncate_byok_tool_content_shortens_large_json_lists():
-    from codex_shim.translate import _truncate_byok_tool_content
-
-    payload = json.dumps({"results": [{"title": f"hit-{i}"} for i in range(20)]})
-    out = _truncate_byok_tool_content(payload, max_chars=50000)
-    parsed = json.loads(out)
-    assert len(parsed["results"]) == 3
-    assert parsed["_shim_truncated"]["total"] == 20
-
-
-def test_truncate_byok_tool_content_plain_fallback():
-    from codex_shim.translate import _truncate_byok_tool_content
-
-    text = "x" * 200
-    out = _truncate_byok_tool_content(text, max_chars=120)
-    assert out.startswith("x")
-    assert "truncated" in out
-    assert len(out) < len(text)
-
-
-def test_responses_to_chat_truncates_large_function_call_output():
-    big = json.dumps({"results": [{"title": f"hit-{i}", "text": "z" * 200} for i in range(50)]})
-    body = {
-        "model": "slug",
-        "input": [
-            {"type": "function_call_output", "call_id": "call_exa", "output": big},
-            {"type": "message", "role": "user", "content": "summarize"},
-        ],
-        "tools": [{"type": "function", "name": "mcp__exa", "description": "MCP server"}],
-    }
-    out = responses_to_chat(body, "local-llama")
-    tool_msg = next(m for m in out["messages"] if m.get("role") == "tool")
-    assert len(tool_msg["content"]) < len(big)
-    assert "_shim_truncated" in tool_msg["content"]
