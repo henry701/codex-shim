@@ -596,6 +596,65 @@ async def test_write_chat_delta_ends_upstream_turn_when_tool_call_complete():
     assert state.has_complete_tool_calls()
 
 
+async def test_mcp_tool_call_emits_namespaced_function_call_when_name_is_chunked():
+    class FakeResponse:
+        def __init__(self):
+            self.chunks: list[bytes] = []
+
+        async def write(self, data: bytes):
+            self.chunks.append(data)
+
+    downstream = FakeResponse()
+    state = ResponsesStreamState("local-llama")
+    await state.start(downstream)
+    for part in ("mcp", "__exa", "__web_search_exa"):
+        await state.write_chat_delta(
+            downstream,
+            {
+                "choices": [
+                    {
+                        "delta": {
+                            "tool_calls": [
+                                {
+                                    "index": 0,
+                                    "id": "call_exa",
+                                    "function": {"name": part, "arguments": ""},
+                                }
+                            ]
+                        }
+                    }
+                ]
+            },
+        )
+    await state.write_chat_delta(
+        downstream,
+        {
+            "choices": [
+                {
+                    "delta": {
+                        "tool_calls": [
+                            {
+                                "index": 0,
+                                "function": {"arguments": '{"query":"ukraine"}'},
+                            }
+                        ]
+                    }
+                }
+            ]
+        },
+    )
+    events = _sse_events(b"".join(downstream.chunks).decode())
+    function_added = [
+        e
+        for e in events
+        if e.get("type") == "response.output_item.added"
+        and (e.get("item") or {}).get("type") == "function_call"
+        and (e.get("item") or {}).get("namespace") == "mcp__exa"
+    ]
+    assert len(function_added) == 1
+    assert function_added[0]["item"]["name"] == "web_search_exa"
+
+
 async def test_mcp_tool_call_emits_namespaced_function_call():
     class FakeResponse:
         def __init__(self):

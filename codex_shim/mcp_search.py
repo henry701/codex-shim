@@ -19,20 +19,22 @@ MCP_TOOL_SEARCH_DEFINITION: dict[str, Any] = {
     "function": {
         "name": MCP_TOOL_SEARCH_NAME,
         "description": (
-            "Look up MCP tool names before calling them. Pass `query` as either "
-            "a bare MCP server name (e.g. 'mcp__jina') to list every tool that "
-            "server exposes, or a full tool name (e.g. 'mcp__jina__read_url') "
-            "to fetch the description of one specific tool. Returns a JSON "
-            "object with the mcp__<server>__<tool> names you should then call "
-            "directly on the next turn. Do NOT call bare server names like "
-            "'mcp__jina' as a tool — that fails with 'unsupported call'."
+            "Look up MCP tool names before calling them. Pass `query` as a short "
+            "server or tool token (e.g. 'exa' or 'web_search_exa') to search Codex's "
+            "local deferred-tool index. Returns JSON with full mcp__<server>__<tool> "
+            "names to call on the next turn. Do NOT call bare server stubs like "
+            "mcp__exa as a tool — that fails with 'unsupported call'. Avoid "
+            "mcp__-prefixed search strings; they often match nothing."
         ),
         "parameters": {
             "type": "object",
             "properties": {
                 "query": {
                     "type": "string",
-                    "description": "Either a bare MCP server name (e.g. 'mcp__jina') to list its tools, or a full tool name (e.g. 'mcp__jina__read_url') to fetch one tool's description.",
+                    "description": (
+                        "Short search token, e.g. 'exa' to list Exa tools or "
+                        "'web_search_exa' for one tool's description."
+                    ),
                 }
             },
             "required": ["query"],
@@ -176,6 +178,19 @@ def parse_mcp_function_name(name: str) -> tuple[str, str] | None:
 
 def is_tool_search_call(name: str) -> bool:
     return name == MCP_TOOL_SEARCH_NAME
+
+
+_UPSTREAM_TOOL_ALIASES: dict[str, str] = {
+    "web_search_exa": "mcp__exa__web_search_exa",
+    "web_search": "mcp__exa__web_search_exa",
+}
+
+
+def normalize_upstream_tool_name(name: str) -> str:
+    stripped = name.strip()
+    if not stripped:
+        return stripped
+    return _UPSTREAM_TOOL_ALIASES.get(stripped, stripped)
 
 
 def format_tool_search_result(query: str, tools: list[dict[str, Any]]) -> str:

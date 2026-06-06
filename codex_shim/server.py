@@ -1132,6 +1132,14 @@ def _tool_call_arguments_complete(tc: dict[str, Any]) -> bool:
     return True
 
 
+def _should_defer_tool_name(name: str) -> bool:
+    if not name:
+        return True
+    if mcp_search.is_tool_search_call(name) or mcp_search.parse_mcp_function_name(name):
+        return False
+    return name.startswith("mcp")
+
+
 class _TurnDiscardStats:
     """Tokens/content skipped when cutting an upstream turn at tool-call boundary."""
 
@@ -1339,12 +1347,48 @@ class ResponsesStreamState:
     ) -> None:
         index = int(call.get("index", 0))
         fn = call.get("function") or {}
+        pending = self.tool_calls.get(index)
+        if pending is not None and not pending.get("emitted"):
+            pending["name"] = mcp_search.normalize_upstream_tool_name(
+                (pending.get("name") or "") + (fn.get("name") or "")
+            )
+            arg_delta = fn.get("arguments") or ""
+            if arg_delta:
+                pending["arguments"] += arg_delta
+            await self._finalize_pending_tool(response, index)
+            if index in self.mcp_tool_calls:
+                await self._chat_mcp_tool_delta(
+                    response,
+                    index,
+                    call,
+                    fn,
+                    self.mcp_tool_calls[index]["name"],
+                )
+                return
+            if index in self.tool_search_calls:
+                await self._chat_tool_search_delta(
+                    response,
+                    index,
+                    call,
+                    fn,
+                    self.tool_search_calls[index]["name"],
+                )
+                return
+            pending = self.tool_calls.get(index)
+            if pending is None or not pending.get("emitted"):
+                return
+
         existing = (
             self.tool_calls.get(index)
             or self.mcp_tool_calls.get(index)
             or self.tool_search_calls.get(index)
         )
-        name = (existing.get("name") if existing else "") + (fn.get("name") or "")
+        name = existing.get("name") if existing else mcp_search.normalize_upstream_tool_name(fn.get("name") or "")
+        if existing is not None and fn.get("name") and existing is not pending:
+            existing["name"] = mcp_search.normalize_upstream_tool_name(
+                (existing.get("name") or "") + (fn.get("name") or "")
+            )
+            name = existing["name"]
         if mcp_search.is_tool_search_call(name) or index in self.tool_search_calls:
             await self._chat_tool_search_delta(response, index, call, fn, name)
             return
@@ -1354,24 +1398,108 @@ class ResponsesStreamState:
         state = self.tool_calls.get(index)
         if state is None:
             call_id = call.get("id") or f"call_{index}"
+            if _should_defer_tool_name(name):
+                self.tool_calls[index] = {
+                    "id": call_id,
+                    "call_id": call_id,
+                    "name": name,
+                    "arguments": fn.get("arguments") or "",
+                    "closed": False,
+                    "emitted": False,
+                }
+                await self._finalize_pending_tool(response, index)
+                return
             state = await self._open_tool(
-                response, key=index, call_id=call_id, name=fn.get("name") or ""
+                response, key=index, call_id=call_id, name=name
             )
+            state["emitted"] = True
+            arg_delta = fn.get("arguments") or ""
+            if arg_delta:
+                state["arguments"] = arg_delta
+                await _write_sse(
+                    response,
+                    {
+                        "type": "response.function_call_arguments.delta",
+                        "item_id": state["id"],
+                        "output_index": state["output_index"],
+                        "delta": arg_delta,
+                    },
+                )
         else:
             if fn.get("name"):
-                state["name"] += fn["name"]
-        arg_delta = fn.get("arguments") or ""
-        if arg_delta:
-            state["arguments"] += arg_delta
-            await _write_sse(
-                response,
-                {
-                    "type": "response.function_call_arguments.delta",
-                    "item_id": state["id"],
-                    "output_index": state["output_index"],
-                    "delta": arg_delta,
+                state["name"] = name
+            arg_delta = fn.get("arguments") or ""
+            if arg_delta:
+                state["arguments"] += arg_delta
+            if not state.get("emitted"):
+                await self._finalize_pending_tool(response, index)
+                state = self.tool_calls.get(index)
+                if state is None or not state.get("emitted"):
+                    return
+            if arg_delta:
+                await _write_sse(
+                    response,
+                    {
+                        "type": "response.function_call_arguments.delta",
+                        "item_id": state["id"],
+                        "output_index": state["output_index"],
+                        "delta": arg_delta,
+                    },
+                )
+        state = self.tool_calls.get(index)
+        if (
+            state
+            and state.get("emitted")
+            and _tool_call_arguments_complete(state)
+            and not state.get("closed")
+        ):
+            await self._close_tool(response, state)
+
+    async def _finalize_pending_tool(self, response: web.StreamResponse, index: int) -> None:
+        state = self.tool_calls.get(index)
+        if state is None or state.get("emitted"):
+            return
+        name = state.get("name") or ""
+        if mcp_search.is_tool_search_call(name):
+            pending = self.tool_calls.pop(index)
+            self.tool_search_calls[index] = {
+                **pending,
+                "opened": False,
+                "closed": False,
+            }
+            return
+        if mcp_search.parse_mcp_function_name(name):
+            pending = self.tool_calls.pop(index)
+            self.mcp_tool_calls[index] = {
+                **pending,
+                "opened": False,
+                "closed": False,
+            }
+            return
+        if _should_defer_tool_name(name):
+            return
+        if self.message_opened and not self.message_closed:
+            await self._close_message(response)
+        output_index = self.next_output_index
+        self.next_output_index += 1
+        state.update({"output_index": output_index, "emitted": True})
+        await _write_sse(
+            response,
+            {
+                "type": "response.output_item.added",
+                "output_index": output_index,
+                "item": {
+                    "id": state["call_id"],
+                    "type": "function_call",
+                    "status": "in_progress",
+                    "call_id": state["call_id"],
+                    "name": name,
+                    "arguments": "",
                 },
-            )
+            },
+        )
+        if _tool_call_arguments_complete(state) and not state.get("closed"):
+            await self._close_tool(response, state)
 
     async def _chat_tool_search_delta(
         self,
@@ -1469,14 +1597,18 @@ class ResponsesStreamState:
             state = {
                 "id": call_id,
                 "call_id": call_id,
-                "name": fn.get("name") or "",
+                "name": name or fn.get("name") or "",
                 "arguments": "",
                 "closed": False,
                 "opened": False,
             }
             self.mcp_tool_calls[index] = state
+        elif mcp_search.parse_mcp_function_name(name):
+            state["name"] = name
         elif fn.get("name"):
-            state["name"] += fn.get("name")
+            state["name"] = mcp_search.normalize_upstream_tool_name(
+                (state.get("name") or "") + fn.get("name")
+            )
         if not state.get("opened") and mcp_search.parse_mcp_function_name(state.get("name") or ""):
             state = await self._open_mcp_tool(response, index, state)
         arg_delta = fn.get("arguments") or ""

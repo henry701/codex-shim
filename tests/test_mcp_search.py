@@ -169,3 +169,9 @@ def test_is_tool_search_call():
     assert not mcp_search.is_tool_search_call("mcp__exa__web_search_exa")
     assert not mcp_search.is_tool_search_call("exec_command")
     assert not mcp_search.is_tool_search_call("mcp__exa")
+
+
+def test_normalize_upstream_tool_name_aliases_web_search():
+    assert mcp_search.normalize_upstream_tool_name("web_search_exa") == "mcp__exa__web_search_exa"
+    assert mcp_search.normalize_upstream_tool_name("web_search") == "mcp__exa__web_search_exa"
+    assert mcp_search.normalize_upstream_tool_name("exec_command") == "exec_command"
