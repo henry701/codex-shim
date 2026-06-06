@@ -2296,6 +2296,8 @@ def _chat_tools_have_mcp(tools: Any) -> bool:
 
 
 async def _pre_discover_if_mcp(body: dict[str, Any]) -> list[dict[str, Any]]:
+    if not mcp_search.pre_discover_mcp_enabled():
+        return []
     if not _chat_tools_have_mcp(body.get("tools")):
         return []
     return await mcp_search.pre_discover_mcp_tools()

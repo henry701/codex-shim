@@ -73,9 +73,10 @@ and this project does not yet follow semantic versioning (pre-1.0).
 
 ### Changed
 
-- MCP tool invocations no longer run on the shim. `tool_search_call` is also
-  translated to the native Responses item for Codex-local execution; the shim
-  only injects tool definitions and pre-discovers MCP tools for upstream models.
+- By default the shim no longer pre-injects MCP `tools/list` results into BYOK
+  upstream tool lists (`CODEX_SHIM_PRE_DISCOVER_MCP=1` restores old behavior).
+  Only `tool_search_call` is injected so Codex-native discovery can populate
+  defer-loaded tools.
 - Reframed the project around a generic all-model Codex shim instead of any
   single upstream app or model store.
 - Made `~/.codex-shim/models.json` the canonical default settings file.

@@ -732,6 +732,11 @@ rewrites it to the native `tool_search_call` Responses item (with `execution:
 "client"`). Codex executes MCP `tools/list` locally and returns
 `tool_search_output` on the next turn, matching ChatGPT passthrough.
 
+By default the shim does **not** pre-inject discovered MCP tool names into the
+upstream LLM tool list (only `tool_search_call`). Set
+`CODEX_SHIM_PRE_DISCOVER_MCP=1` on the shim process to restore eager
+`tools/list` pre-discovery into upstream prompts.
+
 ---
 
 ## Prompt catching and request interception

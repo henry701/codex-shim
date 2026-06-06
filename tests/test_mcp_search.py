@@ -90,6 +90,27 @@ def test_resolve_mcp_url_uses_fallback_for_known_servers():
     assert mcp_search.resolve_mcp_url("mcp__unknown_server_xyz") is None
 
 
+def test_pre_discover_mcp_enabled_defaults_false(monkeypatch):
+    monkeypatch.delenv("CODEX_SHIM_PRE_DISCOVER_MCP", raising=False)
+    assert not mcp_search.pre_discover_mcp_enabled()
+    monkeypatch.setenv("CODEX_SHIM_PRE_DISCOVER_MCP", "1")
+    assert mcp_search.pre_discover_mcp_enabled()
+
+
+def test_responses_to_chat_omits_pre_discovered_when_disabled(monkeypatch):
+    monkeypatch.delenv("CODEX_SHIM_PRE_DISCOVER_MCP", raising=False)
+    body = {
+        "model": "slug",
+        "input": [{"role": "user", "content": "hi"}],
+        "tools": [
+            {"type": "function", "name": "mcp__exa", "description": "MCP server"},
+        ],
+    }
+    out = responses_to_chat(body, "gemma-4-E4B", discovered_mcp_tools=[])
+    names = [t["function"]["name"] for t in out["tools"]]
+    assert names == ["tool_search_call"]
+
+
 def test_responses_to_chat_injects_pre_discovered_mcp_tools():
     body = {
         "model": "slug",

@@ -1,9 +1,9 @@
 """MCP tool discovery helpers for the codex-shim.
 
 Injects a virtual ``tool_search_call`` tool definition into BYOK upstream
-requests and pre-discovers MCP tools from configured servers. The shim
-translates model ``tool_search_call`` invocations into native Responses
-``tool_search_call`` items; Codex executes discovery locally.
+requests. Optional pre-discovery (``CODEX_SHIM_PRE_DISCOVER_MCP=1``) eagerly
+lists MCP tools into the upstream tool list; by default the shim only injects
+``tool_search_call`` and relies on Codex-native discovery.
 """
 
 from __future__ import annotations
@@ -17,6 +17,17 @@ import aiohttp
 
 
 MCP_TOOL_SEARCH_NAME = "tool_search_call"
+
+# When false (default), only inject tool_search_call for upstream models and rely
+# on Codex-native tool_search for MCP discovery. Set CODEX_SHIM_PRE_DISCOVER_MCP=1
+# to restore eager tools/list pre-discovery into the upstream tool list.
+def pre_discover_mcp_enabled() -> bool:
+    return os.environ.get("CODEX_SHIM_PRE_DISCOVER_MCP", "").lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+
 
 MCP_TOOL_SEARCH_DEFINITION: dict[str, Any] = {
     "type": "function",
