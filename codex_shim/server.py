@@ -1200,23 +1200,37 @@ class ResponsesStreamState:
         self.completed_turns: list[dict[str, Any]] = []
         self.discard_stats = _TurnDiscardStats()
 
-    def has_complete_tool_calls(self) -> bool:
-        buckets = (
+    def _pending_tool_calls(self) -> list[dict[str, Any]]:
+        pending: list[dict[str, Any]] = []
+        for tc in (
             *self.tool_calls.values(),
             *self.mcp_tool_calls.values(),
             *self.tool_search_calls.values(),
-        )
-        return any(_tool_call_arguments_complete(tc) for tc in buckets)
+        ):
+            if tc.get("closed"):
+                continue
+            if not (tc.get("name") or "").strip():
+                continue
+            pending.append(tc)
+        return pending
+
+    def has_complete_tool_calls(self) -> bool:
+        pending = self._pending_tool_calls()
+        if not pending:
+            return False
+        return all(_tool_call_arguments_complete(tc) for tc in pending)
 
     def should_end_upstream_turn(self, finish_reason: str | None = None) -> bool:
         """True when the upstream chat-completions turn must end before more deltas.
 
-        OpenAI-compatible servers should stop at tool_calls; some local backends
-        keep streaming assistant text after a tool call unless we cut the turn."""
-        reason = (finish_reason or "").lower()
-        if reason == "tool_calls":
-            return True
-        return self.has_complete_tool_calls()
+        Local backends (llama.cpp) often emit ``finish_reason=tool_calls`` before
+        argument chunks finish, or in the same chunk as a partial JSON fragment.
+        Wait until every open tool call has parseable arguments; once all tools
+        are closed, honour ``finish_reason=tool_calls`` to drop hallucinated text."""
+        pending = self._pending_tool_calls()
+        if pending:
+            return all(_tool_call_arguments_complete(tc) for tc in pending)
+        return (finish_reason or "").lower() == "tool_calls"
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -1242,13 +1256,35 @@ class ResponsesStreamState:
                 continue
             if mcp_search.parse_mcp_function_name(state.get("name") or ""):
                 continue
-            await self._close_tool(response, state)
+            if _tool_call_arguments_complete(state):
+                await self._close_tool(response, state)
         for state in sorted(self.mcp_tool_calls.values(), key=lambda s: s["output_index"]):
-            if not state.get("closed"):
+            if not state.get("closed") and _tool_call_arguments_complete(state):
                 await self._close_mcp_tool(response, state)
         for state in sorted(self.tool_search_calls.values(), key=lambda s: s["output_index"]):
-            if not state.get("closed"):
+            if not state.get("closed") and _tool_call_arguments_complete(state):
                 await self._close_tool_search(response, state)
+        self._log_incomplete_tool_calls()
+
+    def _log_incomplete_tool_calls(self) -> None:
+        incomplete: list[str] = []
+        for tc in (
+            *self.tool_calls.values(),
+            *self.mcp_tool_calls.values(),
+            *self.tool_search_calls.values(),
+        ):
+            if tc.get("closed"):
+                continue
+            name = tc.get("name") or "?"
+            args = tc.get("arguments") or ""
+            if _tool_call_arguments_complete(tc):
+                continue
+            incomplete.append(f"{name}({len(args)} arg chars)")
+        if incomplete:
+            print(
+                f"[turn-cut] model={self.model} incomplete_tool_calls_at_stream_end={incomplete}",
+                flush=True,
+            )
 
     def snapshot_turn(self) -> None:
         self.completed_turns.append(self._current_turn_dict())
@@ -1614,6 +1650,16 @@ class ResponsesStreamState:
         arg_delta = fn.get("arguments") or ""
         if arg_delta:
             state["arguments"] += arg_delta
+            if state.get("opened"):
+                await _write_sse(
+                    response,
+                    {
+                        "type": "response.function_call_arguments.delta",
+                        "item_id": state["id"],
+                        "output_index": state["output_index"],
+                        "delta": arg_delta,
+                    },
+                )
         if _tool_call_arguments_complete(state) and not state.get("closed"):
             await self._close_mcp_tool(response, state)
 
@@ -1655,12 +1701,25 @@ class ResponsesStreamState:
                 ),
             },
         )
+        prior_args = state.get("arguments") or ""
+        if prior_args:
+            await _write_sse(
+                response,
+                {
+                    "type": "response.function_call_arguments.delta",
+                    "item_id": state["id"],
+                    "output_index": output_index,
+                    "delta": prior_args,
+                },
+            )
         return state
 
     async def _close_mcp_tool(
         self, response: web.StreamResponse, state: dict[str, Any]
     ) -> None:
         if state.get("closed"):
+            return
+        if not _tool_call_arguments_complete(state):
             return
         if not state.get("opened"):
             for index, candidate in self.mcp_tool_calls.items():
@@ -1903,6 +1962,8 @@ class ResponsesStreamState:
         return state
 
     async def _close_tool(self, response: web.StreamResponse, state: dict[str, Any]) -> None:
+        if state.get("closed") or not _tool_call_arguments_complete(state):
+            return
         state["closed"] = True
         await _write_sse(
             response,

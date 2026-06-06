@@ -22,9 +22,9 @@ MCP_TOOL_SEARCH_DEFINITION: dict[str, Any] = {
             "Look up MCP tool names before calling them. Pass `query` as a short "
             "server or tool token (e.g. 'exa' or 'web_search_exa') to search Codex's "
             "local deferred-tool index. Returns JSON with full mcp__<server>__<tool> "
-            "names to call on the next turn. Do NOT call bare server stubs like "
-            "mcp__exa as a tool — that fails with 'unsupported call'. Avoid "
-            "mcp__-prefixed search strings; they often match nothing."
+            "names to call on the next turn — call that tool directly; do not repeat "
+            "tool_search_call. Do NOT call bare server stubs like mcp__exa as a tool "
+            "— that fails with 'unsupported call'. Avoid mcp__-prefixed search strings."
         ),
         "parameters": {
             "type": "object",

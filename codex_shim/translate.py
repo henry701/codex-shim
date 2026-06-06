@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 from typing import Any
 
@@ -13,14 +14,20 @@ SHIM_ENCRYPTED_CONTENT_PREFIX = "anthropic-thinking-v1:"
 _THINKING_MAGIC = SHIM_ENCRYPTED_CONTENT_PREFIX
 
 MCP_TOOL_HINT = (
-    "MCP tool-calling convention: invoke tools by full name mcp__<server>__<tool> "
-    "(e.g. mcp__exa__web_search_exa). Do NOT invoke bare server stubs like mcp__exa — "
-    "Codex returns 'unsupported call' for those. "
-    "If a call returns 'unsupported call: X', do not retry X; pick a different tool or approach. "
-    "To discover deferred MCP tools, call `tool_search_call` with a short search token — "
-    "the server or tool name without the mcp__ prefix (e.g. tool_search_call(query='exa') or "
-    "query='web_search_exa'). Queries like mcp__exa often match nothing in the local BM25 index."
+    "MCP tool-calling convention for BYOK/local models:\n"
+    "1. To discover deferred MCP tools, call tool_search_call once with a short token "
+    "(e.g. query='exa' or 'web_search_exa'). Do NOT repeat tool_search_call after it "
+    "returns a full tool name.\n"
+    "2. Invoke MCP tools by full name mcp__<server>__<tool> (e.g. mcp__exa__web_search_exa). "
+    "Do NOT call bare server stubs like mcp__exa — Codex returns 'unsupported call'.\n"
+    "3. For web/news lookup when Exa MCP is available, use mcp__exa__web_search_exa — "
+    "NOT shell_command, command_execution, exec_command, curl, or a native web_search tool.\n"
+    "4. If a call returns 'unsupported call: X', do not retry X; pick a different tool.\n"
+    "5. tool_search_call queries should omit the mcp__ prefix (use 'exa', not 'mcp__exa')."
 )
+
+BYOK_TOOL_OUTPUT_MAX_CHARS = int(os.environ.get("CODEX_SHIM_TOOL_OUTPUT_MAX_CHARS", "16000"))
+_BYOK_TOOL_OUTPUT_LIST_KEYS = ("results", "data", "items", "documents", "pages")
 
 
 def _tools_have_mcp(tools: Any) -> bool:
@@ -444,7 +451,8 @@ def _responses_input_to_messages(value: Any) -> list[dict[str, Any]]:
         elif item_type == "function_call_output":
             flush_pending_assistant_tool_calls()
             output = item.get("output", "")
-            messages.append({"role": "tool", "tool_call_id": item.get("call_id"), "content": _content_to_text(output)})
+            text = _truncate_byok_tool_content(_content_to_text(output))
+            messages.append({"role": "tool", "tool_call_id": item.get("call_id"), "content": text})
             if _has_visual_content(output):
                 messages.append({"role": "user", "content": _visual_feedback_chat_content(output, item.get("call_id"))})
         elif item_type == "web_search_call":
@@ -483,7 +491,7 @@ def _responses_input_to_messages(value: Any) -> list[dict[str, Any]]:
             result = item.get("result")
             if not result:
                 continue
-            content = _content_to_text(result)
+            content = _truncate_byok_tool_content(_content_to_text(result))
             if not content:
                 continue
             server = item.get("server") or "mcp"
@@ -519,6 +527,43 @@ def _responses_content_to_chat_content(content: Any) -> str | list[dict[str, Any
     if any(part.get("type") == "image_url" for part in parts):
         return parts
     return "\n".join(str(part.get("text", "")) for part in parts if part.get("type") == "text")
+
+
+def _truncate_byok_tool_content(content: str, *, max_chars: int | None = None) -> str:
+    """Cap large MCP/tool payloads before sending them to small local models."""
+    if not content:
+        return content
+    limit = max_chars if max_chars is not None else BYOK_TOOL_OUTPUT_MAX_CHARS
+    trimmed = content
+    try:
+        data = json.loads(content)
+    except json.JSONDecodeError:
+        if len(content) <= limit:
+            return content
+        return _truncate_byok_tool_content_plain(content, limit=limit)
+    if isinstance(data, dict):
+        for key in _BYOK_TOOL_OUTPUT_LIST_KEYS:
+            items = data.get(key)
+            if not isinstance(items, list) or len(items) <= 3:
+                continue
+            total = len(items)
+            data[key] = items[:3]
+            data["_shim_truncated"] = {"field": key, "shown": 3, "total": total}
+            trimmed = json.dumps(data, indent=2)
+            break
+    if len(trimmed) <= limit:
+        return trimmed
+    return _truncate_byok_tool_content_plain(trimmed, limit=limit)
+
+
+def _truncate_byok_tool_content_plain(content: str, *, limit: int) -> str:
+    if len(content) <= limit:
+        return content
+    note = f"\n\n[shim: truncated {len(content) - limit} chars for local model context]"
+    if len(note) >= limit:
+        return content[:limit]
+    keep = limit - len(note)
+    return content[:keep] + note
 
 
 def _computer_output_to_chat_content(item: dict[str, Any]) -> str | list[dict[str, Any]]:

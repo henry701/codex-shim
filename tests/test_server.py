@@ -587,13 +587,14 @@ async def test_write_chat_delta_ends_upstream_turn_when_tool_call_complete():
                                 },
                             }
                         ]
-                    }
+                    },
+                    "finish_reason": "tool_calls",
                 }
             ]
         },
     )
     assert ended is True
-    assert state.has_complete_tool_calls()
+    assert state.has_complete_tool_calls() is False
 
 
 async def test_mcp_tool_call_emits_namespaced_function_call_when_name_is_chunked():
@@ -653,6 +654,175 @@ async def test_mcp_tool_call_emits_namespaced_function_call_when_name_is_chunked
     ]
     assert len(function_added) == 1
     assert function_added[0]["item"]["name"] == "web_search_exa"
+
+
+async def test_mcp_tool_call_streams_argument_deltas_like_llama():
+    class FakeResponse:
+        def __init__(self):
+            self.chunks: list[bytes] = []
+
+        async def write(self, data: bytes):
+            self.chunks.append(data)
+
+    downstream = FakeResponse()
+    state = ResponsesStreamState("local-llama")
+    await state.start(downstream)
+    arg_parts = ["{", '"query"', ':"', "ukraine war headline today", '"', "}"]
+    await state.write_chat_delta(
+        downstream,
+        {
+            "choices": [
+                {
+                    "delta": {
+                        "tool_calls": [
+                            {
+                                "index": 0,
+                                "id": "call_exa",
+                                "function": {
+                                    "name": "mcp__exa__web_search_exa",
+                                    "arguments": arg_parts[0],
+                                },
+                            }
+                        ]
+                    }
+                }
+            ]
+        },
+    )
+    for part in arg_parts[1:]:
+        await state.write_chat_delta(
+            downstream,
+            {
+                "choices": [
+                    {
+                        "delta": {
+                            "tool_calls": [
+                                {"index": 0, "function": {"arguments": part}}
+                            ]
+                        }
+                    }
+                ]
+            },
+        )
+    ended = await state.write_chat_delta(
+        downstream,
+        {"choices": [{"delta": {}, "finish_reason": "tool_calls"}]},
+    )
+    assert ended is True
+    await state.finish(downstream)
+    events = _sse_events(b"".join(downstream.chunks).decode())
+    arg_deltas = [
+        e for e in events if e.get("type") == "response.function_call_arguments.delta"
+    ]
+    assert arg_deltas
+    assert "".join(e["delta"] for e in arg_deltas) == '{"query":"ukraine war headline today"}'
+    done = [
+        e
+        for e in events
+        if e.get("type") == "response.function_call_arguments.done"
+    ][-1]
+    json.loads(done["arguments"])
+
+
+async def test_mcp_tool_call_does_not_close_on_finish_reason_with_incomplete_args():
+    class FakeResponse:
+        def __init__(self):
+            self.chunks: list[bytes] = []
+
+        async def write(self, data: bytes):
+            self.chunks.append(data)
+
+    downstream = FakeResponse()
+    state = ResponsesStreamState("local-llama")
+    await state.start(downstream)
+    await state.write_chat_delta(
+        downstream,
+        {
+            "choices": [
+                {
+                    "delta": {
+                        "tool_calls": [
+                            {
+                                "index": 0,
+                                "id": "call_exa",
+                                "function": {
+                                    "name": "mcp__exa__web_search_exa",
+                                    "arguments": '{"query":"ukr',
+                                },
+                            }
+                        ]
+                    },
+                    "finish_reason": "tool_calls",
+                }
+            ]
+        },
+    )
+    events = _sse_events(b"".join(downstream.chunks).decode())
+    assert not [
+        e for e in events if e.get("type") == "response.function_call_arguments.done"
+    ]
+    await state.write_chat_delta(
+        downstream,
+        {
+            "choices": [
+                {
+                    "delta": {
+                        "tool_calls": [
+                            {"index": 0, "function": {"arguments": 'aine"}'}}
+                        ]
+                    }
+                }
+            ]
+        },
+    )
+    await state.finish(downstream)
+    events = _sse_events(b"".join(downstream.chunks).decode())
+    done = [
+        e
+        for e in events
+        if e.get("type") == "response.function_call_arguments.done"
+    ][-1]
+    assert json.loads(done["arguments"]) == {"query": "ukraine"}
+
+
+async def test_write_chat_delta_waits_for_all_tool_calls_before_end():
+    class FakeResponse:
+        async def write(self, data: bytes):
+            return None
+
+    downstream = FakeResponse()
+    state = ResponsesStreamState("local-llama")
+    await state.write_chat_delta(
+        downstream,
+        {
+            "choices": [
+                {
+                    "delta": {
+                        "tool_calls": [
+                            {
+                                "index": 0,
+                                "id": "call_a",
+                                "function": {
+                                    "name": "mcp__exa__web_search_exa",
+                                    "arguments": '{"query":"done"}',
+                                },
+                            },
+                            {
+                                "index": 1,
+                                "id": "call_b",
+                                "function": {
+                                    "name": "tool_search_call",
+                                    "arguments": '{"query":"ex',
+                                },
+                            },
+                        ]
+                    },
+                    "finish_reason": "tool_calls",
+                }
+            ]
+        },
+    )
+    assert state.should_end_upstream_turn("tool_calls") is False
 
 
 async def test_mcp_tool_call_emits_namespaced_function_call():
