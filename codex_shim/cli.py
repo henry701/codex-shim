@@ -666,6 +666,7 @@ model_catalog_json = "{_toml_escape(str(CATALOG_PATH))}"
 name = "{_toml_escape(provider_name)}"
 base_url = "http://127.0.0.1:{port}/v1"
 wire_api = "responses"
+requires_openai_auth = true
 experimental_bearer_token = "dummy"
 request_max_retries = 3
 stream_max_retries = 3

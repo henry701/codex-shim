@@ -4,12 +4,19 @@ import json
 import hashlib
 import plistlib
 import struct
+from dataclasses import replace
 
 import pytest
 
 from codex_shim import cli
 from codex_shim.catalog import catalog_entry, write_catalog
-from codex_shim.settings import ModelSettings, chatgpt_passthrough_available, FALLBACK_CHATGPT_PASSTHROUGH_SLUGS
+from codex_shim.settings import (
+    DEFAULT_PASSTHROUGH_ERROR_FALLBACK_SOURCES,
+    FALLBACK_CHATGPT_PASSTHROUGH_SLUGS,
+    ModelSettings,
+    chatgpt_passthrough_available,
+    load_passthrough_error_fallback,
+)
 
 
 @pytest.fixture
@@ -92,6 +99,17 @@ def test_catalog_preserves_context_and_visibility():
     assert entry["visibility"] == "list"
     assert entry["context_window"] == 200000
     assert "free" in entry["available_in_plans"]
+    assert entry["supports_reasoning_summaries"] is False
+    assert entry["default_reasoning_summary"] == "none"
+
+
+def test_catalog_enables_reasoning_summaries_when_requested():
+    model = ModelSettingsFixture.one()
+    model = replace(model, supports_reasoning_summaries=True)
+    entry = catalog_entry(model)
+    assert entry["supports_reasoning_summaries"] is True
+    assert entry["default_reasoning_summary"] == "auto"
+    assert entry.get("reasoning_summary_format", "none") == "none"
 
 
 def test_default_missing_settings_allows_chatgpt_only(monkeypatch, tmp_path):
@@ -169,6 +187,44 @@ def test_write_catalog_includes_gpt_models_when_auth_present(tmp_path, auth_pres
     write_catalog([], catalog_path)
     data = json.loads(catalog_path.read_text())
     assert [model["slug"] for model in data["models"]] == list(FALLBACK_CHATGPT_PASSTHROUGH_SLUGS)
+
+
+def test_load_passthrough_error_fallback_accepts_map_and_shorthand(tmp_path):
+    mapped = tmp_path / "mapped.json"
+    mapped.write_text(
+        json.dumps({"passthrough_error_fallback": {"gpt-5.4-mini": "or-free-router"}})
+    )
+    assert load_passthrough_error_fallback(mapped) == {"gpt-5.4-mini": "or-free-router"}
+
+    shorthand = tmp_path / "shorthand.json"
+    shorthand.write_text(json.dumps({"passthrough_error_fallback": "or-free-router"}))
+    assert load_passthrough_error_fallback(shorthand) == {
+        slug: "or-free-router" for slug in DEFAULT_PASSTHROUGH_ERROR_FALLBACK_SOURCES
+    }
+
+
+def test_passthrough_error_fallback_requires_usable_target(tmp_path):
+    settings = tmp_path / "models.json"
+    settings.write_text(
+        json.dumps(
+            {
+                "passthrough_error_fallback": {"gpt-5.4-mini": "or-free-router"},
+                "models": [
+                    {
+                        "model": "openrouter/free",
+                        "slug": "or-free-router",
+                        "display_name": "OpenRouter Free",
+                        "provider": "generic-chat-completion-api",
+                        "base_url": "https://openrouter.ai/api/v1",
+                        "api_key": "secret",
+                    }
+                ],
+            }
+        )
+    )
+    assert ModelSettings(settings).passthrough_error_fallback() == {
+        "gpt-5.4-mini": "or-free-router"
+    }
 
 
 def test_managed_config_escapes_windows_catalog_path(monkeypatch):

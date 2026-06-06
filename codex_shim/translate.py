@@ -442,12 +442,16 @@ def _responses_input_to_messages(value: Any) -> list[dict[str, Any]]:
             # message with multiple tool_calls so chat-completions upstreams
             # accept the subsequent tool messages.
             call_id = item.get("call_id") or item.get("id") or "call_0"
+            fn_name = item.get("name") or ""
+            namespace = item.get("namespace") or ""
+            if namespace and fn_name and not fn_name.startswith("mcp__"):
+                fn_name = f"{namespace}__{fn_name}"
             pending_tool_calls.append(
                 {
                     "id": call_id,
                     "type": "function",
                     "function": {
-                        "name": item.get("name") or "",
+                        "name": fn_name,
                         "arguments": item.get("arguments") or "",
                     },
                 }
@@ -458,6 +462,25 @@ def _responses_input_to_messages(value: Any) -> list[dict[str, Any]]:
             messages.append({"role": "tool", "tool_call_id": item.get("call_id"), "content": _content_to_text(output)})
             if _has_visual_content(output):
                 messages.append({"role": "user", "content": _visual_feedback_chat_content(output, item.get("call_id"))})
+        elif item_type == "web_search_call":
+            flush_pending_assistant_tool_calls()
+            continue
+        elif item_type == "mcp_tool_call":
+            flush_pending_assistant_tool_calls()
+            result = item.get("result")
+            if not result:
+                continue
+            content = _content_to_text(result)
+            if not content:
+                continue
+            server = item.get("server") or "mcp"
+            tool = item.get("tool") or "tool"
+            messages.append(
+                {
+                    "role": "user",
+                    "content": f"MCP tool {server}/{tool} result:\n{content}",
+                }
+            )
         elif item_type == "reasoning":
             # For Chat-Completions upstreams reasoning is informational only.
             # We keep it as a marker so the Anthropic translator can reattach

@@ -34,6 +34,10 @@ FALLBACK_CHATGPT_DISPLAY_NAMES = {
     "gpt-5.2": "gpt-5.2",
     "codex-auto-review": "Codex Auto Review",
 }
+DEFAULT_PASSTHROUGH_ERROR_FALLBACK_SOURCES = (
+    "gpt-5.4-mini",
+    "codex-auto-review",
+)
 
 
 def chatgpt_passthrough_available(auth_path: Path | None = None) -> bool:
@@ -179,6 +183,7 @@ class ShimModel:
     max_context_limit: int | None = None
     max_output_tokens: int | None = None
     no_image_support: bool = False
+    supports_reasoning_summaries: bool = False
     extra_headers: dict[str, str] = field(default_factory=dict)
     raw: dict[str, Any] = field(default_factory=dict)
 
@@ -244,6 +249,9 @@ class ModelSettings:
                     max_context_limit=_int_or_none(_field(row, "max_context_limit", "maxContextLimit")),
                     max_output_tokens=_int_or_none(_field(row, "max_output_tokens", "maxOutputTokens")),
                     no_image_support=bool(_field(row, "no_image_support", "noImageSupport", default=False)),
+                    supports_reasoning_summaries=bool(
+                        _field(row, "supports_reasoning_summaries", "supportsReasoningSummaries", default=False)
+                    ),
                     extra_headers=extra_headers,
                     raw=row,
                 )
@@ -265,6 +273,19 @@ class ModelSettings:
         from .router import load_router_config
 
         return load_router_config(self.path)
+
+    def passthrough_error_fallback(self) -> dict[str, str]:
+        """Map ChatGPT passthrough slug -> usable BYOK slug when passthrough fails."""
+        mapping = load_passthrough_error_fallback(self.path)
+        if not mapping:
+            return {}
+        validated: dict[str, str] = {}
+        for source, target in mapping.items():
+            route = self.by_slug_or_model(target)
+            if route is None or not byok_model_has_credentials(route):
+                continue
+            validated[source] = route.slug
+        return validated
 
 
 def _model_rows(data: Any) -> list[dict[str, Any]]:
@@ -385,3 +406,35 @@ def available_model_slugs(models: list[ShimModel]) -> set[str]:
 
 def byok_model_has_credentials(model: ShimModel) -> bool:
     return bool(model.api_key.strip())
+
+
+def load_passthrough_error_fallback(path: Path | None = None) -> dict[str, str]:
+    """Read optional ``passthrough_error_fallback`` from models.json.
+
+    Accepts either a slug->slug map or a single target slug string applied to
+    the default background passthrough slugs (``gpt-5.4-mini``, ``codex-auto-review``).
+    """
+    settings_path = Path(path or DEFAULT_SETTINGS).expanduser()
+    if not settings_path.exists():
+        return {}
+    try:
+        data = json.loads(settings_path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    raw = data.get("passthrough_error_fallback")
+    if raw is None:
+        return {}
+    if isinstance(raw, str):
+        target = raw.strip()
+        if not target:
+            return {}
+        return {slug: target for slug in DEFAULT_PASSTHROUGH_ERROR_FALLBACK_SOURCES}
+    if isinstance(raw, dict):
+        return {
+            str(source).strip(): str(target).strip()
+            for source, target in raw.items()
+            if str(source).strip() and str(target).strip()
+        }
+    return {}

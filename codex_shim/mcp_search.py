@@ -252,81 +252,6 @@ async def call_mcp_tools_list(url: str) -> list[dict[str, Any]]:
     return _extract_tools_from_jsonrpc(data) or []
 
 
-async def call_mcp_tool(url: str, tool_name: str, arguments: dict[str, Any]) -> str:
-    body = {
-        "jsonrpc": "2.0",
-        "id": 2,
-        "method": "tools/call",
-        "params": {
-            "name": tool_name,
-            "arguments": arguments,
-        },
-    }
-    headers = {
-        "Content-Type": "application/json",
-        "Accept": "application/json, text/event-stream",
-    }
-    try:
-        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as session:
-            async with session.post(url, json=body, headers=headers) as resp:
-                if resp.status >= 400:
-                    return json.dumps({"error": f"MCP server returned HTTP {resp.status}"})
-                text = await resp.text()
-    except (aiohttp.ClientError, TimeoutError, OSError) as exc:
-        return json.dumps({"error": f"MCP call failed: {exc}"})
-
-    payload_data: Any = None
-    for line in text.splitlines():
-        line = line.strip()
-        if not line.startswith("data:"):
-            continue
-        chunk = line[len("data:"):].strip()
-        if not chunk or chunk == "[DONE]":
-            continue
-        try:
-            payload_data = json.loads(chunk)
-        except json.JSONDecodeError:
-            continue
-        if isinstance(payload_data, dict):
-            break
-    if payload_data is None:
-        try:
-            payload_data = json.loads(text)
-        except json.JSONDecodeError:
-            return json.dumps({"error": "MCP server returned non-JSON response", "raw": text[:500]})
-
-    return _format_mcp_tool_result(payload_data)
-
-
-def _format_mcp_tool_result(payload: Any) -> str:
-    if not isinstance(payload, dict):
-        return json.dumps({"error": "MCP response was not an object"})
-    if "error" in payload:
-        err = payload["error"]
-        if isinstance(err, dict):
-            message = err.get("message") or json.dumps(err)
-            code = err.get("code")
-            return json.dumps({"error": f"MCP error {code}: {message}"} if code is not None else {"error": message})
-        return json.dumps({"error": str(err)})
-    result = payload.get("result")
-    if not isinstance(result, dict):
-        return json.dumps(result)
-    content = result.get("content")
-    if isinstance(content, list):
-        parts: list[str] = []
-        for item in content:
-            if isinstance(item, dict):
-                if item.get("type") == "text":
-                    parts.append(str(item.get("text", "")))
-                else:
-                    parts.append(json.dumps(item))
-        if parts:
-            return "\n".join(parts)
-    if "text" in result and isinstance(result["text"], str):
-        return result["text"]
-    return json.dumps(result)
-
-
 def is_mcp_tool_call(name: str) -> str | None:
     if not isinstance(name, str) or not name.startswith("mcp__"):
         return None
@@ -337,6 +262,47 @@ def is_mcp_tool_call(name: str) -> str | None:
     if not server or not tool:
         return None
     return f"mcp__{server}"
+
+
+def parse_mcp_function_name(name: str) -> tuple[str, str] | None:
+    """Split ``mcp__<server>__<tool>`` into Codex ``(server, tool)`` names."""
+    server_key = is_mcp_tool_call(name)
+    if not server_key:
+        return None
+    tool = name[len(server_key) + 2 :]
+    if not tool:
+        return None
+    return server_key[len("mcp__") :], tool
+
+
+def is_shim_resolved_tool(name: str) -> bool:
+    """Virtual tools the shim executes server-side (not Codex MCP runtime)."""
+    return name == MCP_TOOL_SEARCH_NAME
+
+
+def _parse_tool_arguments(raw_args: Any) -> dict[str, Any]:
+    if isinstance(raw_args, str):
+        try:
+            parsed = json.loads(raw_args) if raw_args.strip() else {}
+        except json.JSONDecodeError:
+            return {"_raw": raw_args}
+        return parsed if isinstance(parsed, dict) else {"_value": parsed}
+    if isinstance(raw_args, dict):
+        return raw_args
+    return {}
+
+
+async def execute_shim_tool_call(name: str, raw_args: Any) -> str:
+    """Run virtual tool_search_call on the shim side."""
+    if name != MCP_TOOL_SEARCH_NAME:
+        return json.dumps({"error": f"unsupported call: {name}"})
+    args = _parse_tool_arguments(raw_args)
+    query = args.get("query", "") if isinstance(args, dict) else ""
+    if not isinstance(query, str) or not query.strip():
+        return format_tool_search_error(
+            "", "tool_search_call requires a non-empty string 'query' argument"
+        )
+    return await execute_tool_search(query)
 
 
 def _extract_tools_from_jsonrpc(data: Any) -> list[dict[str, Any]] | None:
@@ -430,40 +396,41 @@ async def execute_tool_search(query: str) -> str:
 
 
 async def augment_response_with_tool_search(response: dict[str, Any]) -> dict[str, Any]:
-    """Resolve any `tool_search_call` function calls in a Responses-API payload
-    by running the MCP tools/list lookup and appending a paired
-    `function_call_output` item. Returns the same dict (mutated) if no
-    tool_search_call items are present."""
+    """Resolve virtual shim tools and rewrite MCP function calls for Codex."""
+    from . import tool_translate
+
     output = response.get("output")
     if not isinstance(output, list) or not output:
         return response
 
-    augmented: list[dict[str, Any]] = []
-    found = False
+    rewritten: list[dict[str, Any]] = []
+    changed = False
     for item in output:
-        augmented.append(item)
-        if not (isinstance(item, dict) and item.get("type") == "function_call"):
+        if not isinstance(item, dict):
+            rewritten.append(item)
             continue
-        if item.get("name") != MCP_TOOL_SEARCH_NAME:
+        if item.get("type") != "function_call":
+            rewritten.append(item)
             continue
-        found = True
-        call_id = item.get("call_id") or item.get("id")
+        name = item.get("name") or ""
+        call_id = str(item.get("call_id") or item.get("id") or "call_0")
         raw_args = item.get("arguments", "{}")
-        if isinstance(raw_args, str):
-            try:
-                args = json.loads(raw_args) if raw_args.strip() else {}
-            except json.JSONDecodeError:
-                args = {}
-        elif isinstance(raw_args, dict):
-            args = raw_args
-        else:
-            args = {}
-        query = args.get("query", "") if isinstance(args, dict) else ""
-        if not isinstance(query, str) or not query.strip():
-            result = format_tool_search_error("", "tool_search_call requires a non-empty string 'query' argument")
-        else:
-            result = await execute_tool_search(query)
-        augmented.append(
+        mcp_item = tool_translate.mcp_function_call_from_name(
+            call_id,
+            name,
+            raw_args if isinstance(raw_args, str) else json.dumps(raw_args),
+            "completed",
+        )
+        if mcp_item is not None:
+            rewritten.append(mcp_item)
+            changed = True
+            continue
+        rewritten.append(item)
+        if not is_shim_resolved_tool(name):
+            continue
+        changed = True
+        result = await execute_shim_tool_call(name, raw_args)
+        rewritten.append(
             {
                 "type": "function_call_output",
                 "call_id": call_id,
@@ -471,7 +438,7 @@ async def augment_response_with_tool_search(response: dict[str, Any]) -> dict[st
                 "status": "completed",
             }
         )
-    if found:
-        response["output"] = augmented
+    if changed:
+        response["output"] = rewritten
     return response
 

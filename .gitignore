@@ -15,6 +15,7 @@ normalize-model-settings-*.js
 # Python
 __pycache__/
 *.pyc
+.coverage
 .pytest_cache/
 .venv/
 venv/

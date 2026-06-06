@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import sys
 import time
@@ -22,6 +23,7 @@ from .cursor_passthrough import (
 )
 from . import router as router_module
 from . import mcp_search
+from . import tool_translate
 from .hostguard import build_allowed_hosts, host_guard_middleware
 from .settings import (
     CHATGPT_MODEL_SLUG,
@@ -943,28 +945,54 @@ class ShimServer:
                         )
                         upstream.release()
                         break
-                    async for line in _sse_lines(upstream):
-                        if line == "[DONE]":
-                            break
-                        try:
-                            event = json.loads(line)
-                        except json.JSONDecodeError:
-                            continue
-                        if as_responses and state is not None:
-                            await state.write_chat_delta(
-                                response, event, hide_tool_calls=True
+                    end_upstream_turn = False
+                    try:
+                        async for line in _sse_lines(upstream):
+                            if line == "[DONE]":
+                                break
+                            try:
+                                event = json.loads(line)
+                            except json.JSONDecodeError:
+                                continue
+                            if as_responses and state is not None:
+                                if await state.write_chat_delta(response, event):
+                                    end_upstream_turn = True
+                            else:
+                                await _write_sse(response, event)
+                            if end_upstream_turn:
+                                break
+                    finally:
+                        if end_upstream_turn and as_responses and state is not None:
+                            tool_names = [
+                                tc.get("name") or ""
+                                for tc in {
+                                    **state.all_tool_calls(),
+                                    **state.mcp_tool_calls,
+                                }.values()
+                                if _tool_call_arguments_complete(tc)
+                            ]
+                            state.discard_stats.log(
+                                client_slug,
+                                cancelled_upstream=True,
+                                tool_names=tool_names,
                             )
-                        else:
-                            await _write_sse(response, event)
-                    upstream.release()
-                    mcp_calls = self._collect_state_mcp_calls(state)
-                    if not mcp_calls:
+                        await _finish_upstream_stream(
+                            upstream, cancelled=end_upstream_turn
+                        )
+                    shim_tools = self._collect_shim_resolved_tool_calls(state)
+                    if shim_tools:
+                        print(
+                            f"[mcp-loop] {client_slug}: continuing with "
+                            f"{len(shim_tools)} shim-resolved tool call(s)",
+                            flush=True,
+                        )
+                    if not shim_tools:
                         break
                     if as_responses and state is not None:
                         await state.close_turn_items(response)
                         state.snapshot_turn()
                     messages = await self._build_followup_messages_from_state(
-                        messages, state, mcp_calls
+                        messages, state, shim_tools
                     )
                     if as_responses and state is not None:
                         state.reset_for_next_turn()
@@ -981,23 +1009,27 @@ class ShimServer:
         return response
 
     @staticmethod
-    def _collect_state_mcp_calls(state: ResponsesStreamState | None) -> list[tuple[Any, dict[str, Any]]]:
+    def _collect_shim_resolved_tool_calls(
+        state: ResponsesStreamState | None,
+    ) -> list[tuple[Any, dict[str, Any]]]:
         if state is None:
             return []
         out: list[tuple[Any, dict[str, Any]]] = []
         for key, tc in state.all_tool_calls().items():
             name = tc.get("name") or ""
-            server = mcp_search.is_mcp_tool_call(name)
-            if server:
-                out.append((key, tc))
+            if not mcp_search.is_shim_resolved_tool(name):
+                continue
+            if not _tool_call_arguments_complete(tc):
+                continue
+            out.append((key, tc))
         return out
 
     @classmethod
     async def _build_followup_messages_from_state(
-        cls,
+        _cls,
         messages: list[dict[str, Any]],
         state: ResponsesStreamState | None,
-        mcp_calls: list[tuple[Any, dict[str, Any]]],
+        shim_tools: list[tuple[Any, dict[str, Any]]],
     ) -> list[dict[str, Any]]:
         all_calls: list[dict[str, Any]] = []
         if state is not None:
@@ -1012,18 +1044,16 @@ class ShimServer:
                         },
                     }
                 )
-        mcp_ids = {tc.get("call_id") for _, tc in mcp_calls}
-        assistant_content = state.message_text if state is not None else None
+        shim_ids = {tc.get("call_id") for _, tc in shim_tools}
         assistant_msg: dict[str, Any] = {
             "role": "assistant",
-            "content": assistant_content or None,
+            "content": state.message_text if state is not None and state.message_text else None,
             "tool_calls": all_calls,
         }
         new_messages = list(messages) + [assistant_msg]
-        for _, tc in mcp_calls:
+        for _, tc in shim_tools:
             name = tc.get("name") or ""
-            server = mcp_search.is_mcp_tool_call(name) or ""
-            result = await cls._dispatch_state_mcp_call(tc, server)
+            result = await mcp_search.execute_shim_tool_call(name, tc.get("arguments") or "")
             new_messages.append(
                 {
                     "role": "tool",
@@ -1032,7 +1062,7 @@ class ShimServer:
                 }
             )
         for call in all_calls:
-            if call.get("id") in mcp_ids:
+            if call.get("id") in shim_ids:
                 continue
             name = (call.get("function") or {}).get("name") or ""
             new_messages.append(
@@ -1043,24 +1073,6 @@ class ShimServer:
                 }
             )
         return new_messages
-
-    @staticmethod
-    async def _dispatch_state_mcp_call(tc: dict[str, Any], server: str) -> str:
-        name = tc.get("name") or ""
-        args_str = tc.get("arguments") or "{}"
-        try:
-            args = json.loads(args_str) if isinstance(args_str, str) and args_str.strip() else {}
-            if not isinstance(args, dict):
-                args = {"_value": args}
-        except json.JSONDecodeError:
-            args = {"_raw": args_str}
-        if not server:
-            return json.dumps({"error": f"Could not parse MCP server from tool name '{name}'"})
-        tool = name[len(server) + 2:]
-        url = mcp_search.resolve_mcp_url(server)
-        if not url:
-            return json.dumps({"error": f"Unknown MCP server '{server}'"})
-        return await mcp_search.call_mcp_tool(url, tool, args)
 
     async def _post_anthropic(
         self, request: web.Request, route: ShimModel, body: dict[str, Any], as_responses: bool,
@@ -1192,6 +1204,55 @@ def _iter_reasoning_delta_chunks(text: str, chunk_size: int = _REASONING_DELTA_C
     return chunks
 
 
+def _tool_call_arguments_complete(tc: dict[str, Any]) -> bool:
+    name = tc.get("name") or ""
+    if not name:
+        return False
+    args = tc.get("arguments") or ""
+    if not isinstance(args, str) or not args.strip():
+        return False
+    try:
+        json.loads(args)
+    except json.JSONDecodeError:
+        return False
+    return True
+
+
+class _TurnDiscardStats:
+    """Tokens/content skipped when cutting an upstream turn at tool-call boundary."""
+
+    def __init__(self) -> None:
+        self.skipped_content_chars = 0
+        self.skipped_content_preview = ""
+        self.finish_reason: str | None = None
+
+    def record_skipped_content(self, text: str, *, reason: str | None = None) -> None:
+        if not text:
+            return
+        self.skipped_content_chars += len(text)
+        if not self.skipped_content_preview:
+            self.skipped_content_preview = text[:240]
+        if reason:
+            self.finish_reason = reason
+
+    def log(self, model: str, *, cancelled_upstream: bool, tool_names: list[str]) -> None:
+        if not cancelled_upstream and self.skipped_content_chars == 0 and not tool_names:
+            return
+        preview = self.skipped_content_preview.replace("\n", "\\n")
+        if len(self.skipped_content_preview) > 240:
+            preview += "…"
+        print(
+            "[turn-cut] "
+            f"model={model} "
+            f"reason={self.finish_reason or 'tool_calls'} "
+            f"cancelled_upstream={cancelled_upstream} "
+            f"complete_tools={tool_names or []} "
+            f"skipped_content_chars={self.skipped_content_chars} "
+            f"skipped_content_preview={preview!r}",
+            flush=True,
+        )
+
+
 class ResponsesStreamState:
     """Translates upstream chat-completions / anthropic stream events into the
     Codex Desktop Responses-API event sequence. Keeps the message item and
@@ -1210,6 +1271,7 @@ class ResponsesStreamState:
         self.usage: dict[str, Any] | None = None
         self.tool_calls: dict[int, dict[str, Any]] = {}
         self.hidden_tool_calls: dict[int, dict[str, Any]] = {}
+        self.mcp_tool_calls: dict[int, dict[str, Any]] = {}
         # Synthesized function_call_output items for shim-handled tool calls
         # (currently only tool_search_call), keyed by call_id.
         self.tool_outputs: dict[str, dict[str, Any]] = {}
@@ -1217,6 +1279,21 @@ class ResponsesStreamState:
         self.reasoning_blocks: dict[Any, dict[str, Any]] = {}
         self.next_output_index = 0
         self.completed_turns: list[dict[str, Any]] = []
+        self.discard_stats = _TurnDiscardStats()
+
+    def has_complete_tool_calls(self) -> bool:
+        buckets = (*self.all_tool_calls().values(), *self.mcp_tool_calls.values())
+        return any(_tool_call_arguments_complete(tc) for tc in buckets)
+
+    def should_end_upstream_turn(self, finish_reason: str | None = None) -> bool:
+        """True when the upstream chat-completions turn must end before more deltas.
+
+        OpenAI-compatible servers should stop at tool_calls; some local backends
+        keep streaming assistant text after a tool call unless we cut the turn."""
+        reason = (finish_reason or "").lower()
+        if reason == "tool_calls":
+            return True
+        return self.has_complete_tool_calls()
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -1236,9 +1313,20 @@ class ResponsesStreamState:
         if self.message_opened and not self.message_closed:
             await self._close_message(response)
         for state in sorted(self.tool_calls.values(), key=lambda s: s["output_index"]):
+            if state.get("closed"):
+                continue
+            if mcp_search.is_shim_resolved_tool(state.get("name") or ""):
+                continue
+            if mcp_search.parse_mcp_function_name(state.get("name") or ""):
+                continue
+            await self._close_tool(response, state)
+        for state in sorted(self.mcp_tool_calls.values(), key=lambda s: s["output_index"]):
             if not state.get("closed"):
-                await self._close_tool(response, state)
-        await self._handle_tool_search(response)
+                await self._close_mcp_tool(response, state)
+        for state in sorted(self.hidden_tool_calls.values(), key=lambda s: s["output_index"]):
+            if not state.get("closed"):
+                state["closed"] = True
+        await self._resolve_shim_handled_tools(response)
 
     def snapshot_turn(self) -> None:
         self.completed_turns.append(self._current_turn_dict())
@@ -1252,8 +1340,10 @@ class ResponsesStreamState:
         self.message_closed = False
         self.tool_calls = {}
         self.hidden_tool_calls = {}
+        self.mcp_tool_calls = {}
         self.reasoning_blocks = {}
         self.tool_outputs = {}
+        self.discard_stats = _TurnDiscardStats()
 
     def _current_turn_dict(self) -> dict[str, Any]:
         return {
@@ -1263,70 +1353,93 @@ class ResponsesStreamState:
             "message_opened": self.message_opened,
             "message_closed": self.message_closed,
             "tool_calls": dict(self.tool_calls),
+            "hidden_tool_calls": dict(self.hidden_tool_calls),
+            "mcp_tool_calls": dict(self.mcp_tool_calls),
             "reasoning_blocks": dict(self.reasoning_blocks),
             "tool_outputs": dict(self.tool_outputs),
         }
 
-    async def _handle_tool_search(self, response: web.StreamResponse) -> None:
-        """Resolve any tool_search_call items by running the MCP tools/list
-        lookup on the shim side and emitting paired function_call_output
-        events so Codex Desktop does not need to know about the virtual tool."""
-        for state in sorted(self.tool_calls.values(), key=lambda s: s["output_index"]):
-            if state.get("name") != mcp_search.MCP_TOOL_SEARCH_NAME:
+    async def _resolve_shim_handled_tools(self, response: web.StreamResponse) -> None:
+        """Execute shim-resolved tools (tool_search_call, mcp__*) and emit
+        function_call_output events. MCP tools are finalized eagerly during
+        streaming when possible; this catches any remaining at turn close."""
+        pending = [
+            *self.tool_calls.values(),
+            *self.hidden_tool_calls.values(),
+        ]
+        for state in sorted(pending, key=lambda s: s["output_index"]):
+            name = state.get("name") or ""
+            if not mcp_search.is_shim_resolved_tool(name):
                 continue
-            call_id = state.get("call_id") or state.get("id")
-            if not call_id or call_id in self.tool_outputs:
+            if state.get("shim_finalized"):
                 continue
-            raw_args = state.get("arguments", "")
-            if isinstance(raw_args, str):
-                try:
-                    args = json.loads(raw_args) if raw_args.strip() else {}
-                except json.JSONDecodeError:
-                    args = {}
-            elif isinstance(raw_args, dict):
-                args = raw_args
-            else:
-                args = {}
-            query = args.get("query", "") if isinstance(args, dict) else ""
-            if not isinstance(query, str) or not query.strip():
-                result = mcp_search.format_tool_search_error("", "tool_search_call requires a non-empty string 'query' argument")
-            else:
-                result = await mcp_search.execute_tool_search(query)
-            output_index = self.next_output_index
-            self.next_output_index += 1
-            output_item = {
-                "id": f"out_{int(time.time() * 1000)}_{call_id}",
-                "type": "function_call_output",
-                "status": "completed",
-                "call_id": call_id,
-                "output": result,
-            }
-            self.tool_outputs[call_id] = {
+            await self._finalize_shim_tool_call(response, state)
+
+    async def _finalize_shim_tool_call(
+        self, response: web.StreamResponse, state: dict[str, Any]
+    ) -> None:
+        if state.get("shim_finalized"):
+            return
+        state["shim_finalized"] = True
+        name = state.get("name") or ""
+        if not mcp_search.is_shim_resolved_tool(name):
+            return
+        call_id = state.get("call_id") or state.get("id")
+        if not call_id or call_id in self.tool_outputs:
+            state["closed"] = True
+            return
+        result = await mcp_search.execute_shim_tool_call(
+            name, state.get("arguments") or ""
+        )
+        print(
+            f"[tool-search] {self.model}: {name} call_id={call_id} "
+            f"result_chars={len(result)} preview={result[:120]!r}",
+            flush=True,
+        )
+        await self._emit_tool_output(response, call_id, result)
+        state["closed"] = True
+
+    async def _emit_tool_output(
+        self,
+        response: web.StreamResponse,
+        call_id: str,
+        result: str,
+    ) -> None:
+        output_index = self.next_output_index
+        self.next_output_index += 1
+        output_item = {
+            "id": f"out_{int(time.time() * 1000)}_{call_id}",
+            "type": "function_call_output",
+            "status": "completed",
+            "call_id": call_id,
+            "output": result,
+        }
+        self.tool_outputs[call_id] = {
+            "output_index": output_index,
+            "item": output_item,
+        }
+        await _write_sse(
+            response,
+            {
+                "type": "response.output_item.added",
+                "output_index": output_index,
+                "item": {
+                    "id": output_item["id"],
+                    "type": "function_call_output",
+                    "status": "in_progress",
+                    "call_id": call_id,
+                    "output": "",
+                },
+            },
+        )
+        await _write_sse(
+            response,
+            {
+                "type": "response.output_item.done",
                 "output_index": output_index,
                 "item": output_item,
-            }
-            await _write_sse(
-                response,
-                {
-                    "type": "response.output_item.added",
-                    "output_index": output_index,
-                    "item": {
-                        "id": output_item["id"],
-                        "type": "function_call_output",
-                        "status": "in_progress",
-                        "call_id": call_id,
-                        "output": "",
-                    },
-                },
-            )
-            await _write_sse(
-                response,
-                {
-                    "type": "response.output_item.done",
-                    "output_index": output_index,
-                    "item": output_item,
-                },
-            )
+            },
+        )
 
     # ------------------------------------------------------------------
     # Chat-completions (OpenAI-style) deltas
@@ -1337,23 +1450,37 @@ class ResponsesStreamState:
         chunk: dict[str, Any],
         *,
         hide_tool_calls: bool = False,
-    ) -> None:
+    ) -> bool:
         usage = chunk.get("usage")
         if isinstance(usage, dict):
             self.usage = normalize_responses_usage(usage)
         choice = (chunk.get("choices") or [{}])[0]
         delta = choice.get("delta") or {}
+        finish_reason = choice.get("finish_reason")
         reasoning = delta.get("reasoning_content") or delta.get("reasoning")
         if reasoning:
             await self._chat_reasoning_delta(response, reasoning)
-        content = delta.get("content")
-        if content:
-            for state in list(self.reasoning_blocks.values()):
-                if not state.get("closed"):
-                    await self._close_reasoning(response, state)
-            await self._text_delta(response, content)
         for call in delta.get("tool_calls") or []:
             await self._chat_tool_delta(response, call, hidden=hide_tool_calls)
+        message = choice.get("message") or {}
+        for call in message.get("tool_calls") or []:
+            await self._chat_tool_delta(response, call, hidden=hide_tool_calls)
+        end_turn = self.should_end_upstream_turn(finish_reason)
+        if end_turn and finish_reason:
+            self.discard_stats.finish_reason = str(finish_reason)
+        content = delta.get("content")
+        if content:
+            if end_turn or self.has_complete_tool_calls():
+                self.discard_stats.record_skipped_content(
+                    content,
+                    reason=str(finish_reason) if finish_reason else "tool_calls",
+                )
+            else:
+                for state in list(self.reasoning_blocks.values()):
+                    if not state.get("closed"):
+                        await self._close_reasoning(response, state)
+                await self._text_delta(response, content)
+        return end_turn
 
     async def _emit_reasoning_summary_deltas(
         self, response: web.StreamResponse, state: dict[str, Any], text: str
@@ -1386,14 +1513,33 @@ class ResponsesStreamState:
     ) -> None:
         index = int(call.get("index", 0))
         fn = call.get("function") or {}
+        existing = (
+            self.tool_calls.get(index)
+            or self.hidden_tool_calls.get(index)
+            or self.mcp_tool_calls.get(index)
+        )
+        name = (existing.get("name") if existing else "") + (fn.get("name") or "")
+        if mcp_search.is_shim_resolved_tool(name):
+            hidden = True
+        elif mcp_search.parse_mcp_function_name(name) or index in self.mcp_tool_calls:
+            await self._chat_mcp_tool_delta(response, index, call, fn, name)
+            return
+        if hidden and index in self.tool_calls:
+            migrated = self.tool_calls.pop(index)
+            migrated["hidden"] = True
+            self.hidden_tool_calls[index] = migrated
         bucket = self.hidden_tool_calls if hidden else self.tool_calls
         state = bucket.get(index)
         if state is None:
             call_id = call.get("id") or f"call_{index}"
             if hidden:
-                state = self._open_tool_internal(key=index, call_id=call_id, name=fn.get("name") or "", hidden=True)
+                state = self._open_tool_internal(
+                    key=index, call_id=call_id, name=fn.get("name") or "", hidden=True
+                )
             else:
-                state = await self._open_tool(response, key=index, call_id=call_id, name=fn.get("name") or "")
+                state = await self._open_tool(
+                    response, key=index, call_id=call_id, name=fn.get("name") or ""
+                )
         else:
             if fn.get("name"):
                 state["name"] += fn["name"]
@@ -1410,6 +1556,117 @@ class ResponsesStreamState:
                         "delta": arg_delta,
                     },
                 )
+        if (
+            mcp_search.is_shim_resolved_tool(state.get("name") or "")
+            and _tool_call_arguments_complete(state)
+        ):
+            await self._finalize_shim_tool_call(response, state)
+
+    async def _chat_mcp_tool_delta(
+        self,
+        response: web.StreamResponse,
+        index: int,
+        call: dict[str, Any],
+        fn: dict[str, Any],
+        name: str,
+    ) -> None:
+        state = self.mcp_tool_calls.get(index)
+        if state is None:
+            call_id = call.get("id") or f"call_{index}"
+            state = {
+                "id": call_id,
+                "call_id": call_id,
+                "name": fn.get("name") or "",
+                "arguments": "",
+                "closed": False,
+                "opened": False,
+            }
+            self.mcp_tool_calls[index] = state
+        elif fn.get("name"):
+            state["name"] += fn.get("name")
+        if not state.get("opened") and mcp_search.parse_mcp_function_name(state.get("name") or ""):
+            state = await self._open_mcp_tool(response, index, state)
+        arg_delta = fn.get("arguments") or ""
+        if arg_delta:
+            state["arguments"] += arg_delta
+        if _tool_call_arguments_complete(state) and not state.get("closed"):
+            await self._close_mcp_tool(response, state)
+
+    async def _open_mcp_tool(
+        self,
+        response: web.StreamResponse,
+        index: int,
+        state: dict[str, Any],
+    ) -> dict[str, Any]:
+        parsed = mcp_search.parse_mcp_function_name(state.get("name") or "")
+        if parsed is None:
+            return state
+        server, tool = parsed
+        for reasoning in list(self.reasoning_blocks.values()):
+            if not reasoning.get("closed"):
+                await self._close_reasoning(response, reasoning)
+        output_index = self.next_output_index
+        self.next_output_index += 1
+        state.update(
+            {
+                "output_index": output_index,
+                "server": server,
+                "tool": tool,
+                "opened": True,
+            }
+        )
+        self.mcp_tool_calls[index] = state
+        await _write_sse(
+            response,
+            {
+                "type": "response.output_item.added",
+                "output_index": output_index,
+                "item": tool_translate.mcp_function_call_item(
+                    state["id"],
+                    server,
+                    tool,
+                    "",
+                    "in_progress",
+                ),
+            },
+        )
+        return state
+
+    async def _close_mcp_tool(
+        self, response: web.StreamResponse, state: dict[str, Any]
+    ) -> None:
+        if state.get("closed"):
+            return
+        if not state.get("opened"):
+            for index, candidate in self.mcp_tool_calls.items():
+                if candidate is state:
+                    state = await self._open_mcp_tool(response, index, state)
+                    break
+        state["closed"] = True
+        arguments = state.get("arguments") or ""
+        await _write_sse(
+            response,
+            {
+                "type": "response.function_call_arguments.done",
+                "item_id": state["id"],
+                "output_index": state["output_index"],
+                "arguments": arguments,
+            },
+        )
+        await _write_sse(
+            response,
+            {
+                "type": "response.output_item.done",
+                "output_index": state["output_index"],
+                "item": tool_translate.mcp_function_call_item(
+                    state["id"],
+                    state["server"],
+                    state["tool"],
+                    arguments,
+                    "completed",
+                ),
+            },
+        )
 
     def all_tool_calls(self) -> dict[int, dict[str, Any]]:
         return {**self.tool_calls, **self.hidden_tool_calls}
@@ -1771,6 +2028,15 @@ class ResponsesStreamState:
             ] if self.message_text else [],
         }
 
+    def _mcp_tool_item(self, state: dict[str, Any], status: str = "completed") -> dict[str, Any]:
+        return tool_translate.mcp_function_call_item(
+            state["id"],
+            state["server"],
+            state["tool"],
+            state.get("arguments") or "",
+            status,
+        )
+
     def _tool_item(self, state: dict[str, Any], status: str) -> dict[str, Any]:
         return {
             "id": state["id"],
@@ -1795,6 +2061,17 @@ class ResponsesStreamState:
                 ):
                     collected.append((turn["message_index"], self._message_item_for_turn(turn, "completed")))
                 for state in turn["tool_calls"].values():
+                    if mcp_search.parse_mcp_function_name(state.get("name") or ""):
+                        continue
+                    collected.append((state["output_index"], self._tool_item(state, "completed")))
+                for state in turn.get("mcp_tool_calls", {}).values():
+                    collected.append((state["output_index"], self._mcp_tool_item(state)))
+                for state in turn.get("hidden_tool_calls", {}).values():
+                    call_id = state.get("call_id") or state.get("id")
+                    if not call_id or call_id not in turn.get("tool_outputs", {}):
+                        continue
+                    if not mcp_search.is_shim_resolved_tool(state.get("name") or ""):
+                        continue
                     collected.append((state["output_index"], self._tool_item(state, "completed")))
                 for entry in turn["tool_outputs"].values():
                     collected.append((entry["output_index"], entry["item"]))
@@ -1915,7 +2192,36 @@ async def _safe_write(response: web.StreamResponse, data: bytes) -> None:
         raise
 
 
+def _stream_log_enabled() -> bool:
+    return os.environ.get("CODEX_SHIM_STREAM_LOG", "").lower() in {"1", "true", "yes", "on"}
+
+
+def _log_stream_event(payload: dict[str, Any]) -> None:
+    if not _stream_log_enabled():
+        return
+    event_type = payload.get("type", "?")
+    detail = ""
+    if event_type == "response.output_item.added":
+        item = payload.get("item") or {}
+        extra = item.get("name") or ""
+        if not extra and item.get("type") == "function_call" and item.get("namespace"):
+            extra = f"{item.get('namespace')}/{item.get('name')}"
+        detail = f" item={item.get('type')} name={extra}"
+    elif event_type == "response.output_item.done":
+        item = payload.get("item") or {}
+        extra = item.get("name") or ""
+        if not extra and item.get("type") == "function_call" and item.get("namespace"):
+            extra = f"{item.get('namespace')}/{item.get('name')}"
+        elif not extra:
+            extra = (item.get("action") or {}).get("query", "")
+        detail = f" item={item.get('type')} name={extra}"
+    elif event_type == "response.reasoning_summary_text.delta":
+        detail = f" len={len(payload.get('delta') or '')}"
+    print(f"[sse] {event_type}{detail}", flush=True)
+
+
 async def _write_sse(response: web.StreamResponse, payload: dict[str, Any]) -> None:
+    _log_stream_event(payload)
     try:
         await response.write(f"data: {json.dumps(payload, separators=(',', ':'))}\n\n".encode())
     except (ConnectionResetError, ConnectionError) as exc:
@@ -1956,6 +2262,11 @@ def _log_incoming_request(endpoint: str, body: dict[str, Any]) -> None:
                         extra = f"({item.get('name', '?')})"
                     elif t == "function_call_output":
                         extra = f"(call_id={str(item.get('call_id', ''))[:24]})"
+                    elif t == "web_search_call":
+                        action = item.get("action") or {}
+                        extra = f"(query={str(action.get('query', ''))[:40]})"
+                    elif t == "mcp_tool_call":
+                        extra = f"({item.get('server', '?')}/{item.get('tool', '?')})"
                     input_summary.append(f"{t}{extra}")
         print(
             f"[req] {endpoint} model={body.get('model')!r} stream={body.get('stream')!r} "
@@ -1965,6 +2276,16 @@ def _log_incoming_request(endpoint: str, body: dict[str, Any]) -> None:
         )
     except Exception as exc:
         print(f"[req] failed to log: {exc}", flush=True)
+
+
+async def _finish_upstream_stream(upstream, *, cancelled: bool = False) -> None:
+    """Release an upstream chat-completions SSE response.
+
+    When ``cancelled`` is true, close the HTTP body first so backends like
+    llama-server abort in-flight decode instead of running to max_tokens."""
+    if cancelled:
+        upstream.close()
+    upstream.release()
 
 
 async def _sse_lines(upstream) -> Any:

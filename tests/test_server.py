@@ -1,16 +1,19 @@
 from __future__ import annotations
 
 import json
+from typing import Any
 
 import pytest
-from aiohttp import web
+from aiohttp import ClientSession, web
 from aiohttp.test_utils import TestClient, TestServer
 
+from codex_shim import mcp_search
 from codex_shim import server as server_module
 from codex_shim.server import (
     ResponsesStreamState,
     ShimServer,
     _current_managed_model,
+    _iter_reasoning_delta_chunks,
     _picker_html,
     _rewrite_response_model,
     _sanitize_chatgpt_passthrough_body,
@@ -179,6 +182,81 @@ async def test_image_generation_routes_to_chatgpt_passthrough_and_rewrites_model
     await shim_client.close()
 
 
+async def test_chatgpt_passthrough_falls_back_to_byok_on_error(monkeypatch, tmp_path, auth_present):
+    calls: list[str] = []
+
+    class FailingChatGPTUpstream:
+        status = 503
+        content_type = "text/plain"
+
+        async def text(self):
+            return "chatgpt unavailable"
+
+        def release(self):
+            pass
+
+    async def fake_post(self, url, json=None, headers=None):
+        calls.append(str(url))
+        if "chatgpt.com" in str(url):
+            return FailingChatGPTUpstream()
+        return await orig_post(self, url, json=json, headers=headers)
+
+    upstream = web.Application()
+    captured: dict[str, Any] = {}
+
+    async def chat(request):
+        captured["body"] = await request.json()
+        return web.json_response(
+            {
+                "id": "chatcmpl_fallback",
+                "choices": [{"message": {"role": "assistant", "content": "thread title"}}],
+                "usage": {"prompt_tokens": 2, "completion_tokens": 1, "total_tokens": 3},
+            }
+        )
+
+    upstream.router.add_post("/v1/chat/completions", chat)
+    upstream_client = TestClient(TestServer(upstream))
+    await upstream_client.start_server()
+
+    orig_post = ClientSession.post
+    monkeypatch.setattr("codex_shim.server.ClientSession.post", fake_post)
+
+    settings = tmp_path / "settings.json"
+    settings.write_text(
+        json.dumps(
+            {
+                "passthrough_error_fallback": {"gpt-5.4-mini": "or-free-router"},
+                "customModels": [
+                    {
+                        "model": "openrouter/free",
+                        "displayName": "OpenRouter Free",
+                        "slug": "or-free-router",
+                        "provider": "generic-chat-completion-api",
+                        "baseUrl": str(upstream_client.make_url("/v1")),
+                        "apiKey": "secret",
+                    }
+                ],
+            }
+        )
+    )
+    shim_client = TestClient(TestServer(ShimServer(settings).app()))
+    await shim_client.start_server()
+
+    resp = await shim_client.post(
+        "/v1/responses",
+        json={"model": "gpt-5.4-mini", "input": [{"role": "user", "content": "name this thread"}]},
+    )
+    assert resp.status == 200
+    payload = await resp.json()
+    assert payload["model"] == "gpt-5.4-mini"
+    assert captured["body"]["model"] == "openrouter/free"
+    assert any("chatgpt.com" in url for url in calls)
+    assert any("chat/completions" in url for url in calls)
+
+    await shim_client.close()
+    await upstream_client.close()
+
+
 async def test_responses_routes_to_openai_chat(tmp_path):
     captured = {}
 
@@ -290,6 +368,360 @@ async def test_streaming_openai_chat_response_completed_includes_usage(tmp_path)
 
     await shim_client.close()
     await upstream_client.close()
+
+
+def test_iter_reasoning_delta_chunks_splits_large_text():
+    text = "x" * 200
+    chunks = _iter_reasoning_delta_chunks(text)
+    assert len(chunks) == 3
+    assert "".join(chunks) == text
+
+
+async def test_reasoning_item_populates_summary_for_desktop_collapsible():
+    class FakeResponse:
+        def __init__(self):
+            self.chunks: list[bytes] = []
+
+        async def write(self, data: bytes):
+            self.chunks.append(data)
+
+    downstream = FakeResponse()
+    state = ResponsesStreamState("local-llama")
+    reasoning = await state._open_reasoning(downstream, key=("chat",), initial_text="thought")
+    await state._close_reasoning(downstream, reasoning)
+
+    events = _sse_events(b"".join(downstream.chunks).decode())
+    done = [event for event in events if event.get("type") == "response.output_item.done"][-1]
+    item = done["item"]
+    assert item["type"] == "reasoning"
+    assert item["summary"] == [{"type": "summary_text", "text": "thought"}]
+    assert item["encrypted_content"].startswith(SHIM_ENCRYPTED_CONTENT_PREFIX)
+    delta_events = [event for event in events if event.get("type") == "response.reasoning_summary_text.delta"]
+    assert len(delta_events) >= 1
+
+
+async def test_chat_tool_delta_streams_exec_command_to_client():
+    class FakeResponse:
+        def __init__(self):
+            self.chunks: list[bytes] = []
+
+        async def write(self, data: bytes):
+            self.chunks.append(data)
+
+    downstream = FakeResponse()
+    state = ResponsesStreamState("local-llama")
+    await state.start(downstream)
+    await state.write_chat_delta(
+        downstream,
+        {
+            "choices": [
+                {
+                    "delta": {
+                        "tool_calls": [
+                            {
+                                "index": 0,
+                                "id": "call_1",
+                                "function": {"name": "exec_command", "arguments": '{"cmd":"'},
+                            }
+                        ]
+                    }
+                }
+            ]
+        },
+    )
+    await state.write_chat_delta(
+        downstream,
+        {
+            "choices": [
+                {
+                    "delta": {
+                        "tool_calls": [
+                            {"index": 0, "function": {"arguments": 'ls"}'}}
+                        ]
+                    }
+                }
+            ]
+        },
+    )
+    await state.finish(downstream)
+
+    events = _sse_events(b"".join(downstream.chunks).decode())
+    function_added = [
+        event
+        for event in events
+        if event.get("type") == "response.output_item.added"
+        and (event.get("item") or {}).get("type") == "function_call"
+    ]
+    assert len(function_added) == 1
+    assert function_added[0]["item"]["name"] == "exec_command"
+    completed = [event for event in events if event.get("type") == "response.completed"][-1]
+    tool_items = [item for item in completed["response"]["output"] if item.get("type") == "function_call"]
+    assert len(tool_items) == 1
+    assert tool_items[0]["name"] == "exec_command"
+
+
+async def test_chat_tool_delta_hides_tool_search_call_during_stream():
+    class FakeResponse:
+        def __init__(self):
+            self.chunks: list[bytes] = []
+
+        async def write(self, data: bytes):
+            self.chunks.append(data)
+
+    downstream = FakeResponse()
+    state = ResponsesStreamState("local-llama")
+    await state.start(downstream)
+    await state.write_chat_delta(
+        downstream,
+        {
+            "choices": [
+                {
+                    "delta": {
+                        "tool_calls": [
+                            {
+                                "index": 0,
+                                "id": "call_search",
+                                "function": {"name": "tool_search_call", "arguments": '{"query":"mcp__exa"}'},
+                            }
+                        ]
+                    }
+                }
+            ]
+        },
+    )
+    events_mid = _sse_events(b"".join(downstream.chunks).decode())
+    function_added_mid = [
+        event
+        for event in events_mid
+        if event.get("type") == "response.output_item.added"
+        and (event.get("item") or {}).get("type") == "function_call"
+    ]
+    assert function_added_mid == []
+    outputs_mid = [
+        event
+        for event in events_mid
+        if event.get("type") == "response.output_item.done"
+        and (event.get("item") or {}).get("type") == "function_call_output"
+    ]
+    assert len(outputs_mid) == 1
+    await state.finish(downstream)
+
+
+async def test_write_chat_delta_skips_content_after_complete_tool_call():
+    class FakeResponse:
+        def __init__(self):
+            self.chunks: list[bytes] = []
+
+        async def write(self, data: bytes):
+            self.chunks.append(data)
+
+    downstream = FakeResponse()
+    state = ResponsesStreamState("local-llama")
+    await state.write_chat_delta(
+        downstream,
+        {
+            "choices": [
+                {
+                    "delta": {
+                        "tool_calls": [
+                            {
+                                "index": 0,
+                                "id": "call_exec",
+                                "function": {
+                                    "name": "exec_command",
+                                    "arguments": '{"cmd":"echo hi"}',
+                                },
+                            }
+                        ],
+                        "content": "hallucinated post-tool text",
+                    },
+                    "finish_reason": "tool_calls",
+                }
+            ]
+        },
+    )
+    assert state.discard_stats.skipped_content_chars == len("hallucinated post-tool text")
+    assert state.message_text == ""
+
+
+async def test_write_chat_delta_ends_upstream_turn_when_tool_call_complete():
+    class FakeResponse:
+        async def write(self, data: bytes):
+            return None
+
+    downstream = FakeResponse()
+    state = ResponsesStreamState("local-llama")
+    ended = await state.write_chat_delta(
+        downstream,
+        {
+            "choices": [
+                {
+                    "delta": {
+                        "tool_calls": [
+                            {
+                                "index": 0,
+                                "id": "call_exa",
+                                "function": {
+                                    "name": "mcp__exa__web_search_exa",
+                                    "arguments": '{"query":"ukraine war"}',
+                                },
+                            }
+                        ]
+                    }
+                }
+            ]
+        },
+    )
+    assert ended is True
+    assert state.has_complete_tool_calls()
+
+
+async def test_mcp_tool_call_emits_namespaced_function_call():
+    class FakeResponse:
+        def __init__(self):
+            self.chunks: list[bytes] = []
+
+        async def write(self, data: bytes):
+            self.chunks.append(data)
+
+    downstream = FakeResponse()
+    state = ResponsesStreamState("local-llama")
+    await state.start(downstream)
+    await state.write_chat_delta(
+        downstream,
+        {
+            "choices": [
+                {
+                    "delta": {
+                        "tool_calls": [
+                            {
+                                "index": 0,
+                                "id": "call_exa",
+                                "function": {
+                                    "name": "mcp__exa__web_search_exa",
+                                    "arguments": '{"query":"ukraine"}',
+                                },
+                            }
+                        ]
+                    }
+                }
+            ]
+        },
+    )
+    events = _sse_events(b"".join(downstream.chunks).decode())
+    function_added = [
+        e
+        for e in events
+        if e.get("type") == "response.output_item.added"
+        and (e.get("item") or {}).get("type") == "function_call"
+        and (e.get("item") or {}).get("namespace") == "mcp__exa"
+    ]
+    assert len(function_added) == 1
+    assert function_added[0]["item"]["name"] == "web_search_exa"
+    outputs = [
+        e
+        for e in events
+        if e.get("type") == "response.output_item.done"
+        and (e.get("item") or {}).get("type") == "function_call"
+        and (e.get("item") or {}).get("namespace") == "mcp__exa"
+    ]
+    assert len(outputs) == 1
+    assert outputs[0]["item"]["name"] == "web_search_exa"
+    assert '"query":"ukraine"' in outputs[0]["item"]["arguments"]
+
+
+async def test_mcp_tool_call_in_final_response_output():
+    class FakeResponse:
+        def __init__(self):
+            self.chunks: list[bytes] = []
+
+        async def write(self, data: bytes):
+            self.chunks.append(data)
+
+    downstream = FakeResponse()
+    state = ResponsesStreamState("local-llama")
+    await state.start(downstream)
+    await state.write_chat_delta(
+        downstream,
+        {
+            "choices": [
+                {
+                    "delta": {
+                        "tool_calls": [
+                            {
+                                "index": 0,
+                                "id": "call_exa",
+                                "function": {
+                                    "name": "mcp__exa__web_search_exa",
+                                    "arguments": '{"query":"ukraine"}',
+                                },
+                            }
+                        ]
+                    }
+                }
+            ]
+        },
+    )
+    await state.finish(downstream)
+
+    events = _sse_events(b"".join(downstream.chunks).decode())
+    completed = [e for e in events if e.get("type") == "response.completed"][-1]
+    output = completed["response"]["output"]
+    calls = [item for item in output if item.get("type") == "function_call"]
+    mcp_calls = [item for item in calls if item.get("namespace") == "mcp__exa"]
+    outputs = [item for item in output if item.get("type") == "function_call_output"]
+    assert len(mcp_calls) == 1
+    assert len(calls) == 1
+    assert mcp_calls[0]["name"] == "web_search_exa"
+    assert '"query":"ukraine"' in mcp_calls[0]["arguments"]
+    assert outputs == []
+
+
+async def test_mcp_tool_call_emits_codex_native_item():
+    class FakeResponse:
+        def __init__(self):
+            self.chunks: list[bytes] = []
+
+        async def write(self, data: bytes):
+            self.chunks.append(data)
+
+    downstream = FakeResponse()
+    state = ResponsesStreamState("local-llama")
+    await state.start(downstream)
+    await state.write_chat_delta(
+        downstream,
+        {
+            "choices": [
+                {
+                    "delta": {
+                        "tool_calls": [
+                            {
+                                "index": 0,
+                                "id": "call_exa",
+                                "function": {
+                                    "name": "mcp__exa__web_search_exa",
+                                    "arguments": '{"query":"ukraine war"}',
+                                },
+                            }
+                        ]
+                    }
+                }
+            ]
+        },
+    )
+    await state.finish(downstream)
+
+    events = _sse_events(b"".join(downstream.chunks).decode())
+    outputs = [
+        e
+        for e in events
+        if e.get("type") == "response.output_item.done"
+        and (e.get("item") or {}).get("type") == "function_call"
+        and (e.get("item") or {}).get("namespace") == "mcp__exa"
+    ]
+    assert len(outputs) == 1
+    assert '"query":"ukraine war"' in outputs[0]["item"]["arguments"]
+    assert outputs[0]["item"]["status"] == "completed"
 
 
 async def test_streaming_anthropic_response_completed_includes_usage():

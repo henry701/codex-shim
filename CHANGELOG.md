@@ -9,6 +9,10 @@ and this project does not yet follow semantic versioning (pre-1.0).
 
 ### Added
 
+- `codex_shim/tool_translate.py`: rewrite upstream MCP `function_call` items into
+  passthrough shape (`namespace: "mcp__<server>"`, short tool name) so Codex
+  CLI/Desktop executes MCP locally and `codex exec --json` shows `mcp_tool_call`
+  parity with ChatGPT passthrough.
 - Auto Router (`codex_shim/router.py`): an optional `Auto (smart routing)` picker
   entry (slug `codex-auto`) that routes each task to the cheapest configured
   model that can handle it. A cheap classifier model scores every candidate
@@ -69,6 +73,9 @@ and this project does not yet follow semantic versioning (pre-1.0).
 
 ### Changed
 
+- MCP tool invocations no longer run on the shim (`tools/call` removed). Only
+  the virtual `tool_search_call` tool is shim-executed (lazy MCP `tools/list`
+  discovery). All other MCP calls round-trip through Codex's native MCP runtime.
 - Reframed the project around a generic all-model Codex shim instead of any
   single upstream app or model store.
 - Made `~/.codex-shim/models.json` the canonical default settings file.

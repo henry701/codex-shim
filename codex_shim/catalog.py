@@ -20,6 +20,19 @@ from .cursor_passthrough import cursor_catalog_entry, cursor_passthrough_availab
 PLAN_TIERS = ["free", "plus", "pro", "team", "business", "enterprise"]
 
 
+def _reasoning_catalog_fields(model: ShimModel) -> dict[str, Any]:
+    if model.supports_reasoning_summaries:
+        return {
+            "default_reasoning_summary": "auto",
+            "supports_reasoning_summaries": True,
+        }
+    return {
+        "default_reasoning_summary": "none",
+        "reasoning_summary_format": "none",
+        "supports_reasoning_summaries": False,
+    }
+
+
 def catalog_entry(model: ShimModel) -> dict:
     context = model.max_context_limit or _default_context(model)
     compact = max(8_000, int(context * 0.8))
@@ -40,9 +53,7 @@ def catalog_entry(model: ShimModel) -> dict:
             {"effort": "high", "description": "Deeper reasoning"},
             {"effort": "xhigh", "description": "Maximum reasoning where supported"},
         ],
-        "default_reasoning_summary": "none",
-        "reasoning_summary_format": "none",
-        "supports_reasoning_summaries": False,
+        **_reasoning_catalog_fields(model),
         "default_verbosity": "low",
         "support_verbosity": False,
         "apply_patch_tool_type": "freeform",
@@ -128,6 +139,7 @@ model_catalog_json = "{_toml_escape(str(catalog_path))}"
 name = "Codex Shim"
 base_url = "http://127.0.0.1:{port}/v1"
 wire_api = "responses"
+requires_openai_auth = true
 experimental_bearer_token = "dummy"
 request_max_retries = 3
 stream_max_retries = 3
@@ -145,6 +157,7 @@ def codex_config_overrides(catalog_path: Path, default_slug: str, port: int) -> 
         f'model_providers.{PROVIDER_NAME}.name="Codex Shim"',
         f'model_providers.{PROVIDER_NAME}.base_url="http://127.0.0.1:{port}/v1"',
         f'model_providers.{PROVIDER_NAME}.wire_api="responses"',
+        f'model_providers.{PROVIDER_NAME}.requires_openai_auth=true',
         f'model_providers.{PROVIDER_NAME}.experimental_bearer_token="dummy"',
         f'model_providers.{PROVIDER_NAME}.request_max_retries=3',
         f'model_providers.{PROVIDER_NAME}.stream_max_retries=3',

@@ -641,6 +641,7 @@ Native Responses-only tools now have BYOK fallbacks:
 | `apply_patch` | `apply_patch` function with `{patch, ...}` |
 | `local_shell` / `shell` | `local_shell` function with `{command, ...}` |
 | Codex MCP functions | Passed through as normal function tools |
+| MCP server tools (`mcp__<server>__<tool>`) | Rewritten to namespaced `function_call` (`namespace: "mcp__<server>"`, short tool name) for Codex-native MCP execution |
 
 That keeps BYOK models inside the Codex agent loop even when the upstream API is
 chat-completions or Anthropic Messages instead of native Responses. ChatGPT
@@ -719,6 +720,16 @@ It does **not** flatten individual MCP server tools into the function list.
 That is a Codex client behavior, not a shim limitation. Shim-routed models
 receive the same MCP tools as built-in OpenAI models. The model is expected to
 call `list_mcp_resources` to discover what is available.
+
+When a BYOK model emits a full MCP tool name (`mcp__exa__web_search_exa`, etc.),
+the shim rewrites the streamed Responses item to match ChatGPT passthrough:
+`function_call` with `namespace: "mcp__exa"` and `name: "web_search_exa"`.
+Codex CLI/Desktop executes the MCP call locally (visible as `mcp_tool_call` in
+`codex exec --json`); the shim does not invoke MCP servers for those invocations.
+
+The virtual `tool_search_call` tool is the one exception: the shim executes it
+server-side to run MCP `tools/list` against a configured server so models can
+discover available tools without every tool name being injected up front.
 
 ---
 
