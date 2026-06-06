@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 import os
 import re
@@ -519,7 +520,7 @@ class ShimServer:
             await response.prepare(request)
             try:
                 if response_model_override:
-                    async for line in _sse_lines(upstream):
+                    async for line in _sse_lines(upstream, request):
                         if line == "[DONE]":
                             await _safe_write(response, b"data: [DONE]\n\n")
                             break
@@ -531,12 +532,19 @@ class ShimServer:
                         _rewrite_response_model(payload, response_model_override)
                         await _write_sse(response, payload)
                 else:
-                    async for chunk in upstream.content.iter_chunked(4096):
-                        await _safe_write(response, chunk)
+                    try:
+                        async for chunk in _iter_upstream_chunks(upstream.content, request):
+                            await _safe_write(response, chunk)
+                    except asyncio.CancelledError:
+                        await _close_upstream(upstream)
+                        raise
+            except asyncio.CancelledError:
+                print("[cancel] client disconnected during ChatGPT passthrough stream", flush=True)
+                raise
             except ClientDisconnected:
-                pass
+                print("[cancel] client disconnected during ChatGPT passthrough stream", flush=True)
             finally:
-                upstream.release()
+                await _close_upstream(upstream)
             try:
                 await response.write_eof()
             except Exception:
@@ -940,7 +948,7 @@ class ShimServer:
                         upstream.release()
                         break
                     try:
-                        async for line in _sse_lines(upstream):
+                        async for line in _sse_lines(upstream, request):
                             if line == "[DONE]":
                                 break
                             try:
@@ -952,14 +960,17 @@ class ShimServer:
                             else:
                                 await _write_sse(response, event)
                     finally:
-                        upstream.release()
+                        await _close_upstream(upstream)
                     break
             if as_responses and state is not None:
                 await state.finish(response)
             else:
                 await _safe_write(response, b"data: [DONE]\n\n")
+        except asyncio.CancelledError:
+            print("[cancel] client disconnected during BYOK stream", flush=True)
+            raise
         except ClientDisconnected:
-            pass
+            print("[cancel] client disconnected during BYOK stream", flush=True)
         try:
             await response.write_eof()
         except Exception:
@@ -1003,7 +1014,7 @@ class ShimServer:
         try:
             if as_responses:
                 await state.start(response)
-            async for line in _sse_lines(upstream):
+            async for line in _sse_lines(upstream, request):
                 if line == "[DONE]":
                     break
                 try:
@@ -1018,10 +1029,13 @@ class ShimServer:
                 await state.finish(response)
             else:
                 await _safe_write(response, b"data: [DONE]\n\n")
+        except asyncio.CancelledError:
+            print("[cancel] client disconnected during Anthropic stream", flush=True)
+            raise
         except ClientDisconnected:
-            pass
+            print("[cancel] client disconnected during Anthropic stream", flush=True)
         finally:
-            upstream.release()
+            await _close_upstream(upstream)
         try:
             await response.write_eof()
         except Exception:
@@ -2238,15 +2252,64 @@ def _log_incoming_request(endpoint: str, body: dict[str, Any]) -> None:
         print(f"[req] failed to log: {exc}", flush=True)
 
 
-async def _sse_lines(upstream) -> Any:
+def _request_disconnected(request: web.Request | None) -> bool:
+    if request is None:
+        return False
+    transport = request.transport
+    if transport is not None and transport.is_closing():
+        return True
+    protocol = getattr(request, "protocol", None)
+    if protocol is not None:
+        proto_transport = getattr(protocol, "transport", None)
+        if proto_transport is not None and proto_transport.is_closing():
+            return True
+    return False
+
+
+async def _close_upstream(upstream) -> None:
+    if upstream is None:
+        return
+    try:
+        upstream.close()
+    except Exception:
+        pass
+    try:
+        upstream.release()
+    except Exception:
+        pass
+
+
+async def _iter_upstream_chunks(content, request: web.Request | None = None):
+    """Read upstream bytes until EOF or client disconnect.
+
+    With ``handler_cancellation=True`` on the aiohttp runner, client STOP
+    cancels the handler task and ``readany()`` raises ``CancelledError``.
+    """
+    del request  # reserved for future transport-level hooks
+    try:
+        while True:
+            chunk = await content.readany()
+            if not chunk:
+                break
+            yield chunk
+    except asyncio.CancelledError:
+        raise
+
+
+async def _sse_lines(upstream, request: web.Request | None = None) -> Any:
     buffer = b""
-    async for chunk in upstream.content.iter_chunked(4096):
-        buffer += chunk
-        while b"\n" in buffer:
-            raw, buffer = buffer.split(b"\n", 1)
-            line = raw.decode("utf-8", errors="replace").strip()
-            if line.startswith("data:"):
-                yield line[5:].strip()
+    content = upstream.content
+    try:
+        async for chunk in _iter_upstream_chunks(content, request):
+            buffer += chunk
+            while b"\n" in buffer:
+                raw, buffer = buffer.split(b"\n", 1)
+                line = raw.decode("utf-8", errors="replace").strip()
+                if line.startswith("data:"):
+                    yield line[5:].strip()
+    except asyncio.CancelledError:
+        await _close_upstream(upstream)
+        raise
     tail = buffer.decode("utf-8", errors="replace").strip()
     if tail.startswith("data:"):
         yield tail[5:].strip()
@@ -2597,7 +2660,13 @@ def main(argv: list[str] | None = None) -> None:
     args = parser.parse_args(argv)
 
     shim = ShimServer(args.settings, host=args.host)
-    web.run_app(shim.app(), host=args.host, port=args.port, handle_signals=True)
+    web.run_app(
+        shim.app(),
+        host=args.host,
+        port=args.port,
+        handle_signals=True,
+        handler_cancellation=True,
+    )
 
 
 if __name__ == "__main__":

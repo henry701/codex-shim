@@ -101,6 +101,7 @@ def test_catalog_preserves_context_and_visibility():
     assert "free" in entry["available_in_plans"]
     assert entry["supports_reasoning_summaries"] is False
     assert entry["default_reasoning_summary"] == "none"
+    assert entry["use_responses_lite"] is True
 
 
 def test_catalog_enables_reasoning_summaries_when_requested():
@@ -187,6 +188,24 @@ def test_write_catalog_includes_gpt_models_when_auth_present(tmp_path, auth_pres
     write_catalog([], catalog_path)
     data = json.loads(catalog_path.read_text())
     assert [model["slug"] for model in data["models"]] == list(FALLBACK_CHATGPT_PASSTHROUGH_SLUGS)
+    for entry in data["models"]:
+        assert not entry.get("use_responses_lite"), (
+            f"passthrough catalog entry {entry['slug']} must not set use_responses_lite"
+        )
+
+
+def test_write_catalog_byok_use_responses_lite_not_passthrough(tmp_path, auth_present, monkeypatch):
+    missing_cache = tmp_path / "missing-models-cache.json"
+    monkeypatch.setattr("codex_shim.settings.DEFAULT_CODEX_MODELS_CACHE", missing_cache)
+    models = ModelSettingsFixture.one()
+    models = [models]
+    catalog_path = tmp_path / "catalog.json"
+    write_catalog(models, catalog_path)
+    data = json.loads(catalog_path.read_text())
+    by_slug = {entry["slug"]: entry for entry in data["models"]}
+    assert by_slug["claude-opus"]["use_responses_lite"] is True
+    for slug in FALLBACK_CHATGPT_PASSTHROUGH_SLUGS:
+        assert not by_slug[slug].get("use_responses_lite")
 
 
 def test_load_passthrough_error_fallback_accepts_map_and_shorthand(tmp_path):

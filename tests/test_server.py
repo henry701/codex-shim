@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from typing import Any
 
@@ -15,6 +16,7 @@ from codex_shim.server import (
     _current_managed_model,
     _iter_reasoning_delta_chunks,
     _picker_html,
+    _request_disconnected,
     _rewrite_response_model,
     _sanitize_chatgpt_passthrough_body,
     _set_active_model,
@@ -368,6 +370,82 @@ async def test_streaming_openai_chat_response_completed_includes_usage(tmp_path)
 
     await shim_client.close()
     await upstream_client.close()
+
+
+async def test_sse_lines_closes_upstream_when_client_disconnects(tmp_path):
+    upstream_state = {"sent": 0}
+
+    async def slow_upstream(request):
+        response = web.StreamResponse(headers={"Content-Type": "text/event-stream"})
+        await response.prepare(request)
+        try:
+            for _ in range(500):
+                payload = json.dumps({"choices": [{"delta": {"content": "x"}}]})
+                await response.write(f"data: {payload}\n\n".encode())
+                upstream_state["sent"] += 1
+                await asyncio.sleep(0.01)
+        except (ConnectionResetError, ConnectionError, asyncio.CancelledError):
+            pass
+        finally:
+            try:
+                await response.write_eof()
+            except Exception:
+                pass
+        return response
+
+    upstream = web.Application()
+    upstream.router.add_post("/v1/chat/completions", slow_upstream)
+    upstream_client = TestClient(TestServer(upstream))
+    await upstream_client.start_server()
+
+    settings = tmp_path / "settings.json"
+    settings.write_text(
+        json.dumps(
+            {
+                "customModels": [
+                    {
+                        "model": "slow",
+                        "displayName": "Slow",
+                        "provider": "openai",
+                        "baseUrl": str(upstream_client.make_url("/v1")),
+                        "apiKey": "secret",
+                    }
+                ]
+            }
+        )
+    )
+    shim_client = TestClient(TestServer(ShimServer(settings).app()))
+    await shim_client.start_server()
+
+    resp = await shim_client.post(
+        "/v1/responses",
+        json={"model": "slow", "input": "hi", "stream": True},
+    )
+    assert resp.status == 200
+    await resp.content.readline()
+    resp.close()
+    await asyncio.sleep(0.4)
+    assert 0 < upstream_state["sent"] < 500
+
+    await shim_client.close()
+    await upstream_client.close()
+
+
+async def test_request_disconnected_reflects_closing_transport():
+    class FakeTransport:
+        def __init__(self, closing: bool):
+            self._closing = closing
+
+        def is_closing(self) -> bool:
+            return self._closing
+
+    class FakeRequest:
+        def __init__(self, closing: bool):
+            self.transport = FakeTransport(closing)
+            self.protocol = None
+
+    assert _request_disconnected(FakeRequest(False)) is False
+    assert _request_disconnected(FakeRequest(True)) is True
 
 
 def test_iter_reasoning_delta_chunks_splits_large_text():
