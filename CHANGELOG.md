@@ -83,11 +83,15 @@ and this project does not yet follow semantic versioning (pre-1.0).
 
 ### Fixed
 
+- `codex-shim enable` / `disable` now manage `tool_search_always_defer_mcp_tools`
+  in a shim-owned `[features]` block (with restore of any prior user value).
+  Ephemeral `codex-shim codex` / `app` runs apply the same override via CLI flags.
+- MCP system hint for BYOK models now steers `tool_search_call` queries toward
+  short tokens (`exa`, `web_search_exa`) instead of `mcp__`-prefixed strings that
+  often return empty BM25 results.
 - BYOK catalog entries now set `supports_search_tool: true` (matching ChatGPT
   passthrough models) so Codex builds the client-side `tool_search` BM25 index
   instead of returning empty `tool_search_output.tools` for shim-routed models.
-  Enable `tool_search_always_defer_mcp_tools` in `~/.codex/config.toml` so small
-  MCP servers like Exa stay in the searchable deferred set.
 - Shim injects `tool_search_call` for upstream BYOK models when Codex sends the
   native `tool_search` tool (deferred MCP mode), not only bare `mcp__*` stubs.
 - Removed MCP `tools/list` pre-injection; discovery is via Codex-native

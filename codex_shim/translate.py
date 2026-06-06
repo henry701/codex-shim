@@ -13,12 +13,13 @@ SHIM_ENCRYPTED_CONTENT_PREFIX = "anthropic-thinking-v1:"
 _THINKING_MAGIC = SHIM_ENCRYPTED_CONTENT_PREFIX
 
 MCP_TOOL_HINT = (
-    "MCP tool-calling convention: tools are exposed as mcp__<server>__<tool> with double underscore "
-    "(e.g. mcp__exa__web_search_exa). Do NOT call bare server names like mcp__exa — "
-    "that returns 'unsupported call'. Call tools by their full mcp__<server>__<tool> name. "
-    "If a tool returns 'unsupported call: X', do not retry X; pick a different approach. "
-    "If you cannot find an MCP tool you need, call `tool_search_call` with the bare server name "
-    "(e.g. tool_search_call(query='mcp__exa')) to discover available tools."
+    "MCP tool-calling convention: invoke tools by full name mcp__<server>__<tool> "
+    "(e.g. mcp__exa__web_search_exa). Do NOT invoke bare server stubs like mcp__exa — "
+    "Codex returns 'unsupported call' for those. "
+    "If a call returns 'unsupported call: X', do not retry X; pick a different tool or approach. "
+    "To discover deferred MCP tools, call `tool_search_call` with a short search token — "
+    "the server or tool name without the mcp__ prefix (e.g. tool_search_call(query='exa') or "
+    "query='web_search_exa'). Queries like mcp__exa often match nothing in the local BM25 index."
 )
 
 

@@ -83,6 +83,10 @@ cd ~/codex-shim
 python3 -m pip install --user -e .
 ```
 
+On Arch Linux and other PEP 668 “externally managed” Python installs, add
+`--break-system-packages` to the `pip install` command above (user-site install
+only; does not modify system packages).
+
 Recommended on native Windows PowerShell/cmd:
 
 ```powershell
@@ -120,8 +124,10 @@ ln -sf "$PWD/bin/codex-model" ~/.local/bin/codex-model
 For running the test suite:
 
 ```bash
-python3 -m pip install --user pytest pytest-asyncio
+python3 -m pip install --user -e ".[dev]"
 ```
+
+On Arch Linux, add `--break-system-packages` as with the main install above.
 
 If your POSIX shell cannot find the commands, make sure `~/.local/bin` is on
 `PATH`:
@@ -379,9 +385,10 @@ including bare strings. `provider: "ollama"` is normalized to
 is supplied.
 
 Repeated `codex-shim enable`, `codex-shim app`, and `codex-shim model use ...`
-runs are idempotent: the shim-managed top-level keys and
-`[model_providers.codex_shim]` block are removed before the new managed block is
-written, so duplicate profile/provider keys should not accumulate.
+runs are idempotent: the shim-managed top-level keys,
+`[model_providers.codex_shim]`, and managed `[features]` block are removed before
+the new managed blocks are written, so duplicate profile/provider keys should not
+accumulate.
 
 Codex may make small background calls to OpenAI model slugs such as
 `gpt-5.4-mini` for its own product behavior. Those calls are not Ollama routing
@@ -730,10 +737,16 @@ Codex CLI/Desktop executes the MCP call locally (visible as `mcp_tool_call` in
 When a BYOK model calls the virtual `tool_search_call` discovery tool, the shim
 rewrites it to the native `tool_search_call` Responses item (with `execution:
 "client"`). Codex executes the local BM25 search index and returns
-`tool_search_output` on the next turn. BYOK catalog entries must set
+`tool_search_output` on the next turn. BYOK catalog entries set
 `supports_search_tool: true` (matching ChatGPT passthrough models) so Codex
-builds that index; enable `tool_search_always_defer_mcp_tools` in
-`~/.codex/config.toml` so small MCP servers stay searchable.
+builds that index. `codex-shim enable` installs a managed `[features]` block with
+`tool_search_always_defer_mcp_tools = true` so small MCP servers stay searchable;
+`codex-shim disable` restores any prior value. Ephemeral `codex-shim codex` /
+`app` runs apply the same override via CLI flags.
+
+Discovery queries work best with short tokens (`exa`, `web_search_exa`); the shim
+injects a system hint steering models away from `mcp__`-prefixed search strings
+that often return empty BM25 results.
 
 ---
 
@@ -842,7 +855,7 @@ network path, and how often the agent calls tools.
 ```text
 codex-shim generate          regenerate catalog/config without starting daemon
 codex-shim start             regenerate catalog and start local shim daemon
-codex-shim enable            start daemon and write managed ~/.codex/config.toml block
+codex-shim enable            start daemon; write managed ~/.codex/config.toml (model, provider, tool_search flag)
 codex-shim status            health check + model count
 codex-shim stop              stop daemon
 codex-shim disable           remove managed config block and stop daemon
@@ -1076,10 +1089,10 @@ Config behavior:
   `codex-shim codex -- ...` do not persistently modify `~/.codex/config.toml`.
 - `codex-shim enable`, `codex-shim app`, and `codex-shim model use <slug>` write
   managed blocks to `~/.codex/config.toml`. If existing top-level Codex model
-  keys are displaced, the managed block records them so disable can restore
-  those keys without reverting unrelated config edits.
+  keys or managed `[features]` keys are displaced, the managed block records them
+  so disable can restore those keys without reverting unrelated config edits.
 - `codex-shim disable` removes the managed blocks, restores displaced top-level
-  model keys when present, and stops the daemon.
+  model keys and prior `[features]` values when present, and stops the daemon.
 
 ---
 
