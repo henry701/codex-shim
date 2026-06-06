@@ -727,9 +727,10 @@ the shim rewrites the streamed Responses item to match ChatGPT passthrough:
 Codex CLI/Desktop executes the MCP call locally (visible as `mcp_tool_call` in
 `codex exec --json`); the shim does not invoke MCP servers for those invocations.
 
-The virtual `tool_search_call` tool is the one exception: the shim executes it
-server-side to run MCP `tools/list` against a configured server so models can
-discover available tools without every tool name being injected up front.
+When a BYOK model calls the virtual `tool_search_call` discovery tool, the shim
+rewrites it to the native `tool_search_call` Responses item (with `execution:
+"client"`). Codex executes MCP `tools/list` locally and returns
+`tool_search_output` on the next turn, matching ChatGPT passthrough.
 
 ---
 

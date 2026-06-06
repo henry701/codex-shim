@@ -966,8 +966,9 @@ class ShimServer:
                             tool_names = [
                                 tc.get("name") or ""
                                 for tc in {
-                                    **state.all_tool_calls(),
+                                    **state.tool_calls,
                                     **state.mcp_tool_calls,
+                                    **state.tool_search_calls,
                                 }.values()
                                 if _tool_call_arguments_complete(tc)
                             ]
@@ -979,23 +980,7 @@ class ShimServer:
                         await _finish_upstream_stream(
                             upstream, cancelled=end_upstream_turn
                         )
-                    shim_tools = self._collect_shim_resolved_tool_calls(state)
-                    if shim_tools:
-                        print(
-                            f"[mcp-loop] {client_slug}: continuing with "
-                            f"{len(shim_tools)} shim-resolved tool call(s)",
-                            flush=True,
-                        )
-                    if not shim_tools:
-                        break
-                    if as_responses and state is not None:
-                        await state.close_turn_items(response)
-                        state.snapshot_turn()
-                    messages = await self._build_followup_messages_from_state(
-                        messages, state, shim_tools
-                    )
-                    if as_responses and state is not None:
-                        state.reset_for_next_turn()
+                    break
             if as_responses and state is not None:
                 await state.finish(response)
             else:
@@ -1007,72 +992,6 @@ class ShimServer:
         except Exception:
             pass
         return response
-
-    @staticmethod
-    def _collect_shim_resolved_tool_calls(
-        state: ResponsesStreamState | None,
-    ) -> list[tuple[Any, dict[str, Any]]]:
-        if state is None:
-            return []
-        out: list[tuple[Any, dict[str, Any]]] = []
-        for key, tc in state.all_tool_calls().items():
-            name = tc.get("name") or ""
-            if not mcp_search.is_shim_resolved_tool(name):
-                continue
-            if not _tool_call_arguments_complete(tc):
-                continue
-            out.append((key, tc))
-        return out
-
-    @classmethod
-    async def _build_followup_messages_from_state(
-        _cls,
-        messages: list[dict[str, Any]],
-        state: ResponsesStreamState | None,
-        shim_tools: list[tuple[Any, dict[str, Any]]],
-    ) -> list[dict[str, Any]]:
-        all_calls: list[dict[str, Any]] = []
-        if state is not None:
-            for tc in state.all_tool_calls().values():
-                all_calls.append(
-                    {
-                        "id": tc.get("call_id"),
-                        "type": "function",
-                        "function": {
-                            "name": tc.get("name"),
-                            "arguments": tc.get("arguments"),
-                        },
-                    }
-                )
-        shim_ids = {tc.get("call_id") for _, tc in shim_tools}
-        assistant_msg: dict[str, Any] = {
-            "role": "assistant",
-            "content": state.message_text if state is not None and state.message_text else None,
-            "tool_calls": all_calls,
-        }
-        new_messages = list(messages) + [assistant_msg]
-        for _, tc in shim_tools:
-            name = tc.get("name") or ""
-            result = await mcp_search.execute_shim_tool_call(name, tc.get("arguments") or "")
-            new_messages.append(
-                {
-                    "role": "tool",
-                    "tool_call_id": tc.get("call_id"),
-                    "content": result,
-                }
-            )
-        for call in all_calls:
-            if call.get("id") in shim_ids:
-                continue
-            name = (call.get("function") or {}).get("name") or ""
-            new_messages.append(
-                {
-                    "role": "tool",
-                    "tool_call_id": call.get("id"),
-                    "content": json.dumps({"error": f"unsupported call: {name}"}),
-                }
-            )
-        return new_messages
 
     async def _post_anthropic(
         self, request: web.Request, route: ShimModel, body: dict[str, Any], as_responses: bool,
@@ -1270,11 +1189,8 @@ class ResponsesStreamState:
         self.message_closed = False
         self.usage: dict[str, Any] | None = None
         self.tool_calls: dict[int, dict[str, Any]] = {}
-        self.hidden_tool_calls: dict[int, dict[str, Any]] = {}
         self.mcp_tool_calls: dict[int, dict[str, Any]] = {}
-        # Synthesized function_call_output items for shim-handled tool calls
-        # (currently only tool_search_call), keyed by call_id.
-        self.tool_outputs: dict[str, dict[str, Any]] = {}
+        self.tool_search_calls: dict[int, dict[str, Any]] = {}
         # Reasoning (extended thinking) blocks, keyed by upstream index.
         self.reasoning_blocks: dict[Any, dict[str, Any]] = {}
         self.next_output_index = 0
@@ -1282,7 +1198,11 @@ class ResponsesStreamState:
         self.discard_stats = _TurnDiscardStats()
 
     def has_complete_tool_calls(self) -> bool:
-        buckets = (*self.all_tool_calls().values(), *self.mcp_tool_calls.values())
+        buckets = (
+            *self.tool_calls.values(),
+            *self.mcp_tool_calls.values(),
+            *self.tool_search_calls.values(),
+        )
         return any(_tool_call_arguments_complete(tc) for tc in buckets)
 
     def should_end_upstream_turn(self, finish_reason: str | None = None) -> bool:
@@ -1315,7 +1235,7 @@ class ResponsesStreamState:
         for state in sorted(self.tool_calls.values(), key=lambda s: s["output_index"]):
             if state.get("closed"):
                 continue
-            if mcp_search.is_shim_resolved_tool(state.get("name") or ""):
+            if mcp_search.is_tool_search_call(state.get("name") or ""):
                 continue
             if mcp_search.parse_mcp_function_name(state.get("name") or ""):
                 continue
@@ -1323,10 +1243,9 @@ class ResponsesStreamState:
         for state in sorted(self.mcp_tool_calls.values(), key=lambda s: s["output_index"]):
             if not state.get("closed"):
                 await self._close_mcp_tool(response, state)
-        for state in sorted(self.hidden_tool_calls.values(), key=lambda s: s["output_index"]):
+        for state in sorted(self.tool_search_calls.values(), key=lambda s: s["output_index"]):
             if not state.get("closed"):
-                state["closed"] = True
-        await self._resolve_shim_handled_tools(response)
+                await self._close_tool_search(response, state)
 
     def snapshot_turn(self) -> None:
         self.completed_turns.append(self._current_turn_dict())
@@ -1339,10 +1258,9 @@ class ResponsesStreamState:
         self.message_opened = False
         self.message_closed = False
         self.tool_calls = {}
-        self.hidden_tool_calls = {}
         self.mcp_tool_calls = {}
+        self.tool_search_calls = {}
         self.reasoning_blocks = {}
-        self.tool_outputs = {}
         self.discard_stats = _TurnDiscardStats()
 
     def _current_turn_dict(self) -> dict[str, Any]:
@@ -1353,93 +1271,10 @@ class ResponsesStreamState:
             "message_opened": self.message_opened,
             "message_closed": self.message_closed,
             "tool_calls": dict(self.tool_calls),
-            "hidden_tool_calls": dict(self.hidden_tool_calls),
             "mcp_tool_calls": dict(self.mcp_tool_calls),
+            "tool_search_calls": dict(self.tool_search_calls),
             "reasoning_blocks": dict(self.reasoning_blocks),
-            "tool_outputs": dict(self.tool_outputs),
         }
-
-    async def _resolve_shim_handled_tools(self, response: web.StreamResponse) -> None:
-        """Execute shim-resolved tools (tool_search_call, mcp__*) and emit
-        function_call_output events. MCP tools are finalized eagerly during
-        streaming when possible; this catches any remaining at turn close."""
-        pending = [
-            *self.tool_calls.values(),
-            *self.hidden_tool_calls.values(),
-        ]
-        for state in sorted(pending, key=lambda s: s["output_index"]):
-            name = state.get("name") or ""
-            if not mcp_search.is_shim_resolved_tool(name):
-                continue
-            if state.get("shim_finalized"):
-                continue
-            await self._finalize_shim_tool_call(response, state)
-
-    async def _finalize_shim_tool_call(
-        self, response: web.StreamResponse, state: dict[str, Any]
-    ) -> None:
-        if state.get("shim_finalized"):
-            return
-        state["shim_finalized"] = True
-        name = state.get("name") or ""
-        if not mcp_search.is_shim_resolved_tool(name):
-            return
-        call_id = state.get("call_id") or state.get("id")
-        if not call_id or call_id in self.tool_outputs:
-            state["closed"] = True
-            return
-        result = await mcp_search.execute_shim_tool_call(
-            name, state.get("arguments") or ""
-        )
-        print(
-            f"[tool-search] {self.model}: {name} call_id={call_id} "
-            f"result_chars={len(result)} preview={result[:120]!r}",
-            flush=True,
-        )
-        await self._emit_tool_output(response, call_id, result)
-        state["closed"] = True
-
-    async def _emit_tool_output(
-        self,
-        response: web.StreamResponse,
-        call_id: str,
-        result: str,
-    ) -> None:
-        output_index = self.next_output_index
-        self.next_output_index += 1
-        output_item = {
-            "id": f"out_{int(time.time() * 1000)}_{call_id}",
-            "type": "function_call_output",
-            "status": "completed",
-            "call_id": call_id,
-            "output": result,
-        }
-        self.tool_outputs[call_id] = {
-            "output_index": output_index,
-            "item": output_item,
-        }
-        await _write_sse(
-            response,
-            {
-                "type": "response.output_item.added",
-                "output_index": output_index,
-                "item": {
-                    "id": output_item["id"],
-                    "type": "function_call_output",
-                    "status": "in_progress",
-                    "call_id": call_id,
-                    "output": "",
-                },
-            },
-        )
-        await _write_sse(
-            response,
-            {
-                "type": "response.output_item.done",
-                "output_index": output_index,
-                "item": output_item,
-            },
-        )
 
     # ------------------------------------------------------------------
     # Chat-completions (OpenAI-style) deltas
@@ -1448,8 +1283,6 @@ class ResponsesStreamState:
         self,
         response: web.StreamResponse,
         chunk: dict[str, Any],
-        *,
-        hide_tool_calls: bool = False,
     ) -> bool:
         usage = chunk.get("usage")
         if isinstance(usage, dict):
@@ -1461,10 +1294,10 @@ class ResponsesStreamState:
         if reasoning:
             await self._chat_reasoning_delta(response, reasoning)
         for call in delta.get("tool_calls") or []:
-            await self._chat_tool_delta(response, call, hidden=hide_tool_calls)
+            await self._chat_tool_delta(response, call)
         message = choice.get("message") or {}
         for call in message.get("tool_calls") or []:
-            await self._chat_tool_delta(response, call, hidden=hide_tool_calls)
+            await self._chat_tool_delta(response, call)
         end_turn = self.should_end_upstream_turn(finish_reason)
         if end_turn and finish_reason:
             self.discard_stats.finish_reason = str(finish_reason)
@@ -1508,59 +1341,124 @@ class ResponsesStreamState:
         self,
         response: web.StreamResponse,
         call: dict[str, Any],
-        *,
-        hidden: bool = False,
     ) -> None:
         index = int(call.get("index", 0))
         fn = call.get("function") or {}
         existing = (
             self.tool_calls.get(index)
-            or self.hidden_tool_calls.get(index)
             or self.mcp_tool_calls.get(index)
+            or self.tool_search_calls.get(index)
         )
         name = (existing.get("name") if existing else "") + (fn.get("name") or "")
-        if mcp_search.is_shim_resolved_tool(name):
-            hidden = True
-        elif mcp_search.parse_mcp_function_name(name) or index in self.mcp_tool_calls:
+        if mcp_search.is_tool_search_call(name) or index in self.tool_search_calls:
+            await self._chat_tool_search_delta(response, index, call, fn, name)
+            return
+        if mcp_search.parse_mcp_function_name(name) or index in self.mcp_tool_calls:
             await self._chat_mcp_tool_delta(response, index, call, fn, name)
             return
-        if hidden and index in self.tool_calls:
-            migrated = self.tool_calls.pop(index)
-            migrated["hidden"] = True
-            self.hidden_tool_calls[index] = migrated
-        bucket = self.hidden_tool_calls if hidden else self.tool_calls
-        state = bucket.get(index)
+        state = self.tool_calls.get(index)
         if state is None:
             call_id = call.get("id") or f"call_{index}"
-            if hidden:
-                state = self._open_tool_internal(
-                    key=index, call_id=call_id, name=fn.get("name") or "", hidden=True
-                )
-            else:
-                state = await self._open_tool(
-                    response, key=index, call_id=call_id, name=fn.get("name") or ""
-                )
+            state = await self._open_tool(
+                response, key=index, call_id=call_id, name=fn.get("name") or ""
+            )
         else:
             if fn.get("name"):
                 state["name"] += fn["name"]
         arg_delta = fn.get("arguments") or ""
         if arg_delta:
             state["arguments"] += arg_delta
-            if not hidden:
-                await _write_sse(
-                    response,
-                    {
-                        "type": "response.function_call_arguments.delta",
-                        "item_id": state["id"],
-                        "output_index": state["output_index"],
-                        "delta": arg_delta,
-                    },
-                )
-        if (
-            mcp_search.is_shim_resolved_tool(state.get("name") or "")
-            and _tool_call_arguments_complete(state)
-        ):
-            await self._finalize_shim_tool_call(response, state)
+            await _write_sse(
+                response,
+                {
+                    "type": "response.function_call_arguments.delta",
+                    "item_id": state["id"],
+                    "output_index": state["output_index"],
+                    "delta": arg_delta,
+                },
+            )
+
+    async def _chat_tool_search_delta(
+        self,
+        response: web.StreamResponse,
+        index: int,
+        call: dict[str, Any],
+        fn: dict[str, Any],
+        name: str,
+    ) -> None:
+        state = self.tool_search_calls.get(index)
+        if state is None:
+            call_id = call.get("id") or f"call_{index}"
+            state = {
+                "id": call_id,
+                "call_id": call_id,
+                "name": fn.get("name") or "",
+                "arguments": "",
+                "closed": False,
+                "opened": False,
+            }
+            self.tool_search_calls[index] = state
+        elif fn.get("name"):
+            state["name"] += fn.get("name")
+        if not state.get("opened") and mcp_search.is_tool_search_call(state.get("name") or ""):
+            state = await self._open_tool_search(response, index, state)
+        arg_delta = fn.get("arguments") or ""
+        if arg_delta:
+            state["arguments"] += arg_delta
+        if _tool_call_arguments_complete(state) and not state.get("closed"):
+            await self._close_tool_search(response, state)
+
+    async def _open_tool_search(
+        self,
+        response: web.StreamResponse,
+        index: int,
+        state: dict[str, Any],
+    ) -> dict[str, Any]:
+        for reasoning in list(self.reasoning_blocks.values()):
+            if not reasoning.get("closed"):
+                await self._close_reasoning(response, reasoning)
+        output_index = self.next_output_index
+        self.next_output_index += 1
+        state.update({"output_index": output_index, "opened": True})
+        self.tool_search_calls[index] = state
+        await _write_sse(
+            response,
+            {
+                "type": "response.output_item.added",
+                "output_index": output_index,
+                "item": tool_translate.tool_search_call_from_raw(
+                    state["id"],
+                    "",
+                    "in_progress",
+                ),
+            },
+        )
+        return state
+
+    async def _close_tool_search(
+        self, response: web.StreamResponse, state: dict[str, Any]
+    ) -> None:
+        if state.get("closed"):
+            return
+        if not state.get("opened"):
+            for index, candidate in self.tool_search_calls.items():
+                if candidate is state:
+                    state = await self._open_tool_search(response, index, state)
+                    break
+        state["closed"] = True
+        raw_arguments = state.get("arguments") or ""
+        await _write_sse(
+            response,
+            {
+                "type": "response.output_item.done",
+                "output_index": state["output_index"],
+                "item": tool_translate.tool_search_call_from_raw(
+                    state["id"],
+                    raw_arguments,
+                    "completed",
+                ),
+            },
+        )
 
     async def _chat_mcp_tool_delta(
         self,
@@ -1669,7 +1567,7 @@ class ResponsesStreamState:
         )
 
     def all_tool_calls(self) -> dict[int, dict[str, Any]]:
-        return {**self.tool_calls, **self.hidden_tool_calls}
+        return dict(self.tool_calls)
 
     # ------------------------------------------------------------------
     # Anthropic deltas
@@ -1877,33 +1775,7 @@ class ResponsesStreamState:
         )
         return state
 
-    def _open_tool_internal(
-        self,
-        *,
-        key: Any,
-        call_id: str,
-        name: str,
-        hidden: bool = False,
-    ) -> dict[str, Any]:
-        output_index = self.next_output_index
-        self.next_output_index += 1
-        state: dict[str, Any] = {
-            "id": call_id,
-            "call_id": call_id,
-            "name": name,
-            "arguments": "",
-            "output_index": output_index,
-            "closed": False,
-            "hidden": hidden,
-        }
-        target = self.hidden_tool_calls if hidden else self.tool_calls
-        target[key] = state
-        return state
-
     async def _close_tool(self, response: web.StreamResponse, state: dict[str, Any]) -> None:
-        if state.get("hidden"):
-            state["closed"] = True
-            return
         state["closed"] = True
         await _write_sse(
             response,
@@ -2037,6 +1909,13 @@ class ResponsesStreamState:
             status,
         )
 
+    def _tool_search_item(self, state: dict[str, Any], status: str = "completed") -> dict[str, Any]:
+        return tool_translate.tool_search_call_from_raw(
+            state["id"],
+            state.get("arguments") or "",
+            status,
+        )
+
     def _tool_item(self, state: dict[str, Any], status: str) -> dict[str, Any]:
         return {
             "id": state["id"],
@@ -2063,18 +1942,13 @@ class ResponsesStreamState:
                 for state in turn["tool_calls"].values():
                     if mcp_search.parse_mcp_function_name(state.get("name") or ""):
                         continue
+                    if mcp_search.is_tool_search_call(state.get("name") or ""):
+                        continue
                     collected.append((state["output_index"], self._tool_item(state, "completed")))
                 for state in turn.get("mcp_tool_calls", {}).values():
                     collected.append((state["output_index"], self._mcp_tool_item(state)))
-                for state in turn.get("hidden_tool_calls", {}).values():
-                    call_id = state.get("call_id") or state.get("id")
-                    if not call_id or call_id not in turn.get("tool_outputs", {}):
-                        continue
-                    if not mcp_search.is_shim_resolved_tool(state.get("name") or ""):
-                        continue
-                    collected.append((state["output_index"], self._tool_item(state, "completed")))
-                for entry in turn["tool_outputs"].values():
-                    collected.append((entry["output_index"], entry["item"]))
+                for state in turn.get("tool_search_calls", {}).values():
+                    collected.append((state["output_index"], self._tool_search_item(state)))
             collected.sort(key=lambda pair: pair[0])
             output = [item for _, item in collected]
         payload = {

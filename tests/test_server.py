@@ -460,7 +460,7 @@ async def test_chat_tool_delta_streams_exec_command_to_client():
     assert tool_items[0]["name"] == "exec_command"
 
 
-async def test_chat_tool_delta_hides_tool_search_call_during_stream():
+async def test_chat_tool_delta_streams_tool_search_call_to_client():
     class FakeResponse:
         def __init__(self):
             self.chunks: list[bytes] = []
@@ -497,14 +497,34 @@ async def test_chat_tool_delta_hides_tool_search_call_during_stream():
         and (event.get("item") or {}).get("type") == "function_call"
     ]
     assert function_added_mid == []
+    tool_search_added = [
+        event
+        for event in events_mid
+        if event.get("type") == "response.output_item.added"
+        and (event.get("item") or {}).get("type") == "tool_search_call"
+    ]
+    assert len(tool_search_added) == 1
+    tool_search_done = [
+        event
+        for event in events_mid
+        if event.get("type") == "response.output_item.done"
+        and (event.get("item") or {}).get("type") == "tool_search_call"
+    ]
+    assert len(tool_search_done) == 1
+    assert tool_search_done[0]["item"]["arguments"]["query"] == "mcp__exa"
     outputs_mid = [
         event
         for event in events_mid
         if event.get("type") == "response.output_item.done"
         and (event.get("item") or {}).get("type") == "function_call_output"
     ]
-    assert len(outputs_mid) == 1
+    assert outputs_mid == []
     await state.finish(downstream)
+
+    completed = [e for e in _sse_events(b"".join(downstream.chunks).decode()) if e.get("type") == "response.completed"][-1]
+    search_items = [i for i in completed["response"]["output"] if i.get("type") == "tool_search_call"]
+    assert len(search_items) == 1
+    assert search_items[0]["arguments"]["query"] == "mcp__exa"
 
 
 async def test_write_chat_delta_skips_content_after_complete_tool_call():

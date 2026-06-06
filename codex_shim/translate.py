@@ -465,6 +465,34 @@ def _responses_input_to_messages(value: Any) -> list[dict[str, Any]]:
         elif item_type == "web_search_call":
             flush_pending_assistant_tool_calls()
             continue
+        elif item_type == "tool_search_call":
+            flush_pending_assistant_tool_calls()
+            call_id = item.get("call_id") or item.get("id") or "call_0"
+            args = item.get("arguments") or {}
+            pending_tool_calls.append(
+                {
+                    "id": call_id,
+                    "type": "function",
+                    "function": {
+                        "name": mcp_search.MCP_TOOL_SEARCH_NAME,
+                        "arguments": json.dumps(args) if isinstance(args, dict) else str(args),
+                    },
+                }
+            )
+        elif item_type == "tool_search_output":
+            flush_pending_assistant_tool_calls()
+            tools = item.get("tools")
+            if tools is None:
+                content = json.dumps(item, indent=2)
+            else:
+                content = json.dumps({"tools": tools}, indent=2)
+            messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": item.get("call_id"),
+                    "content": content,
+                }
+            )
         elif item_type == "mcp_tool_call":
             flush_pending_assistant_tool_calls()
             result = item.get("result")

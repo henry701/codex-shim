@@ -39,6 +39,22 @@ def test_mcp_function_call_from_name():
     assert item["name"] == "web_search_exa"
 
 
-def test_is_shim_resolved_tool_only_tool_search():
-    assert mcp_search.is_shim_resolved_tool("tool_search_call")
-    assert not mcp_search.is_shim_resolved_tool("mcp__exa__web_search_exa")
+def test_tool_search_call_item_matches_passthrough_shape():
+    item = tool_translate.tool_search_call_item(
+        "call_search",
+        {"query": "mcp__exa"},
+        "completed",
+    )
+    assert item["type"] == "tool_search_call"
+    assert item["execution"] == "client"
+    assert item["arguments"] == {"query": "mcp__exa", "limit": 10}
+
+
+def test_tool_search_call_from_raw():
+    item = tool_translate.tool_search_call_from_raw(
+        "call_search",
+        '{"query":"mcp__jina"}',
+        "in_progress",
+    )
+    assert item["arguments"]["query"] == "mcp__jina"
+    assert item["arguments"]["limit"] == 10

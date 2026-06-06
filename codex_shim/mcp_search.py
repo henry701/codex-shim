@@ -1,11 +1,9 @@
-"""MCP server proxying for the codex-shim.
+"""MCP tool discovery helpers for the codex-shim.
 
-Implements a virtual ``tool_search_call`` tool that the shim injects into the
-tool list. When the upstream model invokes it, the shim resolves the bare
-MCP server name (e.g. ``mcp__jina``) to a transport URL by reading
-``~/.codex/config.toml`` and dispatches a JSON-RPC ``tools/list`` call.
-The discovered ``mcp__<server>__<tool>`` names are returned to the model so
-the next turn can call them directly. Connections are made only on demand.
+Injects a virtual ``tool_search_call`` tool definition into BYOK upstream
+requests and pre-discovers MCP tools from configured servers. The shim
+translates model ``tool_search_call`` invocations into native Responses
+``tool_search_call`` items; Codex executes discovery locally.
 """
 
 from __future__ import annotations
@@ -275,34 +273,8 @@ def parse_mcp_function_name(name: str) -> tuple[str, str] | None:
     return server_key[len("mcp__") :], tool
 
 
-def is_shim_resolved_tool(name: str) -> bool:
-    """Virtual tools the shim executes server-side (not Codex MCP runtime)."""
+def is_tool_search_call(name: str) -> bool:
     return name == MCP_TOOL_SEARCH_NAME
-
-
-def _parse_tool_arguments(raw_args: Any) -> dict[str, Any]:
-    if isinstance(raw_args, str):
-        try:
-            parsed = json.loads(raw_args) if raw_args.strip() else {}
-        except json.JSONDecodeError:
-            return {"_raw": raw_args}
-        return parsed if isinstance(parsed, dict) else {"_value": parsed}
-    if isinstance(raw_args, dict):
-        return raw_args
-    return {}
-
-
-async def execute_shim_tool_call(name: str, raw_args: Any) -> str:
-    """Run virtual tool_search_call on the shim side."""
-    if name != MCP_TOOL_SEARCH_NAME:
-        return json.dumps({"error": f"unsupported call: {name}"})
-    args = _parse_tool_arguments(raw_args)
-    query = args.get("query", "") if isinstance(args, dict) else ""
-    if not isinstance(query, str) or not query.strip():
-        return format_tool_search_error(
-            "", "tool_search_call requires a non-empty string 'query' argument"
-        )
-    return await execute_tool_search(query)
 
 
 def _extract_tools_from_jsonrpc(data: Any) -> list[dict[str, Any]] | None:
@@ -354,49 +326,8 @@ def format_tool_search_error(query: str, message: str) -> str:
     return json.dumps({"server": query, "error": message}, indent=2)
 
 
-async def execute_tool_search(query: str) -> str:
-    raw = query.strip()
-    if raw.startswith("mcp__"):
-        body = raw[len("mcp__"):]
-        if "__" in body:
-            server, _, tool = body.partition("__")
-            server_name = f"mcp__{server}"
-            tool_name = tool.strip()
-        else:
-            server_name = raw
-            tool_name = ""
-    else:
-        server_name = raw
-        tool_name = ""
-    url = resolve_mcp_url(server_name)
-    if not url:
-        known = ", ".join(known_mcp_servers()) or "(none configured)"
-        return format_tool_search_error(
-            raw,
-            f"Unknown MCP server '{server_name}'. Known servers: {known}.",
-        )
-    tools = await call_mcp_tools_list(url)
-    if not tools:
-        return format_tool_search_error(
-            raw,
-            f"MCP server '{server_name}' reachable at {url} but returned no tools.",
-        )
-    if tool_name:
-        match = next((t for t in tools if isinstance(t, dict) and t.get("name") == tool_name), None)
-        if not match:
-            available = ", ".join(
-                t.get("name", "") for t in tools if isinstance(t, dict) and t.get("name")
-            ) or "(none)"
-            return format_tool_search_error(
-                raw,
-                f"MCP server '{server_name}' does not expose a tool named '{tool_name}'. Available: {available}.",
-            )
-        return format_tool_search_result(server_name, [match])
-    return format_tool_search_result(server_name, tools)
-
-
 async def augment_response_with_tool_search(response: dict[str, Any]) -> dict[str, Any]:
-    """Resolve virtual shim tools and rewrite MCP function calls for Codex."""
+    """Rewrite upstream tool calls into Codex-native Responses item shapes."""
     from . import tool_translate
 
     output = response.get("output")
@@ -425,19 +356,17 @@ async def augment_response_with_tool_search(response: dict[str, Any]) -> dict[st
             rewritten.append(mcp_item)
             changed = True
             continue
-        rewritten.append(item)
-        if not is_shim_resolved_tool(name):
+        if is_tool_search_call(name):
+            rewritten.append(
+                tool_translate.tool_search_call_from_raw(
+                    call_id,
+                    raw_args if isinstance(raw_args, str) else json.dumps(raw_args),
+                    "completed",
+                )
+            )
+            changed = True
             continue
-        changed = True
-        result = await execute_shim_tool_call(name, raw_args)
-        rewritten.append(
-            {
-                "type": "function_call_output",
-                "call_id": call_id,
-                "output": result,
-                "status": "completed",
-            }
-        )
+        rewritten.append(item)
     if changed:
         response["output"] = rewritten
     return response

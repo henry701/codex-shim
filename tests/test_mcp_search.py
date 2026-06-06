@@ -236,8 +236,8 @@ def test_is_mcp_tool_call_parses_full_name():
     assert mcp_search.is_mcp_tool_call("") is None
 
 
-def test_is_shim_resolved_tool():
-    assert mcp_search.is_shim_resolved_tool("tool_search_call")
-    assert not mcp_search.is_shim_resolved_tool("mcp__exa__web_search_exa")
-    assert not mcp_search.is_shim_resolved_tool("exec_command")
-    assert not mcp_search.is_shim_resolved_tool("mcp__exa")
+def test_is_tool_search_call():
+    assert mcp_search.is_tool_search_call("tool_search_call")
+    assert not mcp_search.is_tool_search_call("mcp__exa__web_search_exa")
+    assert not mcp_search.is_tool_search_call("exec_command")
+    assert not mcp_search.is_tool_search_call("mcp__exa")
