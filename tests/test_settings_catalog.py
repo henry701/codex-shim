@@ -229,7 +229,7 @@ def test_passthrough_error_fallback_requires_usable_target(tmp_path):
 
 def test_managed_config_escapes_windows_catalog_path(monkeypatch):
     monkeypatch.setattr(cli, "CATALOG_PATH", r"C:\Users\User\codex-shim\.codex-shim\custom_model_catalog.json")
-    top_block, _, _ = cli._managed_config_blocks("vendor\\model", 8765)
+    top_block, _ = cli._managed_config_blocks("vendor\\model", 8765)
     assert 'model = "vendor\\\\model"' in top_block
     assert 'model_catalog_json = "C:\\\\Users\\\\User\\\\codex-shim\\\\.codex-shim\\\\custom_model_catalog.json"' in top_block
 
@@ -302,6 +302,47 @@ def test_install_and_restore_manage_tool_search_feature_flag(monkeypatch, tmp_pa
         "multi_agent = true\n"
         "tool_search_always_defer_mcp_tools = false\n"
     )
+
+
+def test_install_fixes_duplicate_features_section(monkeypatch, tmp_path):
+    settings = tmp_path / "models.json"
+    settings.write_text(
+        json.dumps(
+            {
+                "models": [
+                    {"model": "llama3.2", "display_name": "Llama", "provider": "generic-chat-completion-api", "base_url": "http://127.0.0.1:11434/v1"}
+                ]
+            }
+        )
+    )
+    config_path = tmp_path / ".codex" / "config.toml"
+    config_path.parent.mkdir()
+    config_path.write_text(
+        "[features]\n"
+        "multi_agent = true\n"
+        "tool_search_always_defer_mcp_tools = true\n"
+        "\n"
+        "# >>> codex-shim managed >>>\n"
+        "[features]\n"
+        "tool_search_always_defer_mcp_tools = true\n"
+        "# <<< codex-shim managed <<<\n"
+    )
+    monkeypatch.setattr(cli, "RUNTIME_DIR", tmp_path / ".codex-shim")
+    monkeypatch.setattr(cli, "CODEX_CONFIG_PATH", config_path)
+    monkeypatch.setattr(cli, "CODEX_CONFIG_BACKUP_PATH", tmp_path / ".codex-shim" / "config.toml.before-codex-shim")
+
+    cli.install_codex_config(settings, 8765, "llama3.2")
+    installed = config_path.read_text()
+    assert installed.count("[features]") == 1
+    features_body = installed.split("[features]", 1)[1]
+    assert features_body.count("tool_search_always_defer_mcp_tools = true") == 1
+    assert cli.MANAGED_BEGIN in installed
+    user_features = cli._extract_section_key_lines(
+        cli._remove_managed_config(installed),
+        cli.MANAGED_FEATURES_SECTION,
+        cli.MANAGED_FEATURE_KEYS,
+    )
+    assert "tool_search_always_defer_mcp_tools" not in user_features
 
 
 def test_install_sets_tool_search_feature_when_missing(monkeypatch, tmp_path):

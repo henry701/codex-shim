@@ -11,6 +11,7 @@ import time
 import hashlib
 import json
 import plistlib
+import re
 import struct
 from urllib.request import urlopen
 
@@ -197,6 +198,7 @@ def install_codex_config(settings_path: Path, port: int, model_slug: str | None 
     CODEX_CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
     RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
     original = CODEX_CONFIG_PATH.read_text() if CODEX_CONFIG_PATH.exists() else ""
+    original = _normalize_features_section_header(original)
     cleaned = _remove_managed_config(original)
     current_top_level = _extract_top_level_key_lines(cleaned, MANAGED_TOP_LEVEL_KEYS)
     if current_top_level:
@@ -218,15 +220,16 @@ def install_codex_config(settings_path: Path, port: int, model_slug: str | None 
         )
     cleaned = _remove_keys_from_section(cleaned, MANAGED_FEATURES_SECTION, MANAGED_FEATURE_KEYS)
     provider_name = _provider_display_name(models, default_slug, router_config)
-    top_block, provider_block, features_block = _managed_config_blocks(
+    top_block, provider_block = _managed_config_blocks(
         default_slug,
         port,
         previous_top_level,
         provider_name=provider_name,
         previous_features=previous_features,
     )
+    cleaned = _apply_managed_features(cleaned)
     CODEX_CONFIG_PATH.write_text(
-        top_block + "\n" + cleaned.lstrip() + "\n" + provider_block + "\n" + features_block
+        top_block + "\n" + cleaned.lstrip() + "\n" + provider_block
     )
     print(f"Installed shim config into {CODEX_CONFIG_PATH}.")
 
@@ -314,6 +317,7 @@ def stop() -> int:
 def restore_codex_config() -> None:
     if CODEX_CONFIG_PATH.exists():
         current = CODEX_CONFIG_PATH.read_text()
+        current = _normalize_features_section_header(current)
         previous_top_level = _managed_previous_top_level(current)
         previous_features = _managed_previous_features(current)
         if not previous_top_level and CODEX_CONFIG_BACKUP_PATH.exists():
@@ -328,6 +332,8 @@ def restore_codex_config() -> None:
         restored = _remove_section(restored, f"model_providers.{PROVIDER_NAME}")
         restored = _restore_missing_top_level_keys(restored.lstrip(), previous_top_level)
         restored = _restore_features_keys(restored, previous_features)
+        if not _features_section_has_assignments(restored):
+            restored = _remove_section(restored, MANAGED_FEATURES_SECTION)
         CODEX_CONFIG_PATH.write_text(restored)
         print(f"Removed shim config from {CODEX_CONFIG_PATH}.")
     if CODEX_CONFIG_BACKUP_PATH.exists():
@@ -679,7 +685,7 @@ def _managed_config_blocks(
     previous_top_level: dict[str, str] | None = None,
     provider_name: str = "Codex Shim",
     previous_features: dict[str, str] | None = None,
-) -> tuple[str, str, str]:
+) -> tuple[str, str]:
     metadata = ""
     if previous_top_level:
         metadata += PREVIOUS_TOP_LEVEL_PREFIX + json.dumps(previous_top_level, sort_keys=True) + "\n"
@@ -704,13 +710,63 @@ stream_max_retries = 3
 stream_idle_timeout_ms = 600000
 {MANAGED_END}
 '''
+    return top_block, provider_block
 
-    features_block = f'''{MANAGED_BEGIN}
-[{MANAGED_FEATURES_SECTION}]
-{MANAGED_FEATURE_KEY} = true
-{MANAGED_END}
-'''
-    return top_block, provider_block, features_block
+
+def _managed_feature_block_lines() -> list[str]:
+    return [
+        MANAGED_BEGIN,
+        f"{MANAGED_FEATURE_KEY} = true",
+        MANAGED_END,
+    ]
+
+
+def _apply_managed_features(text: str) -> str:
+    """Insert shim-managed feature keys into the single user [features] section."""
+    block = _managed_feature_block_lines()
+    header = _section_header(MANAGED_FEATURES_SECTION)
+    lines = text.splitlines()
+    output: list[str] = []
+    in_features = False
+    inserted = False
+    section_exists = header in {ln.strip() for ln in lines if ln.strip().startswith("[") and ln.strip().endswith("]")}
+    for raw_line in lines:
+        stripped = raw_line.strip()
+        if stripped.startswith("[") and stripped.endswith("]"):
+            if in_features and not inserted:
+                output.extend(block)
+                inserted = True
+            in_features = stripped == header
+            output.append(raw_line)
+            continue
+        output.append(raw_line)
+    if section_exists:
+        if in_features and not inserted:
+            output.extend(block)
+        return "\n".join(output) + ("\n" if text.endswith("\n") else "")
+    return text.rstrip() + "\n\n" + header + "\n" + "\n".join(block) + "\n"
+
+
+def _normalize_features_section_header(text: str) -> str:
+    header = _section_header(MANAGED_FEATURES_SECTION)
+    return re.sub(rf"(\S){re.escape(header)}", rf"\1\n\n{header}", text)
+
+
+def _features_section_has_assignments(text: str) -> bool:
+    in_section = False
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("[") and stripped.endswith("]"):
+            in_section = stripped == _section_header(MANAGED_FEATURES_SECTION)
+            continue
+        if not in_section:
+            continue
+        if stripped in {MANAGED_BEGIN, MANAGED_END}:
+            continue
+        if not stripped or stripped.startswith("#") or "=" not in stripped:
+            continue
+        return True
+    return False
 
 
 def _remove_managed_config(text: str) -> str:
