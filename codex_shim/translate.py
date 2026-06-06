@@ -55,13 +55,11 @@ def _decode_thinking_blob(encoded: Any) -> dict[str, Any] | None:
 def responses_to_chat(
     body: dict[str, Any],
     upstream_model: str,
-    *,
-    discovered_mcp_tools: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     messages = []
     instructions_text = _content_to_text(body.get("instructions")) if body.get("instructions") else ""
-    has_mcp = _tools_have_mcp(body.get("tools"))
-    if has_mcp:
+    needs_tool_search = mcp_search.responses_tools_need_tool_search(body.get("tools"))
+    if needs_tool_search:
         instructions_text = MCP_TOOL_HINT + ("\n\n" + instructions_text if instructions_text else "")
     if instructions_text:
         messages.append({"role": "system", "content": instructions_text})
@@ -92,31 +90,17 @@ def responses_to_chat(
     _copy_if_present(body, chat, "reasoning_effort")
 
     tools = _responses_tools_to_chat_tools(body.get("tools"))
-    if has_mcp:
+    if needs_tool_search:
         filtered: list[dict[str, Any]] = []
         for tool in tools:
             fn = tool.get("function") or {}
             name = fn.get("name") or tool.get("name") or ""
             if isinstance(name, str) and name.startswith("mcp__") and name.count("__") == 1:
                 continue
+            if name in {"tool_search", mcp_search.MCP_TOOL_SEARCH_NAME}:
+                continue
             filtered.append(tool)
-        prefix: list[dict[str, Any]] = []
-        if discovered_mcp_tools:
-            existing = {
-                (t.get("function") or {}).get("name") or t.get("name")
-                for t in filtered
-                if isinstance(t, dict)
-            }
-            for tool in discovered_mcp_tools:
-                if not isinstance(tool, dict):
-                    continue
-                fn = tool.get("function") or {}
-                name = fn.get("name") or tool.get("name")
-                if not isinstance(name, str) or not name or name in existing:
-                    continue
-                existing.add(name)
-                prefix.append(tool)
-        tools = [*prefix, mcp_search.MCP_TOOL_SEARCH_DEFINITION, *filtered]
+        tools = [mcp_search.MCP_TOOL_SEARCH_DEFINITION, *filtered]
     if tools:
         chat["tools"] = tools
         tool_choice = _responses_tool_choice_to_chat(body.get("tool_choice"), body.get("tools"))

@@ -207,8 +207,7 @@ class ShimServer:
             forwarded["model"] = route.model
             if "messages" in forwarded:
                 forwarded["messages"] = _normalize_roles(forwarded["messages"])
-            discovered = await _pre_discover_if_mcp(forwarded)
-            _inject_tool_search_if_mcp(forwarded, discovered)
+            _inject_tool_search_if_mcp(forwarded)
             return await self._post_openai_chat(request, route, forwarded, as_responses=False)
         if route.is_anthropic:
             forwarded = chat_to_anthropic(body, route.model, route.max_output_tokens)
@@ -240,8 +239,7 @@ class ShimServer:
             return await self._chatgpt_passthrough(request, body, response_model_override=model)
         route = self._route(body)
         if route.is_openai_chat:
-            discovered = await _pre_discover_if_mcp(body)
-            forwarded = responses_to_chat(body, route.model, discovered_mcp_tools=discovered)
+            forwarded = responses_to_chat(body, route.model)
             return await self._post_openai_chat(request, route, forwarded, as_responses=True)
         if route.is_anthropic:
             forwarded = responses_to_anthropic(body, route.model, route.max_output_tokens)
@@ -273,8 +271,7 @@ class ShimServer:
         route = self._route(body)
         compact_body = _compact_request_body(body, route.model)
         if route.is_openai_chat:
-            discovered = await _pre_discover_if_mcp(body)
-            forwarded = responses_to_chat(compact_body, route.model, discovered_mcp_tools=discovered)
+            forwarded = responses_to_chat(compact_body, route.model)
             forwarded["stream"] = False
             response = await self._post_openai_chat(request, route, forwarded, as_responses=True)
             return await _as_compact_response(response, route.slug)
@@ -815,8 +812,7 @@ class ShimServer:
         route = self._route(body)
         client_slug = response_slug or route.slug
         if route.is_openai_chat:
-            discovered = await _pre_discover_if_mcp(body)
-            forwarded = responses_to_chat(body, route.model, discovered_mcp_tools=discovered)
+            forwarded = responses_to_chat(body, route.model)
             return await self._post_openai_chat(
                 request, route, forwarded, as_responses=True, response_slug=client_slug
             )
@@ -838,8 +834,7 @@ class ShimServer:
         client_slug = response_slug or route.slug
         compact_body = _compact_request_body(body, route.model)
         if route.is_openai_chat:
-            discovered = await _pre_discover_if_mcp(body)
-            forwarded = responses_to_chat(compact_body, route.model, discovered_mcp_tools=discovered)
+            forwarded = responses_to_chat(compact_body, route.model)
             forwarded["stream"] = False
             response = await self._post_openai_chat(
                 request, route, forwarded, as_responses=True, response_slug=client_slug
@@ -2280,34 +2275,8 @@ def _normalize_roles(messages: list[dict]) -> list[dict]:
     return result
 
 
-def _chat_tools_have_mcp(tools: Any) -> bool:
-    if not isinstance(tools, list):
-        return False
-    for t in tools:
-        if not isinstance(t, dict):
-            continue
-        fn = t.get("function")
-        name = t.get("name") if isinstance(t.get("name"), str) else None
-        if not name and isinstance(fn, dict):
-            name = fn.get("name")
-        if isinstance(name, str) and name.startswith("mcp__"):
-            return True
-    return False
-
-
-async def _pre_discover_if_mcp(body: dict[str, Any]) -> list[dict[str, Any]]:
-    if not mcp_search.pre_discover_mcp_enabled():
-        return []
-    if not _chat_tools_have_mcp(body.get("tools")):
-        return []
-    return await mcp_search.pre_discover_mcp_tools()
-
-
-def _inject_tool_search_if_mcp(
-    body: dict[str, Any],
-    discovered: list[dict[str, Any]] | None = None,
-) -> None:
-    if not _chat_tools_have_mcp(body.get("tools")):
+def _inject_tool_search_if_mcp(body: dict[str, Any]) -> None:
+    if not mcp_search.responses_tools_need_tool_search(body.get("tools")):
         return
     tools = body.get("tools")
     if not isinstance(tools, list):
@@ -2319,6 +2288,8 @@ def _inject_tool_search_if_mcp(
                  and t["function"].get("name") == mcp_search.MCP_TOOL_SEARCH_NAME))
         for t in tools
     )
+    if already:
+        return
     filtered: list[dict[str, Any]] = []
     for t in tools:
         if not isinstance(t, dict):
@@ -2328,26 +2299,13 @@ def _inject_tool_search_if_mcp(
         name = t.get("name") if isinstance(t.get("name"), str) else None
         if not name and isinstance(fn, dict):
             name = fn.get("name")
+        tool_type = str(t.get("type") or "").strip().lower()
+        if tool_type == "tool_search":
+            continue
         if isinstance(name, str) and name.startswith("mcp__") and name.count("__") == 1:
             continue
         filtered.append(t)
-    prefix: list[dict[str, Any]] = []
-    if discovered:
-        existing = {
-            (t.get("function") or {}).get("name") or t.get("name")
-            for t in filtered
-            if isinstance(t, dict)
-        }
-        for t in discovered:
-            if not isinstance(t, dict):
-                continue
-            fn = t.get("function") or {}
-            name = fn.get("name") or t.get("name")
-            if not isinstance(name, str) or not name or name in existing:
-                continue
-            existing.add(name)
-            prefix.append(t)
-    body["tools"] = [*prefix, mcp_search.MCP_TOOL_SEARCH_DEFINITION, *filtered]
+    body["tools"] = [mcp_search.MCP_TOOL_SEARCH_DEFINITION, *filtered]
 
 
 def _dump_debug_request(slug: str, url: str, body: dict[str, Any]) -> None:

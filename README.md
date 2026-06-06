@@ -729,13 +729,11 @@ Codex CLI/Desktop executes the MCP call locally (visible as `mcp_tool_call` in
 
 When a BYOK model calls the virtual `tool_search_call` discovery tool, the shim
 rewrites it to the native `tool_search_call` Responses item (with `execution:
-"client"`). Codex executes MCP `tools/list` locally and returns
-`tool_search_output` on the next turn, matching ChatGPT passthrough.
-
-By default the shim does **not** pre-inject discovered MCP tool names into the
-upstream LLM tool list (only `tool_search_call`). Set
-`CODEX_SHIM_PRE_DISCOVER_MCP=1` on the shim process to restore eager
-`tools/list` pre-discovery into upstream prompts.
+"client"`). Codex executes the local BM25 search index and returns
+`tool_search_output` on the next turn. BYOK catalog entries must set
+`supports_search_tool: true` (matching ChatGPT passthrough models) so Codex
+builds that index; enable `tool_search_always_defer_mcp_tools` in
+`~/.codex/config.toml` so small MCP servers stay searchable.
 
 ---
 

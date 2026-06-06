@@ -1,9 +1,8 @@
 """MCP tool discovery helpers for the codex-shim.
 
 Injects a virtual ``tool_search_call`` tool definition into BYOK upstream
-requests. Optional pre-discovery (``CODEX_SHIM_PRE_DISCOVER_MCP=1``) eagerly
-lists MCP tools into the upstream tool list; by default the shim only injects
-``tool_search_call`` and relies on Codex-native discovery.
+requests when Codex exposes deferred MCP discovery (``tool_search`` or
+``mcp__*`` server stubs).
 """
 
 from __future__ import annotations
@@ -13,21 +12,7 @@ import os
 from pathlib import Path
 from typing import Any
 
-import aiohttp
-
-
 MCP_TOOL_SEARCH_NAME = "tool_search_call"
-
-# When false (default), only inject tool_search_call for upstream models and rely
-# on Codex-native tool_search for MCP discovery. Set CODEX_SHIM_PRE_DISCOVER_MCP=1
-# to restore eager tools/list pre-discovery into the upstream tool list.
-def pre_discover_mcp_enabled() -> bool:
-    return os.environ.get("CODEX_SHIM_PRE_DISCOVER_MCP", "").lower() in (
-        "1",
-        "true",
-        "yes",
-    )
-
 
 MCP_TOOL_SEARCH_DEFINITION: dict[str, Any] = {
     "type": "function",
@@ -61,9 +46,23 @@ _FALLBACK_MCP_URLS: dict[str, str] = {
 
 _CONFIG_CACHE: dict[str, Any] | None = None
 
-_DISCOVERY_CACHE: dict[str, tuple[float, list[dict[str, Any]]]] = {}
-_DISCOVERY_TTL_SECONDS = 300.0
-_DISCOVERY_ERROR_TTL_SECONDS = 30.0
+
+def responses_tools_need_tool_search(tools: Any) -> bool:
+    if not isinstance(tools, list):
+        return False
+    for tool in tools:
+        if not isinstance(tool, dict):
+            continue
+        tool_type = str(tool.get("type") or "").strip().lower()
+        if tool_type == "tool_search":
+            return True
+        fn = tool.get("function")
+        name = tool.get("name") if isinstance(tool.get("name"), str) else None
+        if not name and isinstance(fn, dict):
+            name = fn.get("name")
+        if isinstance(name, str) and name.startswith("mcp__"):
+            return True
+    return False
 
 
 def _config_path() -> Path:
@@ -152,115 +151,6 @@ def known_mcp_servers() -> list[str]:
     return list({*urls.keys(), *_FALLBACK_MCP_URLS.keys()})
 
 
-def _iter_server_urls() -> list[tuple[str, str]]:
-    result: list[tuple[str, str]] = []
-    seen: set[str] = set()
-    for name, url in _read_codex_mcp_servers().items():
-        if name in seen or not isinstance(url, str) or not url:
-            continue
-        seen.add(name)
-        result.append((name, url))
-    for name, url in _FALLBACK_MCP_URLS.items():
-        if name in seen:
-            continue
-        seen.add(name)
-        result.append((name, url))
-    return result
-
-
-def invalidate_discovery_cache() -> None:
-    _DISCOVERY_CACHE.clear()
-
-
-async def pre_discover_mcp_tools(force: bool = False) -> list[dict[str, Any]]:
-    import time
-
-    now = time.time()
-    if not force:
-        cached = _DISCOVERY_CACHE.get("__tools__")
-        if cached is not None:
-            cached_at, cached_tools = cached
-            if cached_tools and now - cached_at < _DISCOVERY_TTL_SECONDS:
-                return cached_tools
-            if not cached_tools and now - cached_at < _DISCOVERY_ERROR_TTL_SECONDS:
-                return []
-
-    all_tools: list[dict[str, Any]] = []
-    for server_name, url in _iter_server_urls():
-        try:
-            tools = await call_mcp_tools_list(url)
-        except Exception:
-            continue
-        for tool in tools:
-            if not isinstance(tool, dict):
-                continue
-            name = tool.get("name", "")
-            if not isinstance(name, str) or not name:
-                continue
-            if not name.startswith(f"{server_name}__"):
-                name = f"{server_name}__{name}"
-            description = tool.get("description", "")
-            if not isinstance(description, str):
-                description = ""
-            parameters = tool.get("inputSchema")
-            if not isinstance(parameters, dict):
-                parameters = {"type": "object", "properties": {}}
-            all_tools.append(
-                {
-                    "type": "function",
-                    "function": {
-                        "name": name,
-                        "description": description.strip()[:500],
-                        "parameters": parameters,
-                    },
-                }
-            )
-
-    _DISCOVERY_CACHE["__tools__"] = (now, all_tools)
-    return all_tools
-
-
-async def call_mcp_tools_list(url: str) -> list[dict[str, Any]]:
-    body = {
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "tools/list",
-        "params": {},
-    }
-    headers = {
-        "Content-Type": "application/json",
-        "Accept": "application/json, text/event-stream",
-    }
-    try:
-        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as session:
-            async with session.post(url, json=body, headers=headers) as resp:
-                if resp.status >= 400:
-                    return []
-                text = await resp.text()
-    except (aiohttp.ClientError, TimeoutError, OSError):
-        return []
-
-    for line in text.splitlines():
-        line = line.strip()
-        if not line.startswith("data:"):
-            continue
-        payload = line[len("data:"):].strip()
-        if not payload or payload == "[DONE]":
-            continue
-        try:
-            data = json.loads(payload)
-        except json.JSONDecodeError:
-            continue
-        tools = _extract_tools_from_jsonrpc(data)
-        if tools is not None:
-            return tools
-    try:
-        data = json.loads(text)
-    except json.JSONDecodeError:
-        return []
-    return _extract_tools_from_jsonrpc(data) or []
-
-
 def is_mcp_tool_call(name: str) -> str | None:
     if not isinstance(name, str) or not name.startswith("mcp__"):
         return None
@@ -286,18 +176,6 @@ def parse_mcp_function_name(name: str) -> tuple[str, str] | None:
 
 def is_tool_search_call(name: str) -> bool:
     return name == MCP_TOOL_SEARCH_NAME
-
-
-def _extract_tools_from_jsonrpc(data: Any) -> list[dict[str, Any]] | None:
-    if not isinstance(data, dict):
-        return None
-    result = data.get("result")
-    if not isinstance(result, dict):
-        return None
-    tools = result.get("tools")
-    if isinstance(tools, list):
-        return [t for t in tools if isinstance(t, dict)]
-    return None
 
 
 def format_tool_search_result(query: str, tools: list[dict[str, Any]]) -> str:

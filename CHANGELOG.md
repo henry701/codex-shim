@@ -73,10 +73,6 @@ and this project does not yet follow semantic versioning (pre-1.0).
 
 ### Changed
 
-- By default the shim no longer pre-injects MCP `tools/list` results into BYOK
-  upstream tool lists (`CODEX_SHIM_PRE_DISCOVER_MCP=1` restores old behavior).
-  Only `tool_search_call` is injected so Codex-native discovery can populate
-  defer-loaded tools.
 - Reframed the project around a generic all-model Codex shim instead of any
   single upstream app or model store.
 - Made `~/.codex-shim/models.json` the canonical default settings file.
@@ -86,6 +82,16 @@ and this project does not yet follow semantic versioning (pre-1.0).
   exports.
 
 ### Fixed
+
+- BYOK catalog entries now set `supports_search_tool: true` (matching ChatGPT
+  passthrough models) so Codex builds the client-side `tool_search` BM25 index
+  instead of returning empty `tool_search_output.tools` for shim-routed models.
+  Enable `tool_search_always_defer_mcp_tools` in `~/.codex/config.toml` so small
+  MCP servers like Exa stay in the searchable deferred set.
+- Shim injects `tool_search_call` for upstream BYOK models when Codex sends the
+  native `tool_search` tool (deferred MCP mode), not only bare `mcp__*` stubs.
+- Removed MCP `tools/list` pre-injection; discovery is via Codex-native
+  `tool_search` only.
 
 - Anthropic route requests now send only `x-api-key` (plus `anthropic-version`)
   for authentication and no longer also attach `Authorization: Bearer <apiKey>`.
