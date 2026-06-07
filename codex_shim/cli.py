@@ -53,6 +53,8 @@ CONFIG_PATH = RUNTIME_DIR / "config.toml"
 PID_PATH = RUNTIME_DIR / "shim.pid"
 LOG_PATH = RUNTIME_DIR / "shim.log"
 CODEX_CONFIG_PATH = Path.home() / ".codex" / "config.toml"
+DESKTOP_CATALOG_PATH = CODEX_CONFIG_PATH.parent / "custom_model_catalog.json"
+LOAD_ENV_SCRIPT = Path.home() / ".codex-shim" / "load-env.sh"
 CODEX_CONFIG_BACKUP_PATH = RUNTIME_DIR / "config.toml.before-codex-shim"
 MANAGED_BEGIN = "# >>> codex-shim managed >>>"
 MANAGED_END = "# <<< codex-shim managed <<<"
@@ -104,6 +106,10 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("restart")
     sub.add_parser("run", help="Run the shim in the foreground (for systemd and debugging).")
     sub.add_parser(
+        "sync-desktop",
+        help="Regenerate catalogs and sync ~/.codex/config.toml for Codex Desktop.",
+    )
+    sub.add_parser(
         "install-service",
         help="Install and enable a systemd user service so the shim starts at login/boot.",
     )
@@ -150,6 +156,8 @@ def main(argv: list[str] | None = None) -> int:
         return start(args.settings, args.port)
     if args.command == "run":
         return run_foreground(args.settings, args.port)
+    if args.command == "sync-desktop":
+        return sync_desktop(args.settings, args.port)
     if args.command == "install-service":
         return install_service(args.settings, args.port)
     if args.command == "status":
@@ -213,6 +221,13 @@ def _active_router(models, settings_path: Path):
     return None
 
 
+def _publish_catalog(models, router_config) -> Path:
+    write_catalog(models, CATALOG_PATH, router_config=router_config)
+    DESKTOP_CATALOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(CATALOG_PATH, DESKTOP_CATALOG_PATH)
+    return DESKTOP_CATALOG_PATH
+
+
 def generate(settings_path: Path, port: int) -> None:
     models = _load_models(settings_path)
     try:
@@ -220,15 +235,34 @@ def generate(settings_path: Path, port: int) -> None:
     except ValueError as exc:
         raise SystemExit(str(exc)) from exc
     router_config = router_module.load_router_config(Path(settings_path).expanduser())
-    write_catalog(models, CATALOG_PATH, router_config=router_config)
+    _publish_catalog(models, router_config)
     write_config(models, CONFIG_PATH, CATALOG_PATH, port)
     discovered_count = sum(1 for model in models if model.raw.get("discovered"))
     print(f"Generated {len(models)} model entries ({discovered_count} auto-discovered):")
     if _active_router(models, settings_path) is not None:
         print(f"  auto router: {router_config.slug} ({router_config.display_name})")
     print(f"  catalog: {CATALOG_PATH}")
+    print(f"  desktop catalog: {DESKTOP_CATALOG_PATH}")
     print(f"  config:  {CONFIG_PATH}")
     print("No files under ~/.codex were modified.")
+
+
+def sync_desktop(settings_path: Path, port: int, model_slug: str | None = None) -> int:
+    models = _load_models(settings_path)
+    try:
+        default_model_slug(models)
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
+    router_config = router_module.load_router_config(Path(settings_path).expanduser())
+    desktop_catalog = _publish_catalog(models, router_config)
+    write_config(models, CONFIG_PATH, CATALOG_PATH, port)
+    install_codex_config(settings_path, port, model_slug)
+    discovered_count = sum(1 for model in models if model.raw.get("discovered"))
+    catalog_models = len(json.loads(desktop_catalog.read_text()).get("models", []))
+    print(f"Synced {catalog_models} Desktop catalog entries ({discovered_count} auto-discovered routes):")
+    print(f"  desktop catalog: {desktop_catalog}")
+    print(f"  codex config:    {CODEX_CONFIG_PATH}")
+    return 0
 
 
 def discover_models(settings_path: Path, *, refresh: bool = False) -> int:
@@ -355,7 +389,7 @@ def list_models(settings_path: Path) -> int:
 
 
 def run_foreground(settings_path: Path, port: int) -> int:
-    generate(settings_path, port)
+    sync_desktop(settings_path, port)
     from .server import main as server_main
 
     server_main(
@@ -374,6 +408,13 @@ def run_foreground(settings_path: Path, port: int) -> int:
 SYSTEMD_USER_UNIT = Path.home() / ".config/systemd/user/codex-shim.service"
 
 
+def _systemd_shell_command(codex_shim_bin: str, common_args: str, subcommand: str) -> str:
+    command = f"{codex_shim_bin} {common_args} {subcommand}"
+    if LOAD_ENV_SCRIPT.is_file():
+        return f'/bin/bash -lc \'source "{LOAD_ENV_SCRIPT}" && exec {command}\''
+    return command
+
+
 def _systemd_unit_content(
     *,
     codex_shim_bin: str,
@@ -382,6 +423,8 @@ def _systemd_unit_content(
 ) -> str:
     settings = Path(settings_path).expanduser()
     common_args = f"--settings {settings} --port {port}"
+    sync_cmd = _systemd_shell_command(codex_shim_bin, common_args, "sync-desktop")
+    run_cmd = _systemd_shell_command(codex_shim_bin, common_args, "run")
     return f"""[Unit]
 Description=Codex BYOK shim
 After=network-online.target
@@ -389,8 +432,8 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStartPre={codex_shim_bin} {common_args} generate
-ExecStart={codex_shim_bin} {common_args} run
+ExecStartPre={sync_cmd}
+ExecStart={run_cmd}
 Restart=on-failure
 RestartSec=3
 
@@ -910,7 +953,7 @@ def _managed_config_blocks(
     top_block = f'''{MANAGED_BEGIN}
 {metadata}model = "{_toml_escape(default_slug)}"
 model_provider = "{PROVIDER_NAME}"
-model_catalog_json = "{_toml_escape(str(CATALOG_PATH))}"
+model_catalog_json = "{_toml_escape(str(DESKTOP_CATALOG_PATH))}"
 {MANAGED_END}
 '''
 
@@ -1221,7 +1264,7 @@ def _override_args(settings_path: Path, port: int) -> list[str]:
         default_slug = default_model_slug(models)
     except ValueError as exc:
         raise SystemExit(str(exc)) from exc
-    pairs = codex_config_overrides(CATALOG_PATH, default_slug, port)
+    pairs = codex_config_overrides(DESKTOP_CATALOG_PATH, default_slug, port)
     args: list[str] = []
     for pair in pairs:
         args.extend(["-c", pair])

@@ -5,6 +5,7 @@ import hashlib
 import plistlib
 import struct
 from dataclasses import replace
+from pathlib import Path
 
 import pytest
 
@@ -250,10 +251,11 @@ def test_passthrough_error_fallback_requires_usable_target(tmp_path):
 
 
 def test_managed_config_escapes_windows_catalog_path(monkeypatch):
-    monkeypatch.setattr(cli, "CATALOG_PATH", r"C:\Users\User\codex-shim\.codex-shim\custom_model_catalog.json")
+    desktop_catalog = r"C:\Users\User\.codex\custom_model_catalog.json"
+    monkeypatch.setattr(cli, "DESKTOP_CATALOG_PATH", Path(desktop_catalog))
     top_block, _ = cli._managed_config_blocks("vendor\\model", 8765)
     assert 'model = "vendor\\\\model"' in top_block
-    assert 'model_catalog_json = "C:\\\\Users\\\\User\\\\codex-shim\\\\.codex-shim\\\\custom_model_catalog.json"' in top_block
+    assert 'model_catalog_json = "C:\\\\Users\\\\User\\\\.codex\\\\custom_model_catalog.json"' in top_block
 
 
 def test_install_codex_config_is_idempotent(monkeypatch, tmp_path):
