@@ -26,13 +26,7 @@ _NVIDIA_SKIP_RE = re.compile(
 _OPENROUTER_FREE_SUFFIX = ":free"
 _OPENROUTER_FREE_ROUTER = "openrouter/free"
 _CHATGPT_MODEL_RE = re.compile(r"^(gpt-|codex-|o\d)", re.IGNORECASE)
-_ZEN_PUBLIC_IDS = frozenset(
-    {
-        "big-pickle",
-        "minimax-m2.5",
-        "minimax-m2.7",
-    }
-)
+_ZEN_PUBLIC_IDS = frozenset({"big-pickle"})
 
 
 @dataclass(frozen=True)
@@ -56,10 +50,10 @@ ZEN_PUBLIC_TEMPLATE = DiscoverTemplate(
     kind="zen_public",
     base_url="https://opencode.ai/zen/v1",
     provider="generic-chat-completion-api",
-    slug_prefix="zen",
+    slug_prefix="oc-free",
     api_key="public",
     extra_headers={},
-    label_prefix="zen",
+    label_prefix="oc-free",
 )
 
 OPENROUTER_FREE_TEMPLATE = DiscoverTemplate(
@@ -139,38 +133,9 @@ def is_local_base_url(base_url: str) -> bool:
 
 
 def infer_discover_templates(models: list[ShimModel]) -> list[DiscoverTemplate]:
-    templates: dict[tuple[str, str], DiscoverTemplate] = {}
-    for model in models:
-        base_url = model.base_url.rstrip("/")
-        lower = base_url.lower()
-        kind: str | None = None
-        slug_prefix = ""
-        label_prefix: str | None = None
-        if "opencode.ai/zen" in lower:
-            if model.api_key.strip() in {"", "public"}:
-                continue
-            kind = "zen"
-            slug_prefix = _infer_slug_prefix(model.slug, default="zen")
-            label_prefix = "zen"
-        elif "openrouter.ai" in lower:
-            continue
-        elif "integrate.api.nvidia.com" in lower:
-            continue
-        if kind is None:
-            continue
-        key = (kind, base_url)
-        if key in templates:
-            continue
-        templates[key] = DiscoverTemplate(
-            kind=kind,
-            base_url=base_url,
-            provider=model.provider,
-            slug_prefix=slug_prefix,
-            api_key=model.api_key,
-            extra_headers=dict(model.extra_headers),
-            label_prefix=label_prefix,
-        )
-    return list(templates.values())
+    """Reserved for future explicit-template inference; paid OpenCode Zen is not auto-discovered."""
+    _ = models
+    return []
 
 
 def discover_byok_models(
@@ -332,7 +297,8 @@ def fetch_zen_public_model_ids() -> list[str]:
         if is_zen_public_model(model_id):
             discovered.add(model_id)
     for model_id in discover_opencode_cli_ids("opencode"):
-        discovered.add(model_id)
+        if is_zen_public_model(model_id):
+            discovered.add(model_id)
     return sorted(discovered)
 
 
@@ -454,10 +420,6 @@ def discover_opencode_cli_ids(prefix: str) -> list[str]:
 def _discover_rows_for_template(template: DiscoverTemplate) -> list[str]:
     if template.kind == "zen_public":
         return fetch_zen_public_model_ids()
-    if template.kind == "zen":
-        ids = fetch_zen_model_ids() or discover_opencode_cli_ids("opencode")
-        public_ids = set(fetch_zen_public_model_ids())
-        return [model_id for model_id in ids if model_id not in public_ids]
     if template.kind in {"openrouter", "openrouter_free"}:
         return fetch_openrouter_free_model_ids()
     if template.kind in {"nvidia", "nvidia_integrate"}:
@@ -502,7 +464,7 @@ def _catalog_slug_for_model(
 
 
 def _api_key_for_discovered_model(model_id: str, template: DiscoverTemplate) -> str:
-    if template.kind in {"zen", "zen_public"} and is_zen_public_model(model_id):
+    if template.kind == "zen_public" and is_zen_public_model(model_id):
         return "public"
     return template.api_key
 

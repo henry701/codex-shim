@@ -70,8 +70,8 @@ def test_discover_byok_models_adds_zen_public_models(monkeypatch):
     models = discover_byok_models([_zen_template()])
     slugs = {model.slug for model in models}
     assert "zen-big-pickle" in slugs
-    assert "zen-minimax-m3-free" in slugs
-    assert "zen-minimax-m2-5" in slugs
+    assert "oc-free-minimax-m3-free" in slugs
+    assert "oc-free-minimax-m2-5" not in slugs
     assert "zen-kimi-k2-6" not in slugs
 
 

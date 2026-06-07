@@ -63,14 +63,14 @@ def test_discover_openrouter_alias_respects_openrouter_key(monkeypatch):
     assert not any(model.slug == "or-openrouter-free" for model in disabled)
 
 
-def test_paid_zen_discovery_adds_non_public_models(monkeypatch):
+def test_paid_zen_is_not_auto_discovered(monkeypatch):
     monkeypatch.setattr(
         "codex_shim.discover.fetch_zen_model_ids",
         lambda: ["kimi-k2.6", "deepseek-v4-flash", "minimax-m3-free"],
     )
     monkeypatch.setattr(
         "codex_shim.discover.discover_opencode_cli_ids",
-        lambda prefix: ["big-pickle"] if prefix == "opencode" else [],
+        lambda prefix: ["big-pickle", "kimi-k2.6"] if prefix == "opencode" else [],
     )
     explicit = [
         ShimModel(
@@ -85,8 +85,9 @@ def test_paid_zen_discovery_adds_non_public_models(monkeypatch):
     models = discover_byok_models(explicit)
     slugs = {model.slug for model in models}
     assert "zen-kimi-k2-6" in slugs
-    assert "zen-deepseek-v4-flash" in slugs
-    assert "zen-minimax-m3-free" in slugs
+    assert "zen-deepseek-v4-flash" not in slugs
+    assert "oc-free-minimax-m3-free" in slugs
+    assert "oc-free-big-pickle" in slugs
     assert sum(model.model == "kimi-k2.6" for model in models) == 1
 
 
@@ -162,7 +163,7 @@ def test_resolved_api_key_expands_env_placeholder(monkeypatch):
     assert _resolved_api_key("literal") == "literal"
 
 
-def test_chatgpt_catalog_merge_prefers_cache_over_cursor(monkeypatch, tmp_path):
+def test_chatgpt_catalog_uses_codex_prefix_and_prefers_cache(monkeypatch, tmp_path):
     cache = tmp_path / "models_cache.json"
     cache.write_text(
         json.dumps(
@@ -178,13 +179,14 @@ def test_chatgpt_catalog_merge_prefers_cache_over_cursor(monkeypatch, tmp_path):
         )
     )
     monkeypatch.setattr(
-        "codex_shim.discover.discover_chatgpt_models_from_cursor",
-        lambda: [("gpt-5.5", "GPT-5.5 Cursor"), ("gpt-5.2", "GPT-5.2 Cursor")],
+        "codex_shim.discover.discover_chatgpt_model_ids_from_openai_api",
+        lambda: ["gpt-5.5", "gpt-5.2"],
     )
     entries = load_chatgpt_passthrough_catalog_models(cache)
     by_slug = {entry["slug"]: entry for entry in entries}
-    assert by_slug["gpt-5.5"]["display_name"] == "GPT-5.5 Cached"
-    assert by_slug["gpt-5.2"]["display_name"] == "GPT-5.2 Cursor"
+    assert by_slug["codex-gpt-5-5"]["display_name"] == "GPT-5.5 Cached"
+    assert by_slug["codex-gpt-5-5"]["_upstream_model"] == "gpt-5.5"
+    assert by_slug["codex-gpt-5-2"]["_upstream_model"] == "gpt-5.2"
 
 
 def test_write_catalog_includes_discovered_zen_public(tmp_path, monkeypatch, auth_missing):
@@ -200,7 +202,7 @@ def test_write_catalog_includes_discovered_zen_public(tmp_path, monkeypatch, aut
     write_catalog(models, catalog_path)
     payload = json.loads(catalog_path.read_text())
     slugs = {entry["slug"] for entry in payload["models"]}
-    assert "zen-minimax-m3-free" in slugs
+    assert "oc-free-minimax-m3-free" in slugs
 
 
 def test_model_settings_load_explicit_skips_discovery(tmp_path, monkeypatch):

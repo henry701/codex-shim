@@ -16,9 +16,9 @@ def test_parse_cursor_list_models_output():
     models = _parse_cursor_list_models_output(
         "auto - Auto\ncomposer-2.5 - Composer 2.5\ngpt-5.3-codex - Codex 5.3\n"
     )
-    assert models["composer-2-5"].upstream_id == "composer-2.5"
-    assert models["composer-2-5"].display_name == "Composer 2.5"
-    assert models["gpt-5-3-codex"].upstream_id == "gpt-5.3-codex"
+    assert models["cursor-composer-2-5"].upstream_id == "composer-2.5"
+    assert models["cursor-composer-2-5"].display_name == "Composer 2.5"
+    assert models["cursor-gpt-5-3-codex"].upstream_id == "gpt-5.3-codex"
 
 
 def test_is_cursor_passthrough_slug(monkeypatch):
@@ -26,15 +26,17 @@ def test_is_cursor_passthrough_slug(monkeypatch):
         "codex_shim.cursor_passthrough._load_cursor_catalog_models",
         lambda **_: _parse_cursor_list_models_output("composer-2.5 - Composer 2.5\n"),
     )
+    assert is_cursor_passthrough_slug("cursor-composer-2-5")
     assert is_cursor_passthrough_slug("composer-2-5")
     assert is_cursor_passthrough_slug("composer-2.5")
-    assert not is_cursor_passthrough_slug("gpt-5.5")
+    assert not is_cursor_passthrough_slug("codex-gpt-5-5")
+    assert cursor_upstream_model("cursor-composer-2-5") == "composer-2.5"
     assert cursor_upstream_model("composer-2-5") == "composer-2.5"
 
 
 def test_build_cursor_prompt_from_responses_body():
     body = {
-        "model": "composer-2-5",
+        "model": "cursor-composer-2-5",
         "instructions": "You are Codex.",
         "input": [{"role": "user", "content": "Hello"}],
     }

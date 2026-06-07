@@ -27,6 +27,7 @@ _TOKEN_OVERRIDES = {
     "openrouter": "OpenRouter",
     "opencode": "OpenCode",
     "zen": "Zen",
+    "oc-free": "OpenCode Zen (free)",
     "or": "OpenRouter",
     "pro": "Pro",
     "max": "Max",
@@ -76,6 +77,9 @@ def _normalize_slug_body(body: str) -> str:
     return normalized
 
 
+_CATALOG_ROUTE_PREFIXES = ("cursor-", "codex-", "oc-free-")
+
+
 def display_name_from_slug(slug: str, *, label_prefix: str | None = None) -> str:
     """Turn a catalog slug into a human-readable display name."""
     raw = slug.strip()
@@ -84,6 +88,11 @@ def display_name_from_slug(slug: str, *, label_prefix: str | None = None) -> str
     body = raw
     if label_prefix and body.startswith(f"{label_prefix}-"):
         body = body[len(label_prefix) + 1 :]
+    elif not label_prefix:
+        for prefix in _CATALOG_ROUTE_PREFIXES:
+            if body.startswith(prefix):
+                body = body[len(prefix) :]
+                break
     body = _normalize_slug_body(body)
     parts = re.split(r"[-_/]+", body)
     rendered = " ".join(_format_token(part) for part in parts if part)

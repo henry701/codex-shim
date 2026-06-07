@@ -21,6 +21,7 @@ from codex_shim.server import (
     _sanitize_chatgpt_passthrough_body,
     _set_active_model,
 )
+from codex_shim.catalog_slugs import codex_catalog_slug
 from codex_shim.settings import FALLBACK_CHATGPT_PASSTHROUGH_SLUGS
 from codex_shim.translate import SHIM_ENCRYPTED_CONTENT_PREFIX
 
@@ -1414,7 +1415,8 @@ async def test_health_and_models_include_chatgpt_passthrough_when_auth_present(t
     models = await shim_client.get("/v1/models")
     assert models.status == 200
     payload = await models.json()
-    assert sorted(model["id"] for model in payload["data"]) == sorted(FALLBACK_CHATGPT_PASSTHROUGH_SLUGS)
+    expected = [codex_catalog_slug(slug) for slug in FALLBACK_CHATGPT_PASSTHROUGH_SLUGS]
+    assert sorted(model["id"] for model in payload["data"]) == sorted(expected)
 
     await shim_client.close()
 
@@ -1478,7 +1480,7 @@ async def test_health_and_models_include_cursor_passthrough_when_auth_present(tm
 
     models = await shim_client.get("/v1/models")
     payload = await models.json()
-    assert [model["id"] for model in payload["data"]] == ["composer-2-5"]
+    assert [model["id"] for model in payload["data"]] == ["cursor-composer-2-5"]
 
     await shim_client.close()
 
@@ -1696,14 +1698,14 @@ async def test_api_models_includes_chatgpt_when_auth_present(
     monkeypatch, tmp_path, auth_present
 ):
     settings = _picker_settings_file(tmp_path)
-    _stub_codex_config(monkeypatch, tmp_path, model="gpt-5.5")
+    _stub_codex_config(monkeypatch, tmp_path, model="codex-gpt-5-5")
     shim_client = TestClient(TestServer(ShimServer(settings).app()))
     await shim_client.start_server()
     try:
         resp = await shim_client.get("/api/models")
         data = await resp.json()
         slugs = [m["slug"] for m in data]
-        assert slugs[0] == "gpt-5.5"
+        assert slugs[0] == "codex-gpt-5-5"
         assert data[0]["active"] is True
     finally:
         await shim_client.close()

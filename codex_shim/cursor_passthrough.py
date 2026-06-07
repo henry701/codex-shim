@@ -11,11 +11,12 @@ from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from typing import Any
 
+from .catalog_slugs import cursor_catalog_slug
 from .naming import description_for_route, display_name_from_slug
 from .settings import slugify
 from .translate import responses_to_chat, strip_think
 
-CURSOR_MODEL_SLUG = "composer-2-5"
+CURSOR_MODEL_SLUG = cursor_catalog_slug("composer-2.5")
 CURSOR_UPSTREAM_MODEL = "composer-2.5"
 CURSOR_DISPLAY_NAME = "Composer 2.5"
 _LIST_MODELS_RE = re.compile(r"^(\S+)\s+-\s+(.+)$")
@@ -124,13 +125,17 @@ def _parse_cursor_list_models_output(output: str) -> dict[str, CursorCatalogMode
         upstream_id, display_name = match.group(1).strip(), match.group(2).strip()
         if not upstream_id or upstream_id.lower() == "auto":
             continue
-        catalog_slug = slugify(upstream_id)
-        models[catalog_slug] = CursorCatalogModel(
+        catalog_slug = cursor_catalog_slug(upstream_id)
+        model = CursorCatalogModel(
             catalog_slug=catalog_slug,
             upstream_id=upstream_id,
             display_name=display_name,
         )
-        models[upstream_id] = models[catalog_slug]
+        models[catalog_slug] = model
+        models[upstream_id] = model
+        legacy_slug = slugify(upstream_id)
+        if legacy_slug != catalog_slug:
+            models[legacy_slug] = model
     return models or _fallback_cursor_models()
 
 

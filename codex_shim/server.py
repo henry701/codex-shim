@@ -810,7 +810,14 @@ class ShimServer:
         return route
 
     def _passthrough_fallback_slug(self, requested: str) -> str | None:
-        return self.settings.passthrough_error_fallback().get(requested)
+        mapping = self.settings.passthrough_error_fallback()
+        if requested in mapping:
+            return mapping[requested]
+        if is_chatgpt_passthrough_slug(requested):
+            upstream = chatgpt_upstream_model(requested)
+            if upstream in mapping:
+                return mapping[upstream]
+        return None
 
     async def _dispatch_byok_responses(
         self,

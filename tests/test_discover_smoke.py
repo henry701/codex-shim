@@ -110,7 +110,7 @@ def test_cli_generate_writes_catalog_with_discovered_slugs(
     loaded = ModelSettings(user_models_path).load()
     assert len(loaded) > len(explicit)
     assert (runtime / "config.toml").exists()
-    assert any(slug.startswith("zen-") for slug in slugs)
+    assert any(slug.startswith("oc-free-") for slug in slugs)
     assert "local-llama" in slugs
     for model in loaded:
         if not model.api_key.strip():

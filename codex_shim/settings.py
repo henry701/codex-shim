@@ -7,6 +7,7 @@ from pathlib import Path
 import re
 from typing import Any
 
+from .catalog_slugs import CHATGPT_CATALOG_SLUG, CHATGPT_UPSTREAM_DEFAULT, codex_catalog_slug
 
 DEFAULT_SETTINGS = Path.home() / ".codex-shim" / "models.json"
 DEFAULT_CURSOR_API_KEY_FILE = Path.home() / ".codex-shim" / "cursor-api-key"
@@ -15,7 +16,7 @@ DEFAULT_CODEX_MODELS_CACHE = Path.home() / ".codex" / "models_cache.json"
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8765
 PROVIDER_NAME = "codex_shim"
-CHATGPT_MODEL_SLUG = "gpt-5.5"
+CHATGPT_MODEL_SLUG = CHATGPT_UPSTREAM_DEFAULT
 FALLBACK_CHATGPT_PASSTHROUGH_SLUGS = (
     "gpt-5.5",
     "gpt-5.4",
@@ -71,9 +72,15 @@ def _is_listed_gpt_model(entry: dict[str, Any]) -> bool:
     return lower.startswith("gpt-") or lower.startswith("codex-")
 
 
-def _minimal_chatgpt_passthrough_entry(slug: str, display_name: str) -> dict[str, Any]:
+def _minimal_chatgpt_passthrough_entry(
+    catalog_slug: str,
+    display_name: str,
+    *,
+    upstream_model: str | None = None,
+) -> dict[str, Any]:
     return {
-        "slug": slug,
+        "slug": catalog_slug,
+        "_upstream_model": upstream_model or catalog_slug,
         "display_name": display_name,
         "description": f"OpenAI {display_name} routed through ChatGPT passthrough.",
         "context_window": 400000,
@@ -106,7 +113,7 @@ def _minimal_chatgpt_passthrough_entry(slug: str, display_name: str) -> dict[str
         "supported_in_api": True,
         "availability_nux": None,
         "upgrade": None,
-        "priority": 10000 if slug == CHATGPT_MODEL_SLUG else 9000,
+        "priority": 10000 if catalog_slug == CHATGPT_CATALOG_SLUG else 9000,
         "prefer_websockets": False,
         "available_in_plans": ["free", "plus", "pro", "team", "business", "enterprise"],
         "base_instructions": f"You are Codex, a coding agent powered by {display_name}.",
@@ -114,7 +121,7 @@ def _minimal_chatgpt_passthrough_entry(slug: str, display_name: str) -> dict[str
             "instructions_template": f"You are Codex, a coding agent powered by {display_name}.",
             "instructions_variables": {"model_name": display_name},
         },
-        **({"isDefault": True} if slug == CHATGPT_MODEL_SLUG else {}),
+        **({"isDefault": True} if catalog_slug == CHATGPT_CATALOG_SLUG else {}),
     }
 
 
@@ -134,33 +141,58 @@ def _load_chatgpt_cache_catalog_models(cache_path: Path | None = None) -> list[d
     return [dict(model) for model in models if isinstance(model, dict) and _is_listed_gpt_model(model)]
 
 
+def _codex_passthrough_entry(
+    upstream: str,
+    display_name: str,
+    *,
+    cache_entry: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    catalog_slug = codex_catalog_slug(upstream)
+    if cache_entry is not None:
+        entry = dict(cache_entry)
+        entry["slug"] = catalog_slug
+        entry.setdefault("display_name", display_name)
+        entry["_upstream_model"] = upstream
+        if catalog_slug == CHATGPT_CATALOG_SLUG:
+            entry["isDefault"] = True
+            entry["priority"] = max(int(entry.get("priority") or 0), 10000)
+        return entry
+    return _minimal_chatgpt_passthrough_entry(
+        catalog_slug,
+        display_name,
+        upstream_model=upstream,
+    )
+
+
 def load_chatgpt_passthrough_catalog_models(cache_path: Path | None = None) -> list[dict[str, Any]]:
-    from .discover import discover_chatgpt_model_ids_from_openai_api, discover_chatgpt_models_from_cursor
+    from .discover import discover_chatgpt_model_ids_from_openai_api
     from .naming import display_name_from_slug
 
-    by_slug: dict[str, dict[str, Any]] = {}
-    for upstream, display_name in discover_chatgpt_models_from_cursor():
-        by_slug[upstream] = _minimal_chatgpt_passthrough_entry(upstream, display_name)
+    by_upstream: dict[str, dict[str, Any]] = {}
     for upstream in discover_chatgpt_model_ids_from_openai_api():
-        by_slug.setdefault(
+        by_upstream.setdefault(
             upstream,
-            _minimal_chatgpt_passthrough_entry(
+            _codex_passthrough_entry(
                 upstream,
                 FALLBACK_CHATGPT_DISPLAY_NAMES.get(upstream, display_name_from_slug(upstream)),
             ),
         )
     for entry in _load_chatgpt_cache_catalog_models(cache_path):
-        slug = str(entry.get("slug") or "").strip()
-        if slug:
-            by_slug[slug] = entry
-    if by_slug:
-        return list(by_slug.values())
+        upstream = str(entry.get("slug") or "").strip()
+        if upstream:
+            by_upstream[upstream] = _codex_passthrough_entry(
+                upstream,
+                str(entry.get("display_name") or upstream),
+                cache_entry=entry,
+            )
+    if by_upstream:
+        return list(by_upstream.values())
     return [
-        _minimal_chatgpt_passthrough_entry(
-            slug,
-            FALLBACK_CHATGPT_DISPLAY_NAMES.get(slug, slug),
+        _codex_passthrough_entry(
+            upstream,
+            FALLBACK_CHATGPT_DISPLAY_NAMES.get(upstream, upstream),
         )
-        for slug in FALLBACK_CHATGPT_PASSTHROUGH_SLUGS
+        for upstream in FALLBACK_CHATGPT_PASSTHROUGH_SLUGS
     ]
 
 
@@ -176,18 +208,41 @@ def chatgpt_passthrough_display_names(cache_path: Path | None = None) -> dict[st
     }
 
 
+def _chatgpt_catalog_slug_for_upstream(upstream: str, cache_path: Path | None = None) -> str | None:
+    for model in load_chatgpt_passthrough_catalog_models(cache_path):
+        if str(model.get("_upstream_model") or "") == upstream:
+            return str(model["slug"])
+    return None
+
+
 def is_chatgpt_passthrough_slug(slug: str, cache_path: Path | None = None) -> bool:
     if slug.startswith("openai-gpt-"):
         return True
-    return slug in chatgpt_passthrough_slugs(cache_path)
+    if slug in chatgpt_passthrough_slugs(cache_path):
+        return True
+    return _chatgpt_catalog_slug_for_upstream(slug, cache_path) is not None
+
+
+def chatgpt_catalog_slug(slug: str, cache_path: Path | None = None) -> str:
+    if slug in chatgpt_passthrough_slugs(cache_path):
+        return slug
+    catalog_slug = _chatgpt_catalog_slug_for_upstream(slug, cache_path)
+    if catalog_slug is not None:
+        return catalog_slug
+    if slug.startswith("openai-gpt-"):
+        return CHATGPT_CATALOG_SLUG
+    return codex_catalog_slug(slug)
 
 
 def chatgpt_upstream_model(slug: str, cache_path: Path | None = None) -> str:
     if slug.startswith("openai-gpt-"):
-        return CHATGPT_MODEL_SLUG
-    if slug in chatgpt_passthrough_slugs(cache_path):
+        return CHATGPT_UPSTREAM_DEFAULT
+    for model in load_chatgpt_passthrough_catalog_models(cache_path):
+        if str(model.get("slug") or "") == slug:
+            return str(model.get("_upstream_model") or CHATGPT_UPSTREAM_DEFAULT)
+    if _chatgpt_catalog_slug_for_upstream(slug, cache_path) is not None:
         return slug
-    return CHATGPT_MODEL_SLUG
+    return CHATGPT_UPSTREAM_DEFAULT
 
 
 def slugify(value: str) -> str:
@@ -415,7 +470,7 @@ def default_model_slug(models: list[ShimModel], include_chatgpt: bool | None = N
     if include_chatgpt is None:
         include_chatgpt = chatgpt_passthrough_available()
     if include_chatgpt:
-        return CHATGPT_MODEL_SLUG
+        return CHATGPT_CATALOG_SLUG
     usable = usable_byok_models(models)
     if usable:
         return usable[0].slug

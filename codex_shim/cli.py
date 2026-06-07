@@ -25,14 +25,15 @@ from .cursor_passthrough import (
     is_cursor_passthrough_slug,
 )
 from .discover import discover_byok_models, discover_summary
+from .catalog_slugs import CHATGPT_CATALOG_SLUG
 from .settings import (
-    CHATGPT_MODEL_SLUG,
     DEFAULT_SETTINGS,
     DEFAULT_HOST,
     DEFAULT_PORT,
     PROVIDER_NAME,
     ModelSettings,
     available_model_slugs,
+    chatgpt_catalog_slug,
     chatgpt_passthrough_available,
     chatgpt_passthrough_display_names,
     chatgpt_passthrough_slugs,
@@ -1132,9 +1133,7 @@ def _resolve_model_slug(models, requested: str | None, router_config=None) -> st
                 "ChatGPT passthrough requires a Codex login. "
                 "Run `codex login` so ~/.codex/auth.json contains tokens.access_token."
             )
-        if requested.startswith("openai-gpt-"):
-            return CHATGPT_MODEL_SLUG
-        return requested
+        return chatgpt_catalog_slug(requested)
     if is_cursor_passthrough_slug(requested):
         if not cursor_passthrough_available():
             raise SystemExit(

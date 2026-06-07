@@ -10,6 +10,7 @@ import pytest
 
 from codex_shim import cli
 from codex_shim.catalog import catalog_entry, write_catalog
+from codex_shim.catalog_slugs import codex_catalog_slug
 from codex_shim.settings import (
     DEFAULT_PASSTHROUGH_ERROR_FALLBACK_SOURCES,
     FALLBACK_CHATGPT_PASSTHROUGH_SLUGS,
@@ -128,8 +129,9 @@ def test_cli_load_models_missing_custom_settings_has_actionable_error(tmp_path):
 
 
 def test_cli_resolves_chatgpt_passthrough_slug_when_auth_present(auth_present):
-    assert cli._resolve_model_slug([], "gpt-5.5") == "gpt-5.5"
-    assert cli._resolve_model_slug([], "openai-gpt-5-5") == "gpt-5.5"
+    assert cli._resolve_model_slug([], "codex-gpt-5-5") == "codex-gpt-5-5"
+    assert cli._resolve_model_slug([], "gpt-5.5") == "codex-gpt-5-5"
+    assert cli._resolve_model_slug([], "openai-gpt-5-5") == "codex-gpt-5-5"
 
 
 def test_cli_rejects_chatgpt_passthrough_slug_when_auth_missing(auth_missing):
@@ -141,7 +143,7 @@ def test_cli_rejects_chatgpt_passthrough_slug_when_auth_missing(auth_missing):
 def test_list_models_includes_chatgpt_passthrough_when_auth_present(monkeypatch, capsys, auth_present):
     monkeypatch.setattr(cli, "_load_models", lambda _settings_path: [])
     assert cli.list_models("unused") == 0
-    assert "gpt-5.5" in capsys.readouterr().out
+    assert "codex-gpt-5-5" in capsys.readouterr().out
 
 
 def test_list_models_hides_chatgpt_passthrough_when_auth_missing(monkeypatch, capsys, auth_missing):
@@ -187,7 +189,8 @@ def test_write_catalog_includes_gpt_models_when_auth_present(tmp_path, auth_pres
     catalog_path = tmp_path / "catalog.json"
     write_catalog([], catalog_path)
     data = json.loads(catalog_path.read_text())
-    assert [model["slug"] for model in data["models"]] == list(FALLBACK_CHATGPT_PASSTHROUGH_SLUGS)
+    expected = [codex_catalog_slug(slug) for slug in FALLBACK_CHATGPT_PASSTHROUGH_SLUGS]
+    assert [model["slug"] for model in data["models"]] == expected
     for entry in data["models"]:
         assert not entry.get("use_responses_lite"), (
             f"passthrough catalog entry {entry['slug']} must not set use_responses_lite"
@@ -205,7 +208,7 @@ def test_write_catalog_byok_does_not_set_use_responses_lite(tmp_path, auth_prese
     by_slug = {entry["slug"]: entry for entry in data["models"]}
     assert not by_slug["claude-opus"].get("use_responses_lite")
     for slug in FALLBACK_CHATGPT_PASSTHROUGH_SLUGS:
-        assert not by_slug[slug].get("use_responses_lite")
+        assert not by_slug[codex_catalog_slug(slug)].get("use_responses_lite")
 
 
 def test_load_passthrough_error_fallback_accepts_map_and_shorthand(tmp_path):

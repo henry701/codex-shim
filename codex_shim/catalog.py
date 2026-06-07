@@ -5,8 +5,8 @@ from pathlib import Path
 from typing import Any
 
 from . import router as router_module
+from .catalog_slugs import CHATGPT_CATALOG_SLUG
 from .settings import (
-    CHATGPT_MODEL_SLUG,
     PROVIDER_NAME,
     ShimModel,
     available_model_slugs,
@@ -88,12 +88,12 @@ def chatgpt_passthrough_entries() -> list[dict]:
     """Catalog entries for GPT models routed through ChatGPT passthrough."""
     entries: list[dict] = []
     for raw in load_chatgpt_passthrough_catalog_models():
-        entry = dict(raw)
+        entry = {key: value for key, value in raw.items() if not str(key).startswith("_")}
         entry["visibility"] = "list"
         entry.setdefault("available_in_plans", PLAN_TIERS)
         entry.setdefault("minimal_client_version", "0.0.1")
         entry.setdefault("supported_in_api", True)
-        if entry.get("slug") == CHATGPT_MODEL_SLUG:
+        if entry.get("slug") == CHATGPT_CATALOG_SLUG:
             entry["isDefault"] = True
             entry["priority"] = max(int(entry.get("priority") or 0), 10000)
         entries.append(entry)
@@ -103,7 +103,7 @@ def chatgpt_passthrough_entries() -> list[dict]:
 def chatgpt_passthrough_entry() -> dict:
     """Catalog entry for the default GPT-5.5 ChatGPT passthrough model."""
     for entry in chatgpt_passthrough_entries():
-        if entry.get("slug") == CHATGPT_MODEL_SLUG:
+        if entry.get("slug") == CHATGPT_CATALOG_SLUG:
             return entry
     return chatgpt_passthrough_entries()[0]
 
