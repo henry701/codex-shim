@@ -399,4 +399,4 @@ def test_write_catalog_includes_auto_entry(tmp_path, auth_missing):
     data = json.loads(catalog_path.read_text())
     slugs = [m["slug"] for m in data["models"]]
     assert slugs[0] == "codex-auto"
-    assert data["models"][0]["use_responses_lite"] is True
+    assert not data["models"][0].get("use_responses_lite")

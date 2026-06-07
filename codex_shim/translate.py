@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+from collections.abc import Mapping
 from typing import Any
 
 from . import mcp_search
@@ -11,6 +12,71 @@ THINK_RE = re.compile(r"<think>.*?</think>", re.IGNORECASE | re.DOTALL)
 
 SHIM_ENCRYPTED_CONTENT_PREFIX = "anthropic-thinking-v1:"
 _THINKING_MAGIC = SHIM_ENCRYPTED_CONTENT_PREFIX
+
+_CODEX_CLIENT_HEADERS = (
+    "x-codex-installation-id",
+    "x-codex-window-id",
+    "x-codex-turn-state",
+    "x-codex-turn-metadata",
+    "x-codex-parent-thread-id",
+)
+
+
+def is_codex_client_headers(headers: Mapping[str, str]) -> bool:
+    """True when the request looks like Codex Desktop / codex-cli, not a generic OpenAI client."""
+    lowered = {str(k).lower(): str(v) for k, v in headers.items()}
+    if any(lowered.get(name) for name in _CODEX_CLIENT_HEADERS):
+        return True
+    ua = lowered.get("user-agent", "")
+    return "codex" in ua.lower()
+
+
+def is_hosted_web_search_tool(tool: Any) -> bool:
+    if not isinstance(tool, dict):
+        return False
+    tool_type = str(tool.get("type") or "").strip().lower()
+    if tool_type.startswith("web_search"):
+        return True
+    fn = tool.get("function")
+    if isinstance(fn, dict):
+        name = str(fn.get("name") or "").strip().lower()
+        if name in {"web_search", "web_search_preview"}:
+            return True
+    name = str(tool.get("name") or "").strip().lower()
+    return name in {"web_search", "web_search_preview"}
+
+
+def omit_hosted_web_search_tools(tools: Any) -> list[Any]:
+    if not isinstance(tools, list):
+        return []
+    return [tool for tool in tools if not is_hosted_web_search_tool(tool)]
+
+
+def _tool_choice_targets_web_search(tool_choice: Any) -> bool:
+    if not isinstance(tool_choice, dict):
+        return False
+    choice_type = str(tool_choice.get("type") or "").strip().lower()
+    if choice_type.startswith("web_search"):
+        return True
+    name = str(tool_choice.get("name") or "").strip().lower()
+    return name in {"web_search", "web_search_preview"}
+
+
+def prepare_codex_byok_responses_body(
+    body: dict[str, Any],
+    headers: Mapping[str, str],
+) -> dict[str, Any]:
+    """Drop hosted Codex web_search tools for BYOK upstreams when the client is Codex."""
+    if not is_codex_client_headers(headers):
+        return body
+    tools = body.get("tools")
+    if not isinstance(tools, list) or not any(is_hosted_web_search_tool(tool) for tool in tools):
+        return body
+    prepared = dict(body)
+    prepared["tools"] = omit_hosted_web_search_tools(tools)
+    if _tool_choice_targets_web_search(prepared.get("tool_choice")):
+        prepared.pop("tool_choice", None)
+    return prepared
 
 
 def _decode_thinking_blob(encoded: Any) -> dict[str, Any] | None:

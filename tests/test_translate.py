@@ -278,3 +278,61 @@ def test_anthropic_to_response_normalizes_cache_usage():
             "cache_creation_input_tokens": 2,
         },
     }
+
+
+def test_prepare_codex_byok_responses_body_strips_hosted_web_search_for_codex_client():
+    from codex_shim.translate import prepare_codex_byok_responses_body
+
+    body = {
+        "model": "local-llama",
+        "parallel_tool_calls": True,
+        "tool_choice": {"type": "web_search_preview"},
+        "tools": [
+            {"type": "function", "name": "tool_search", "parameters": {"type": "object"}},
+            {"type": "web_search_preview"},
+            {"type": "function", "name": "exec_command", "parameters": {"type": "object"}},
+        ],
+    }
+    headers = {"x-codex-installation-id": "install-123"}
+
+    out = prepare_codex_byok_responses_body(body, headers)
+
+    assert out["parallel_tool_calls"] is True
+    assert "tool_choice" not in out
+    assert [tool.get("name") or tool.get("type") for tool in out["tools"]] == [
+        "tool_search",
+        "exec_command",
+    ]
+
+
+def test_prepare_codex_byok_responses_body_keeps_web_search_for_non_codex_client():
+    from codex_shim.translate import prepare_codex_byok_responses_body
+
+    body = {
+        "tools": [
+            {"type": "web_search_preview"},
+            {"type": "function", "name": "exec_command", "parameters": {"type": "object"}},
+        ],
+    }
+
+    out = prepare_codex_byok_responses_body(body, {"User-Agent": "openai-python/1.0"})
+
+    assert len(out["tools"]) == 2
+
+
+def test_responses_to_chat_after_prepare_omits_web_search_for_byok():
+    from codex_shim.translate import prepare_codex_byok_responses_body
+
+    body = {
+        "input": "Search the web",
+        "parallel_tool_calls": True,
+        "tools": [
+            {"type": "web_search_preview"},
+            {"type": "function", "name": "tool_search", "parameters": {"type": "object"}},
+        ],
+    }
+    prepared = prepare_codex_byok_responses_body(body, {"User-Agent": "codex-cli/0.135.0"})
+    out = responses_to_chat(prepared, "gemma-4")
+
+    assert out["parallel_tool_calls"] is True
+    assert [tool["function"]["name"] for tool in out["tools"]] == ["tool_search"]

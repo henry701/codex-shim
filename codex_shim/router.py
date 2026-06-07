@@ -201,7 +201,6 @@ def router_catalog_entry(config: RouterConfig) -> dict[str, Any]:
         "support_verbosity": False,
         "apply_patch_tool_type": "freeform",
         "web_search_tool_type": "text_and_image",
-        "use_responses_lite": True,
         "supports_search_tool": True,
         "supports_parallel_tool_calls": True,
         "experimental_supported_tools": [],

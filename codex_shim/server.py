@@ -51,6 +51,7 @@ from .translate import (
     chat_completion_to_response,
     chat_to_anthropic,
     normalize_responses_usage,
+    prepare_codex_byok_responses_body,
     responses_to_anthropic,
     responses_to_chat,
 )
@@ -238,6 +239,7 @@ class ShimServer:
         if self._needs_image_gen(body) or self._needs_image_followup(body):
             return await self._chatgpt_passthrough(request, body, response_model_override=model)
         route = self._route(body)
+        body = prepare_codex_byok_responses_body(body, request.headers)
         if route.is_openai_chat:
             forwarded = responses_to_chat(body, route.model)
             return await self._post_openai_chat(request, route, forwarded, as_responses=True)
@@ -270,6 +272,7 @@ class ShimServer:
             )
         route = self._route(body)
         compact_body = _compact_request_body(body, route.model)
+        compact_body = prepare_codex_byok_responses_body(compact_body, request.headers)
         if route.is_openai_chat:
             forwarded = responses_to_chat(compact_body, route.model)
             forwarded["stream"] = False
@@ -818,6 +821,7 @@ class ShimServer:
     ) -> web.StreamResponse:
         route = self._route(body)
         client_slug = response_slug or route.slug
+        body = prepare_codex_byok_responses_body(body, request.headers)
         if route.is_openai_chat:
             forwarded = responses_to_chat(body, route.model)
             return await self._post_openai_chat(
@@ -840,6 +844,7 @@ class ShimServer:
         route = self._route(body)
         client_slug = response_slug or route.slug
         compact_body = _compact_request_body(body, route.model)
+        compact_body = prepare_codex_byok_responses_body(compact_body, request.headers)
         if route.is_openai_chat:
             forwarded = responses_to_chat(compact_body, route.model)
             forwarded["stream"] = False
