@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import contextlib
 import json
 import os
 import re
@@ -60,8 +59,7 @@ from .translate import (
 DEBUG_DIR = Path(__file__).resolve().parents[1] / ".codex-shim"
 CODEX_CONFIG_PATH = Path.home() / ".codex" / "config.toml"
 _MODELS_CACHE_TTL_SEC = 30.0
-_HEALTH_REFRESH_INTERVAL_SEC = 60.0
-_HEALTH_REFRESH_STARTUP_TIMEOUT_SEC = 120.0
+_STARTUP_REFRESH_TIMEOUT_SEC = 120.0
 
 
 class ShimServer:
@@ -77,17 +75,13 @@ class ShimServer:
             "cursor_passthrough": False,
             "auto_router": False,
         }
-        self._health_refresh_task: asyncio.Task[None] | None = None
-
     def app(self) -> web.Application:
         allowed_hosts = build_allowed_hosts(self.host)
         app = web.Application(
             client_max_size=64 * 1024 * 1024,
             middlewares=[host_guard_middleware(allowed_hosts)],
         )
-        app["shim"] = self
         app.on_startup.append(self._on_startup)
-        app.on_cleanup.append(self._on_cleanup)
         app.router.add_get("/health", self.health)
         app.router.add_get("/v1/models", self.models)
         app.router.add_post("/v1/chat/completions", self.chat_completions)
@@ -99,29 +93,24 @@ class ShimServer:
         return app
 
     async def _on_startup(self, _app: web.Application) -> None:
-        self._health_refresh_task = asyncio.create_task(self._health_refresh_loop())
-
-    async def _on_cleanup(self, _app: web.Application) -> None:
-        task = self._health_refresh_task
-        if task is not None:
-            task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await task
-
-    async def _health_refresh_loop(self) -> None:
-        while True:
+        try:
+            models = await asyncio.wait_for(
+                asyncio.to_thread(self.settings.load),
+                timeout=_STARTUP_REFRESH_TIMEOUT_SEC,
+            )
+            self._models_cache = (time.monotonic(), models)
+            self._health_snapshot = self._compute_health_snapshot_from_models(models)
+        except Exception:
             try:
                 self._health_snapshot = await asyncio.wait_for(
                     asyncio.to_thread(self._compute_health_snapshot),
-                    timeout=_HEALTH_REFRESH_STARTUP_TIMEOUT_SEC,
+                    timeout=_STARTUP_REFRESH_TIMEOUT_SEC,
                 )
-                self._models_cache = None
             except Exception:
                 pass
-            await asyncio.sleep(_HEALTH_REFRESH_INTERVAL_SEC)
 
-    def _compute_health_snapshot(self) -> dict[str, Any]:
-        models = usable_byok_models(self.settings.load())
+    def _compute_health_snapshot_from_models(self, models: list[ShimModel]) -> dict[str, Any]:
+        usable = usable_byok_models(models)
         chatgpt_ok = chatgpt_passthrough_available()
         cursor_ok = cursor_passthrough_available()
         passthrough_count = len(chatgpt_passthrough_slugs()) if chatgpt_ok else 0
@@ -133,11 +122,14 @@ class ShimServer:
         )
         return {
             "ok": True,
-            "models": len(models) + passthrough_count,
+            "models": len(usable) + passthrough_count,
             "chatgpt_passthrough": chatgpt_ok,
             "cursor_passthrough": cursor_ok,
             "auto_router": auto_router,
         }
+
+    def _compute_health_snapshot(self) -> dict[str, Any]:
+        return self._compute_health_snapshot_from_models(self.settings.load())
 
     async def _load_models(self) -> list[ShimModel]:
         now = time.monotonic()
@@ -224,8 +216,19 @@ class ShimServer:
             _restart_codex_app()
         return web.json_response({"ok": True, "model": slug, "restarted": restart})
 
+    def _auto_router_active_now(self) -> bool:
+        config = self.settings.load_router()
+        if not config or not config.effective_enabled:
+            return False
+        cached = self._models_cache
+        if cached is None:
+            return bool(self._health_snapshot.get("auto_router"))
+        return router_module.router_is_active(config, available_model_slugs(cached[1]))
+
     async def health(self, _request: web.Request) -> web.Response:
-        return web.json_response(dict(self._health_snapshot))
+        snap = dict(self._health_snapshot)
+        snap["auto_router"] = self._auto_router_active_now()
+        return web.json_response(snap)
 
     async def models(self, _request: web.Request) -> web.Response:
         now = int(time.time())

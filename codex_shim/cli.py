@@ -4,6 +4,7 @@ import argparse
 import os
 from pathlib import Path
 import ctypes
+import shutil
 import signal
 import socket
 import subprocess
@@ -101,6 +102,11 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("stop")
     sub.add_parser("disable")
     sub.add_parser("restart")
+    sub.add_parser("run", help="Run the shim in the foreground (for systemd and debugging).")
+    sub.add_parser(
+        "install-service",
+        help="Install and enable a systemd user service so the shim starts at login/boot.",
+    )
     sub.add_parser("status")
     sub.add_parser("patch-app", help="Patch Codex Desktop picker/sidebar handling for custom shim models.")
     sub.add_parser("restore-app", help="Restore Codex Desktop app.asar from the pre-patch backup.")
@@ -142,6 +148,10 @@ def main(argv: list[str] | None = None) -> int:
             return 1
         generate(args.settings, args.port)
         return start(args.settings, args.port)
+    if args.command == "run":
+        return run_foreground(args.settings, args.port)
+    if args.command == "install-service":
+        return install_service(args.settings, args.port)
     if args.command == "status":
         return status(args.port)
     if args.command == "patch-app":
@@ -341,6 +351,93 @@ def list_models(settings_path: Path) -> int:
     width = max(len(row[0]) for row in rows)
     for slug, display_name, model, provider in rows:
         print(f"{slug:<{width}}  {display_name}  ->  {model} ({provider})", flush=True)
+    return 0
+
+
+def run_foreground(settings_path: Path, port: int) -> int:
+    generate(settings_path, port)
+    from .server import main as server_main
+
+    server_main(
+        [
+            "--settings",
+            str(Path(settings_path).expanduser()),
+            "--host",
+            DEFAULT_HOST,
+            "--port",
+            str(port),
+        ]
+    )
+    return 0
+
+
+SYSTEMD_USER_UNIT = Path.home() / ".config/systemd/user/codex-shim.service"
+
+
+def _systemd_unit_content(
+    *,
+    codex_shim_bin: str,
+    settings_path: Path,
+    port: int,
+) -> str:
+    settings = Path(settings_path).expanduser()
+    common_args = f"--settings {settings} --port {port}"
+    return f"""[Unit]
+Description=Codex BYOK shim
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStartPre={codex_shim_bin} {common_args} generate
+ExecStart={codex_shim_bin} {common_args} run
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target
+"""
+
+
+def install_service(settings_path: Path, port: int) -> int:
+    if os.name == "nt":
+        print("systemd user services are not supported on Windows.", file=sys.stderr)
+        return 1
+    codex_shim_bin = shutil.which("codex-shim")
+    if not codex_shim_bin:
+        print("codex-shim not found on PATH; install it before enabling the service.", file=sys.stderr)
+        return 1
+    stop()
+    SYSTEMD_USER_UNIT.parent.mkdir(parents=True, exist_ok=True)
+    SYSTEMD_USER_UNIT.write_text(
+        _systemd_unit_content(
+            codex_shim_bin=codex_shim_bin,
+            settings_path=settings_path,
+            port=port,
+        )
+    )
+    for cmd in (
+        ["systemctl", "--user", "daemon-reload"],
+        ["systemctl", "--user", "enable", "--now", "codex-shim.service"],
+    ):
+        result = subprocess.run(cmd, check=False)
+        if result.returncode != 0:
+            print(f"Command failed: {' '.join(cmd)}", file=sys.stderr)
+            return result.returncode
+    linger = subprocess.run(
+        ["loginctl", "enable-linger", os.environ.get("USER", "")],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if linger.returncode != 0:
+        print(
+            "Service enabled for this login session. "
+            "Run `loginctl enable-linger $USER` if you need it at boot without an active session.",
+            file=sys.stderr,
+        )
+    print(f"Installed {SYSTEMD_USER_UNIT}")
+    print("codex-shim.service is enabled and running.")
     return 0
 
 
