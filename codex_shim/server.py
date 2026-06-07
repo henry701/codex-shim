@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import json
 import os
 import re
@@ -58,6 +59,9 @@ from .translate import (
 
 DEBUG_DIR = Path(__file__).resolve().parents[1] / ".codex-shim"
 CODEX_CONFIG_PATH = Path.home() / ".codex" / "config.toml"
+_MODELS_CACHE_TTL_SEC = 30.0
+_HEALTH_REFRESH_INTERVAL_SEC = 60.0
+_HEALTH_REFRESH_STARTUP_TIMEOUT_SEC = 120.0
 
 
 class ShimServer:
@@ -65,6 +69,15 @@ class ShimServer:
         self.settings = ModelSettings(settings_path)
         self.host = host
         self.timeout = ClientTimeout(total=None, sock_connect=120, sock_read=None)
+        self._models_cache: tuple[float, list[ShimModel]] | None = None
+        self._health_snapshot: dict[str, Any] = {
+            "ok": True,
+            "models": 0,
+            "chatgpt_passthrough": False,
+            "cursor_passthrough": False,
+            "auto_router": False,
+        }
+        self._health_refresh_task: asyncio.Task[None] | None = None
 
     def app(self) -> web.Application:
         allowed_hosts = build_allowed_hosts(self.host)
@@ -72,6 +85,9 @@ class ShimServer:
             client_max_size=64 * 1024 * 1024,
             middlewares=[host_guard_middleware(allowed_hosts)],
         )
+        app["shim"] = self
+        app.on_startup.append(self._on_startup)
+        app.on_cleanup.append(self._on_cleanup)
         app.router.add_get("/health", self.health)
         app.router.add_get("/v1/models", self.models)
         app.router.add_post("/v1/chat/completions", self.chat_completions)
@@ -82,13 +98,63 @@ class ShimServer:
         app.router.add_post("/api/switch", self.switch_model)
         return app
 
+    async def _on_startup(self, _app: web.Application) -> None:
+        self._health_refresh_task = asyncio.create_task(self._health_refresh_loop())
+
+    async def _on_cleanup(self, _app: web.Application) -> None:
+        task = self._health_refresh_task
+        if task is not None:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+
+    async def _health_refresh_loop(self) -> None:
+        while True:
+            try:
+                self._health_snapshot = await asyncio.wait_for(
+                    asyncio.to_thread(self._compute_health_snapshot),
+                    timeout=_HEALTH_REFRESH_STARTUP_TIMEOUT_SEC,
+                )
+                self._models_cache = None
+            except Exception:
+                pass
+            await asyncio.sleep(_HEALTH_REFRESH_INTERVAL_SEC)
+
+    def _compute_health_snapshot(self) -> dict[str, Any]:
+        models = usable_byok_models(self.settings.load())
+        chatgpt_ok = chatgpt_passthrough_available()
+        cursor_ok = cursor_passthrough_available()
+        passthrough_count = len(chatgpt_passthrough_slugs()) if chatgpt_ok else 0
+        if cursor_ok:
+            passthrough_count += len(cursor_passthrough_display_names())
+        config = self.settings.load_router()
+        auto_router = bool(
+            config and router_module.router_is_active(config, available_model_slugs(models))
+        )
+        return {
+            "ok": True,
+            "models": len(models) + passthrough_count,
+            "chatgpt_passthrough": chatgpt_ok,
+            "cursor_passthrough": cursor_ok,
+            "auto_router": auto_router,
+        }
+
+    async def _load_models(self) -> list[ShimModel]:
+        now = time.monotonic()
+        cached = self._models_cache
+        if cached is not None and now - cached[0] < _MODELS_CACHE_TTL_SEC:
+            return cached[1]
+        models = await asyncio.to_thread(self.settings.load)
+        self._models_cache = (now, models)
+        return models
+
     async def picker_page(self, _request: web.Request) -> web.Response:
         return web.Response(text=_picker_html(), content_type="text/html")
 
     async def api_models(self, _request: web.Request) -> web.Response:
         current = _current_managed_model()
         data: list[dict[str, Any]] = []
-        router_config = self._active_router()
+        router_config = await self._active_router()
         if router_config is not None:
             data.append(
                 {
@@ -118,7 +184,7 @@ class ShimServer:
                         "active": current == slug,
                     }
                 )
-        for m in usable_byok_models(self.settings.load()):
+        for m in usable_byok_models(await self._load_models()):
             data.append(
                 {
                     "slug": m.slug,
@@ -137,10 +203,10 @@ class ShimServer:
         slug = str(body.get("slug") or "").strip()
         if not slug:
             return web.json_response({"error": "slug is required"}, status=400)
-        models = usable_byok_models(self.settings.load())
+        models = usable_byok_models(await self._load_models())
         valid = {m.slug for m in models}
         display_for: dict[str, str] = {m.slug: m.display_name for m in models}
-        router_config = self._active_router()
+        router_config = await self._active_router()
         if router_config is not None:
             valid.add(router_config.slug)
             display_for[router_config.slug] = router_config.display_name
@@ -159,27 +225,12 @@ class ShimServer:
         return web.json_response({"ok": True, "model": slug, "restarted": restart})
 
     async def health(self, _request: web.Request) -> web.Response:
-        models = usable_byok_models(self.settings.load())
-        chatgpt_ok = chatgpt_passthrough_available()
-        cursor_ok = cursor_passthrough_available()
-        passthrough_count = len(chatgpt_passthrough_slugs()) if chatgpt_ok else 0
-        if cursor_ok:
-            passthrough_count += len(cursor_passthrough_display_names())
-        count = len(models) + passthrough_count
-        return web.json_response(
-            {
-                "ok": True,
-                "models": count,
-                "chatgpt_passthrough": chatgpt_ok,
-                "cursor_passthrough": cursor_ok,
-                "auto_router": self._active_router() is not None,
-            }
-        )
+        return web.json_response(dict(self._health_snapshot))
 
     async def models(self, _request: web.Request) -> web.Response:
         now = int(time.time())
         data: list[dict[str, Any]] = []
-        router_config = self._active_router()
+        router_config = await self._active_router()
         if router_config is not None:
             data.append(router_module.router_models_entry(router_config, now))
         if chatgpt_passthrough_available():
@@ -197,13 +248,21 @@ class ShimServer:
                 }
                 for slug in sorted(cursor_passthrough_display_names())
             )
-        data.extend({"id": model.slug, "object": "model", "created": now, "owned_by": "codex-shim"} for model in usable_byok_models(self.settings.load()))
+        data.extend(
+            {
+                "id": model.slug,
+                "object": "model",
+                "created": now,
+                "owned_by": "codex-shim",
+            }
+            for model in usable_byok_models(await self._load_models())
+        )
         return web.json_response({"object": "list", "data": data})
 
     async def chat_completions(self, request: web.Request) -> web.StreamResponse:
         body = await request.json()
         body = await self._maybe_apply_auto_router(body)
-        route = self._route(body)
+        route = await self._route(body)
         if route.is_openai_chat:
             forwarded = dict(body)
             forwarded["model"] = route.model
@@ -238,7 +297,7 @@ class ShimServer:
             )
         if self._needs_image_gen(body) or self._needs_image_followup(body):
             return await self._chatgpt_passthrough(request, body, response_model_override=model)
-        route = self._route(body)
+        route = await self._route(body)
         body = prepare_codex_byok_responses_body(body, request.headers)
         if route.is_openai_chat:
             forwarded = responses_to_chat(body, route.model)
@@ -270,7 +329,7 @@ class ShimServer:
                 upstream_model=cursor_upstream_model(model),
                 force_non_stream=True,
             )
-        route = self._route(body)
+        route = await self._route(body)
         compact_body = _compact_request_body(body, route.model)
         compact_body = prepare_codex_byok_responses_body(compact_body, request.headers)
         if route.is_openai_chat:
@@ -715,11 +774,14 @@ class ShimServer:
     # ------------------------------------------------------------------
     # Auto Router
     # ------------------------------------------------------------------
-    def _active_router(self):
+    async def _active_router(self):
         """Return the RouterConfig only when enabled and at least one candidate
         backend is usable, so discovery never advertises a dead Auto entry."""
         config = self.settings.load_router()
-        if config and router_module.router_is_active(config, available_model_slugs(self.settings.load())):
+        if config is None:
+            return None
+        models = await self._load_models()
+        if router_module.router_is_active(config, available_model_slugs(models)):
             return config
         return None
 
@@ -742,7 +804,7 @@ class ShimServer:
         return body
 
     async def _resolve_auto_model(self, config, body: dict[str, Any]) -> str | None:
-        models = self.settings.load()
+        models = await self._load_models()
         candidates = router_module.filter_available(config, available_model_slugs(models))
         if not candidates:
             return None
@@ -795,9 +857,15 @@ class ShimServer:
 
         return classify
 
-    def _route(self, body: dict[str, Any]) -> ShimModel:
+    async def _route(self, body: dict[str, Any]) -> ShimModel:
         requested = str(body.get("model") or "")
-        route = self.settings.by_slug_or_model(requested)
+        models = await self._load_models()
+        by_slug = {model.slug: model for model in models}
+        route = by_slug.get(requested)
+        if route is None:
+            matches = [model for model in models if model.model == requested]
+            if len(matches) == 1:
+                route = matches[0]
         if route is None:
             raise web.HTTPNotFound(text=f"Unknown model slug/model: {requested}")
         if not byok_model_has_credentials(route):
@@ -826,7 +894,7 @@ class ShimServer:
         *,
         response_slug: str | None = None,
     ) -> web.StreamResponse:
-        route = self._route(body)
+        route = await self._route(body)
         client_slug = response_slug or route.slug
         body = prepare_codex_byok_responses_body(body, request.headers)
         if route.is_openai_chat:
@@ -848,7 +916,7 @@ class ShimServer:
         *,
         response_slug: str | None = None,
     ) -> web.StreamResponse:
-        route = self._route(body)
+        route = await self._route(body)
         client_slug = response_slug or route.slug
         compact_body = _compact_request_body(body, route.model)
         compact_body = prepare_codex_byok_responses_body(compact_body, request.headers)
@@ -2744,6 +2812,7 @@ def main(argv: list[str] | None = None) -> None:
         port=args.port,
         handle_signals=True,
         handler_cancellation=True,
+        shutdown_timeout=5.0,
     )
 
 

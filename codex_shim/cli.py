@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import ctypes
 import signal
+import socket
 import subprocess
 import sys
 import time
@@ -364,7 +365,8 @@ def start(settings_path: Path, port: int) -> int:
     env["PYTHONPATH"] = str(PROJECT_ROOT) + os.pathsep + env.get("PYTHONPATH", "")
     process = _popen_daemon(cmd, log, env)
     PID_PATH.write_text(str(process.pid))
-    for _ in range(50):
+    deadline = time.monotonic() + _STARTUP_HEALTH_WAIT_S
+    while time.monotonic() < deadline:
         if _healthy(port):
             print(f"Shim started on http://{DEFAULT_HOST}:{port} with pid {process.pid}.")
             print(f"Log: {LOG_PATH}")
@@ -372,14 +374,18 @@ def start(settings_path: Path, port: int) -> int:
         if process.poll() is not None:
             print(f"Shim exited during startup. See {LOG_PATH}.", file=sys.stderr)
             return 1
-        time.sleep(0.1)
+        time.sleep(_STARTUP_POLL_INTERVAL_S)
     print(f"Shim process started but health check timed out. See {LOG_PATH}.", file=sys.stderr)
     return 1
 
 
+_STARTUP_HEALTH_WAIT_S = 30.0
+_STARTUP_POLL_INTERVAL_S = 0.1
+_STARTUP_HEALTH_TIMEOUT_S = 1.0
 _SHUTDOWN_TERM_WAIT_S = 10.0
 _SHUTDOWN_KILL_WAIT_S = 5.0
 _SHUTDOWN_POLL_INTERVAL_S = 0.1
+_PORT_FREE_WAIT_S = 10.0
 
 
 def _wait_for_pid_exit(pid: int, timeout_s: float) -> bool:
@@ -397,8 +403,10 @@ def stop() -> int:
         print("Shim is not running.")
         PID_PATH.unlink(missing_ok=True)
         return 0
+    port = DEFAULT_PORT
     _terminate_pid(pid)
     if _wait_for_pid_exit(pid, _SHUTDOWN_TERM_WAIT_S):
+        _wait_for_port_free(port, _PORT_FREE_WAIT_S)
         PID_PATH.unlink(missing_ok=True)
         print("Shim stopped.")
         return 0
@@ -408,12 +416,16 @@ def stop() -> int:
             file=sys.stderr,
         )
         try:
-            os.kill(pid, signal.SIGKILL)
+            os.killpg(pid, signal.SIGKILL)
         except OSError:
-            pass
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except OSError:
+                pass
     else:
         _terminate_pid(pid)
     if _wait_for_pid_exit(pid, _SHUTDOWN_KILL_WAIT_S):
+        _wait_for_port_free(port, _PORT_FREE_WAIT_S)
         PID_PATH.unlink(missing_ok=True)
         print("Shim stopped.")
         return 0
@@ -1100,7 +1112,10 @@ def _terminate_pid(pid: int) -> None:
             finally:
                 ctypes.windll.kernel32.CloseHandle(handle)
         return
-    os.kill(pid, signal.SIGTERM)
+    try:
+        os.killpg(pid, signal.SIGTERM)
+    except OSError:
+        os.kill(pid, signal.SIGTERM)
 
 
 def _override_args(settings_path: Path, port: int) -> list[str]:
@@ -1206,12 +1221,33 @@ def _healthy(port: int) -> bool:
     return _health(port) is not None
 
 
+def _port_is_free(port: int) -> bool:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.settimeout(0.2)
+        return sock.connect_ex((DEFAULT_HOST, port)) != 0
+
+
+def _wait_for_port_free(port: int, timeout_s: float) -> bool:
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        if _port_is_free(port):
+            return True
+        time.sleep(_SHUTDOWN_POLL_INTERVAL_S)
+    return _port_is_free(port)
+
+
 def _health(port: int) -> dict | None:
     try:
-        with urlopen(f"http://{DEFAULT_HOST}:{port}/health", timeout=0.5) as response:
+        with urlopen(
+            f"http://{DEFAULT_HOST}:{port}/health",
+            timeout=_STARTUP_HEALTH_TIMEOUT_S,
+        ) as response:
             if response.status != 200:
                 return None
-            return json.loads(response.read().decode("utf-8"))
+            payload = json.loads(response.read().decode("utf-8"))
+            if not payload.get("ok"):
+                return None
+            return payload
     except Exception:
         return None
 

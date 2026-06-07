@@ -21,6 +21,12 @@ def test_stop_escalates_to_sigkill_when_sigterm_times_out(monkeypatch, tmp_path)
 
     monkeypatch.setattr(cli, "_pid_running", pid_running)
     monkeypatch.setattr(cli, "_terminate_pid", lambda pid: kills.append(("term", pid)))
+    monkeypatch.setattr(cli, "_wait_for_port_free", lambda port, timeout_s: True)
+    monkeypatch.setattr(
+        cli.os,
+        "killpg",
+        lambda pid, sig: kills.append(("killpg", pid, sig)),
+    )
     monkeypatch.setattr(
         cli.os,
         "kill",
@@ -32,7 +38,7 @@ def test_stop_escalates_to_sigkill_when_sigterm_times_out(monkeypatch, tmp_path)
 
     assert cli.stop() == 0
     assert ("term", 4242) in kills
-    assert ("kill", 4242, signal.SIGKILL) in kills
+    assert ("killpg", 4242, signal.SIGKILL) in kills or ("kill", 4242, signal.SIGKILL) in kills
     assert not pid_path.exists()
 
 
@@ -42,6 +48,7 @@ def test_stop_returns_error_when_process_survives_sigkill(monkeypatch, tmp_path)
     monkeypatch.setattr(cli, "PID_PATH", pid_path)
     monkeypatch.setattr(cli, "_pid_running", lambda pid: True)
     monkeypatch.setattr(cli, "_terminate_pid", lambda pid: None)
+    monkeypatch.setattr(cli.os, "killpg", lambda pid, sig: None)
     monkeypatch.setattr(cli.os, "kill", lambda pid, sig: None)
     monkeypatch.setattr(cli, "_SHUTDOWN_TERM_WAIT_S", 0.01)
     monkeypatch.setattr(cli, "_SHUTDOWN_KILL_WAIT_S", 0.01)
