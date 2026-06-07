@@ -280,7 +280,7 @@ def test_anthropic_to_response_normalizes_cache_usage():
     }
 
 
-def test_prepare_codex_byok_responses_body_strips_hosted_web_search_for_codex_client():
+def test_prepare_codex_byok_responses_body_strips_hosted_codex_tools_for_codex_client():
     from codex_shim.translate import prepare_codex_byok_responses_body
 
     body = {
@@ -290,6 +290,8 @@ def test_prepare_codex_byok_responses_body_strips_hosted_web_search_for_codex_cl
         "tools": [
             {"type": "function", "name": "tool_search", "parameters": {"type": "object"}},
             {"type": "web_search_preview"},
+            {"type": "image_generation"},
+            {"type": "computer_use_preview"},
             {"type": "function", "name": "exec_command", "parameters": {"type": "object"}},
         ],
     }
@@ -303,6 +305,24 @@ def test_prepare_codex_byok_responses_body_strips_hosted_web_search_for_codex_cl
         "tool_search",
         "exec_command",
     ]
+
+
+def test_prepare_codex_byok_responses_body_clears_tool_choice_for_image_and_computer_use():
+    from codex_shim.translate import prepare_codex_byok_responses_body
+
+    headers = {"User-Agent": "codex-cli/0.135.0"}
+    for tool_choice in (
+        {"type": "image_generation"},
+        {"type": "computer_use_preview"},
+    ):
+        body = {
+            "tools": [{"type": tool_choice["type"]}, {"type": "function", "name": "exec_command"}],
+            "tool_choice": tool_choice,
+        }
+        out = prepare_codex_byok_responses_body(body, headers)
+        assert "tool_choice" not in out
+        assert len(out["tools"]) == 1
+        assert out["tools"][0]["name"] == "exec_command"
 
 
 def test_prepare_codex_byok_responses_body_keeps_web_search_for_non_codex_client():

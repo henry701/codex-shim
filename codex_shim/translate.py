@@ -31,50 +31,70 @@ def is_codex_client_headers(headers: Mapping[str, str]) -> bool:
     return "codex" in ua.lower()
 
 
-def is_hosted_web_search_tool(tool: Any) -> bool:
+_HOSTED_CODEX_TOOL_NAMES = frozenset(
+    {
+        "web_search",
+        "web_search_preview",
+        "image_generation",
+        "computer_use",
+        "computer_use_preview",
+    }
+)
+
+
+def is_hosted_codex_tool(tool: Any) -> bool:
+    """Codex-hosted tools that BYOK local models cannot execute."""
     if not isinstance(tool, dict):
         return False
     tool_type = str(tool.get("type") or "").strip().lower()
     if tool_type.startswith("web_search"):
         return True
+    if tool_type.startswith("computer_use"):
+        return True
+    if tool_type == "image_generation":
+        return True
     fn = tool.get("function")
     if isinstance(fn, dict):
         name = str(fn.get("name") or "").strip().lower()
-        if name in {"web_search", "web_search_preview"}:
+        if name in _HOSTED_CODEX_TOOL_NAMES:
             return True
     name = str(tool.get("name") or "").strip().lower()
-    return name in {"web_search", "web_search_preview"}
+    return name in _HOSTED_CODEX_TOOL_NAMES
 
 
-def omit_hosted_web_search_tools(tools: Any) -> list[Any]:
+def omit_hosted_codex_tools(tools: Any) -> list[Any]:
     if not isinstance(tools, list):
         return []
-    return [tool for tool in tools if not is_hosted_web_search_tool(tool)]
+    return [tool for tool in tools if not is_hosted_codex_tool(tool)]
 
 
-def _tool_choice_targets_web_search(tool_choice: Any) -> bool:
+def _tool_choice_targets_hosted_codex_tool(tool_choice: Any) -> bool:
     if not isinstance(tool_choice, dict):
         return False
     choice_type = str(tool_choice.get("type") or "").strip().lower()
     if choice_type.startswith("web_search"):
         return True
+    if choice_type.startswith("computer_use"):
+        return True
+    if choice_type == "image_generation":
+        return True
     name = str(tool_choice.get("name") or "").strip().lower()
-    return name in {"web_search", "web_search_preview"}
+    return name in _HOSTED_CODEX_TOOL_NAMES
 
 
 def prepare_codex_byok_responses_body(
     body: dict[str, Any],
     headers: Mapping[str, str],
 ) -> dict[str, Any]:
-    """Drop hosted Codex web_search tools for BYOK upstreams when the client is Codex."""
+    """Drop Codex-hosted tools (web search, image gen, computer use) for BYOK upstreams."""
     if not is_codex_client_headers(headers):
         return body
     tools = body.get("tools")
-    if not isinstance(tools, list) or not any(is_hosted_web_search_tool(tool) for tool in tools):
+    if not isinstance(tools, list) or not any(is_hosted_codex_tool(tool) for tool in tools):
         return body
     prepared = dict(body)
-    prepared["tools"] = omit_hosted_web_search_tools(tools)
-    if _tool_choice_targets_web_search(prepared.get("tool_choice")):
+    prepared["tools"] = omit_hosted_codex_tools(tools)
+    if _tool_choice_targets_hosted_codex_tool(prepared.get("tool_choice")):
         prepared.pop("tool_choice", None)
     return prepared
 
