@@ -121,7 +121,9 @@ def main(argv: list[str] | None = None) -> int:
             restore_codex_config()
         return stop()
     if args.command == "restart":
-        stop()
+        if stop() != 0:
+            print("Restart aborted: could not stop the running shim.", file=sys.stderr)
+            return 1
         generate(args.settings, args.port)
         return start(args.settings, args.port)
     if args.command == "status":
@@ -297,6 +299,20 @@ def start(settings_path: Path, port: int) -> int:
     return 1
 
 
+_SHUTDOWN_TERM_WAIT_S = 10.0
+_SHUTDOWN_KILL_WAIT_S = 5.0
+_SHUTDOWN_POLL_INTERVAL_S = 0.1
+
+
+def _wait_for_pid_exit(pid: int, timeout_s: float) -> bool:
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        if not _pid_running(pid):
+            return True
+        time.sleep(_SHUTDOWN_POLL_INTERVAL_S)
+    return not _pid_running(pid)
+
+
 def stop() -> int:
     pid = _read_pid()
     if not _pid_running(pid):
@@ -304,13 +320,26 @@ def stop() -> int:
         PID_PATH.unlink(missing_ok=True)
         return 0
     _terminate_pid(pid)
-    for _ in range(50):
-        if not _pid_running(pid):
-            PID_PATH.unlink(missing_ok=True)
-            print("Shim stopped.")
-            return 0
-        time.sleep(0.1)
-    print(f"Shim pid {pid} did not exit after SIGTERM.", file=sys.stderr)
+    if _wait_for_pid_exit(pid, _SHUTDOWN_TERM_WAIT_S):
+        PID_PATH.unlink(missing_ok=True)
+        print("Shim stopped.")
+        return 0
+    if os.name != "nt":
+        print(
+            f"Shim pid {pid} did not exit after SIGTERM; sending SIGKILL.",
+            file=sys.stderr,
+        )
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except OSError:
+            pass
+    else:
+        _terminate_pid(pid)
+    if _wait_for_pid_exit(pid, _SHUTDOWN_KILL_WAIT_S):
+        PID_PATH.unlink(missing_ok=True)
+        print("Shim stopped.")
+        return 0
+    print(f"Shim pid {pid} did not exit after SIGKILL.", file=sys.stderr)
     return 1
 
 

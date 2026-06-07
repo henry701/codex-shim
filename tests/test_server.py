@@ -521,7 +521,7 @@ async def test_chat_tool_delta_streams_exec_command_to_client():
             ]
         },
     )
-    await state.finish(downstream)
+    await state.finish(downstream, upstream_saw_done=True)
 
     events = _sse_events(b"".join(downstream.chunks).decode())
     function_added = [
@@ -597,7 +597,7 @@ async def test_chat_tool_delta_streams_tool_search_call_to_client():
         and (event.get("item") or {}).get("type") == "function_call_output"
     ]
     assert outputs_mid == []
-    await state.finish(downstream)
+    await state.finish(downstream, upstream_saw_done=True)
 
     completed = [e for e in _sse_events(b"".join(downstream.chunks).decode()) if e.get("type") == "response.completed"][-1]
     search_items = [i for i in completed["response"]["output"] if i.get("type") == "tool_search_call"]
@@ -886,7 +886,7 @@ async def test_mcp_tool_call_streams_argument_deltas_like_llama():
         downstream,
         {"choices": [{"delta": {}, "finish_reason": "tool_calls"}]},
     )
-    await state.finish(downstream)
+    await state.finish(downstream, upstream_saw_done=True)
     events = _sse_events(b"".join(downstream.chunks).decode())
     arg_deltas = [
         e for e in events if e.get("type") == "response.function_call_arguments.delta"
@@ -952,7 +952,7 @@ async def test_mcp_tool_call_does_not_close_on_finish_reason_with_incomplete_arg
             ]
         },
     )
-    await state.finish(downstream)
+    await state.finish(downstream, upstream_saw_done=True)
     events = _sse_events(b"".join(downstream.chunks).decode())
     done = [
         e
@@ -960,6 +960,145 @@ async def test_mcp_tool_call_does_not_close_on_finish_reason_with_incomplete_arg
         if e.get("type") == "response.function_call_arguments.done"
     ][-1]
     assert json.loads(done["arguments"]) == {"query": "ukraine"}
+
+
+async def test_finish_does_not_complete_incomplete_tool_or_response():
+    class FakeResponse:
+        def __init__(self):
+            self.chunks: list[bytes] = []
+
+        async def write(self, data: bytes):
+            self.chunks.append(data)
+
+    downstream = FakeResponse()
+    state = ResponsesStreamState("local-llama")
+    await state.start(downstream)
+    await state.write_chat_delta(
+        downstream,
+        {
+            "choices": [
+                {
+                    "delta": {
+                        "tool_calls": [
+                            {
+                                "index": 0,
+                                "id": "call_exec",
+                                "function": {
+                                    "name": "exec_command",
+                                    "arguments": "{",
+                                },
+                            }
+                        ]
+                    },
+                    "finish_reason": "tool_calls",
+                }
+            ]
+        },
+    )
+    await state.finish(downstream, upstream_saw_done=True)
+    events = _sse_events(b"".join(downstream.chunks).decode())
+    assert not [
+        e
+        for e in events
+        if e.get("type") == "response.output_item.done"
+        and (e.get("item") or {}).get("name") == "exec_command"
+    ]
+    assert not [
+        e
+        for e in events
+        if e.get("type") == "response.function_call_arguments.done"
+    ]
+    assert not [e for e in events if e.get("type") == "response.completed"]
+    terminal = [
+        e
+        for e in events
+        if e.get("type") in ("response.completed", "response.incomplete", "response.failed")
+    ][-1]
+    assert terminal["type"] == "response.incomplete"
+    assert terminal["response"]["status"] == "incomplete"
+    assert b"data: [DONE]" in b"".join(downstream.chunks)
+    arg_deltas = [
+        e for e in events if e.get("type") == "response.function_call_arguments.delta"
+    ]
+    assert arg_deltas
+    assert arg_deltas[0]["delta"] == "{"
+
+
+async def test_finish_emits_response_incomplete_with_length_reason_when_upstream_done_truncated():
+    class FakeResponse:
+        def __init__(self):
+            self.chunks: list[bytes] = []
+
+        async def write(self, data: bytes):
+            self.chunks.append(data)
+
+    downstream = FakeResponse()
+    state = ResponsesStreamState("zen-nemotron-3-ultra-free")
+    await state.start(downstream)
+    await state.write_chat_delta(
+        downstream,
+        {
+            "choices": [
+                {
+                    "delta": {
+                        "tool_calls": [
+                            {
+                                "index": 0,
+                                "id": "call_exec",
+                                "function": {
+                                    "name": "exec_command",
+                                    "arguments": "{",
+                                },
+                            }
+                        ]
+                    },
+                    "finish_reason": "length",
+                }
+            ]
+        },
+    )
+    await state.finish(downstream, upstream_saw_done=True)
+    events = _sse_events(b"".join(downstream.chunks).decode())
+    terminal = [
+        e
+        for e in events
+        if e.get("type") in ("response.completed", "response.incomplete", "response.failed")
+    ][-1]
+    assert terminal["type"] == "response.incomplete"
+    assert terminal["response"]["incomplete_details"] == {"reason": "max_output_tokens"}
+
+
+async def test_finish_emits_response_completed_only_when_upstream_done_and_items_complete():
+    class FakeResponse:
+        def __init__(self):
+            self.chunks: list[bytes] = []
+
+        async def write(self, data: bytes):
+            self.chunks.append(data)
+
+    downstream = FakeResponse()
+    state = ResponsesStreamState("local-llama")
+    await state.start(downstream)
+    await state.write_chat_delta(
+        downstream,
+        {"choices": [{"delta": {"content": "hello"}}]},
+    )
+    await state.finish(downstream, upstream_saw_done=True)
+    events = _sse_events(b"".join(downstream.chunks).decode())
+    assert events[-1]["type"] == "response.completed"
+    assert b"data: [DONE]" in b"".join(downstream.chunks)
+
+    downstream2 = FakeResponse()
+    state2 = ResponsesStreamState("local-llama")
+    await state2.start(downstream2)
+    await state2.write_chat_delta(
+        downstream2,
+        {"choices": [{"delta": {"content": "hello"}}]},
+    )
+    await state2.finish(downstream2, upstream_saw_done=False)
+    events2 = _sse_events(b"".join(downstream2.chunks).decode())
+    assert not [e for e in events2 if e.get("type") == "response.completed"]
+    assert b"data: [DONE]" not in b"".join(downstream2.chunks)
 
 
 async def test_mcp_tool_call_emits_namespaced_function_call():
@@ -1048,7 +1187,7 @@ async def test_mcp_tool_call_in_final_response_output():
             ]
         },
     )
-    await state.finish(downstream)
+    await state.finish(downstream, upstream_saw_done=True)
 
     events = _sse_events(b"".join(downstream.chunks).decode())
     completed = [e for e in events if e.get("type") == "response.completed"][-1]
@@ -1095,7 +1234,7 @@ async def test_mcp_tool_call_emits_codex_native_item():
             ]
         },
     )
-    await state.finish(downstream)
+    await state.finish(downstream, upstream_saw_done=True)
 
     events = _sse_events(b"".join(downstream.chunks).decode())
     outputs = [
@@ -1141,7 +1280,7 @@ async def test_streaming_anthropic_response_completed_includes_usage():
             "usage": {"output_tokens": 3},
         },
     )
-    await state.finish(downstream)
+    await state.finish(downstream, upstream_saw_done=True)
 
     events = _sse_events(b"".join(downstream.chunks).decode())
     completed = [event for event in events if event.get("type") == "response.completed"][-1]

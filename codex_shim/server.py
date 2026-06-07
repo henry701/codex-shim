@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urljoin
 
-from aiohttp import ClientSession, ClientTimeout, web
+from aiohttp import ClientError, ClientSession, ClientTimeout, web
 
 from .cursor_passthrough import (
     CURSOR_MODEL_SLUG,
@@ -700,7 +700,7 @@ class ShimServer:
                         {"choices": [{"delta": {"content": message}}]},
                     )
                     break
-            await state.finish(response)
+            await state.finish(response, upstream_saw_done=True)
         except ClientDisconnected:
             pass
         except Exception as exc:
@@ -939,6 +939,7 @@ class ShimServer:
         chat_body["stream"] = True
         url = _join_url(route.base_url, "/chat/completions")
         headers = _openai_headers(route)
+        upstream_saw_done = False
         try:
             async with ClientSession(timeout=self.timeout) as session:
                 for _ in range(max_turns):
@@ -946,30 +947,45 @@ class ShimServer:
                     upstream = await session.post(url, json=turn_body, headers=headers)
                     if upstream.status >= 400:
                         text = await upstream.text()
-                        await _safe_write(
-                            response,
-                            json.dumps({"error": f"upstream {upstream.status}: {text[:200]}"}).encode() + b"\n",
+                        print(
+                            f"[stream] model={route.slug} upstream HTTP {upstream.status}: {text[:500]}",
+                            flush=True,
                         )
+                        if not as_responses or state is None:
+                            await _safe_write(
+                                response,
+                                json.dumps({"error": f"upstream {upstream.status}: {text[:200]}"}).encode() + b"\n",
+                            )
                         upstream.release()
                         break
                     try:
                         async for line in _sse_lines(upstream, request):
                             if line == "[DONE]":
+                                upstream_saw_done = True
                                 break
                             try:
                                 event = json.loads(line)
                             except json.JSONDecodeError:
                                 continue
+                            if isinstance(event, dict) and event.get("error"):
+                                await _write_sse(response, event)
+                                continue
                             if as_responses and state is not None:
                                 await state.write_chat_delta(response, event)
                             else:
                                 await _write_sse(response, event)
+                    except ClientError as exc:
+                        print(
+                            f"[stream] model={route.slug} upstream stream disconnected: "
+                            f"{type(exc).__name__}: {exc}",
+                            flush=True,
+                        )
                     finally:
                         await _close_upstream(upstream)
                     break
             if as_responses and state is not None:
-                await state.finish(response)
-            else:
+                await state.finish(response, upstream_saw_done=upstream_saw_done)
+            elif upstream_saw_done:
                 await _safe_write(response, b"data: [DONE]\n\n")
         except asyncio.CancelledError:
             print("[cancel] client disconnected during BYOK stream", flush=True)
@@ -1016,23 +1032,35 @@ class ShimServer:
         await response.prepare(request)
         if as_responses:
             state = ResponsesStreamState(client_slug)
+        upstream_saw_done = False
         try:
             if as_responses:
                 await state.start(response)
-            async for line in _sse_lines(upstream, request):
-                if line == "[DONE]":
-                    break
-                try:
-                    event = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if as_responses:
-                    await state.write_anthropic_delta(response, event)
-                else:
-                    await _write_sse(response, _anthropic_stream_to_chat_chunk(event, client_slug))
+            try:
+                async for line in _sse_lines(upstream, request):
+                    if line == "[DONE]":
+                        upstream_saw_done = True
+                        break
+                    try:
+                        event = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if isinstance(event, dict) and event.get("error"):
+                        await _write_sse(response, event)
+                        continue
+                    if as_responses:
+                        await state.write_anthropic_delta(response, event)
+                    else:
+                        await _write_sse(response, _anthropic_stream_to_chat_chunk(event, client_slug))
+            except ClientError as exc:
+                print(
+                    f"[stream] model={route.slug} upstream stream disconnected: "
+                    f"{type(exc).__name__}: {exc}",
+                    flush=True,
+                )
             if as_responses:
-                await state.finish(response)
-            else:
+                await state.finish(response, upstream_saw_done=upstream_saw_done)
+            elif upstream_saw_done:
                 await _safe_write(response, b"data: [DONE]\n\n")
         except asyncio.CancelledError:
             print("[cancel] client disconnected during Anthropic stream", flush=True)
@@ -1142,7 +1170,9 @@ class ResponsesStreamState:
     Codex Desktop Responses-API event sequence. Keeps the message item and
     each tool call as separate output items with stable indices, and emits
     proper .added / .delta / .done / .completed events plus a final
-    `response.completed` with the full reconciled `output` array."""
+    proper .added / .delta / .done / .completed events. Emits ``response.completed``
+    and client ``[DONE]`` only when upstream sent ``[DONE]`` and every open item
+    was fully received."""
 
     def __init__(self, model: str):
         self.response_id = f"resp_{int(time.time() * 1000)}"
@@ -1160,6 +1190,7 @@ class ResponsesStreamState:
         self.reasoning_blocks: dict[Any, dict[str, Any]] = {}
         self.next_output_index = 0
         self.completed_turns: list[dict[str, Any]] = []
+        self.upstream_finish_reason: str | None = None
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -1167,16 +1198,49 @@ class ResponsesStreamState:
     async def start(self, response: web.StreamResponse) -> None:
         await _write_sse(response, {"type": "response.created", "response": self._response("in_progress")})
 
-    async def finish(self, response: web.StreamResponse) -> None:
+    async def finish(self, response: web.StreamResponse, *, upstream_saw_done: bool) -> None:
         await self.close_turn_items(response)
-        await _write_sse(response, {"type": "response.completed", "response": self._response("completed", final=True)})
-        await response.write(b"data: [DONE]\n\n")
+        if upstream_saw_done and not self._has_open_incomplete_items():
+            await _write_sse(
+                response,
+                {"type": "response.completed", "response": self._response("completed", final=True)},
+            )
+            await response.write(b"data: [DONE]\n\n")
+        elif upstream_saw_done:
+            self._log_incomplete_tool_calls()
+            incomplete_response = self._response("incomplete", final=True)
+            if self.upstream_finish_reason == "length":
+                incomplete_response["incomplete_details"] = {"reason": "max_output_tokens"}
+            await _write_sse(
+                response,
+                {"type": "response.incomplete", "response": incomplete_response},
+            )
+            await response.write(b"data: [DONE]\n\n")
+        elif self._has_open_incomplete_items():
+            self._log_incomplete_tool_calls()
+
+    def _has_open_incomplete_items(self) -> bool:
+        if self.message_opened and not self.message_closed:
+            return True
+        for state in self.reasoning_blocks.values():
+            if not state.get("closed"):
+                return True
+        for tc in (
+            *self.tool_calls.values(),
+            *self.mcp_tool_calls.values(),
+            *self.tool_search_calls.values(),
+        ):
+            if tc.get("closed"):
+                continue
+            if not _tool_call_arguments_complete(tc):
+                return True
+        return False
 
     async def close_turn_items(self, response: web.StreamResponse) -> None:
         for state in sorted(self.reasoning_blocks.values(), key=lambda s: s["output_index"]):
             if not state.get("closed"):
                 await self._close_reasoning(response, state)
-        if self.message_opened and not self.message_closed:
+        if self.message_opened and not self.message_closed and self.message_text:
             await self._close_message(response)
         for state in sorted(self.tool_calls.values(), key=lambda s: s["output_index"]):
             if state.get("closed"):
@@ -1193,7 +1257,6 @@ class ResponsesStreamState:
         for state in sorted(self.tool_search_calls.values(), key=lambda s: s["output_index"]):
             if not state.get("closed") and _tool_call_arguments_complete(state):
                 await self._close_tool_search(response, state)
-        self._log_incomplete_tool_calls()
 
     def _log_incomplete_tool_calls(self) -> None:
         incomplete: list[str] = []
@@ -1255,6 +1318,9 @@ class ResponsesStreamState:
         if isinstance(usage, dict):
             self.usage = normalize_responses_usage(usage)
         choice = (chunk.get("choices") or [{}])[0]
+        finish_reason = choice.get("finish_reason")
+        if finish_reason is not None:
+            self.upstream_finish_reason = str(finish_reason)
         delta = choice.get("delta") or {}
         reasoning = delta.get("reasoning_content") or delta.get("reasoning")
         if reasoning:
