@@ -74,25 +74,28 @@ local:
 
 ## Install
 
+Install [uv](https://docs.astral.sh/uv/getting-started/installation/) first.
+uv manages a project virtualenv from `uv.lock`, so you do not need
+`pip install` or PEP 668 workarounds on Arch and other externally managed
+Python installs.
+
 Recommended on macOS/Linux/WSL/Git Bash (installs the `codex-shim` entry
 point from `pyproject.toml`):
 
 ```bash
 git clone https://github.com/0xSero/codex-shim ~/codex-shim
 cd ~/codex-shim
-python3 -m pip install --user -e .
+uv sync
+uv tool install -e .
 ```
-
-On Arch Linux and other PEP 668 “externally managed” Python installs, add
-`--break-system-packages` to the `pip install` command above (user-site install
-only; does not modify system packages).
 
 Recommended on native Windows PowerShell/cmd:
 
 ```powershell
 git clone https://github.com/0xSero/codex-shim $HOME\codex-shim
 cd $HOME\codex-shim
-py -3.11 -m pip install --user -e .
+uv sync
+uv tool install -e .
 ```
 
 That pulls in `aiohttp` and installs the portable Python console command
@@ -108,26 +111,22 @@ ln -sf "$PWD/bin/codex-model" ~/.local/bin/codex-model
 If you move the checkout, recreate those symlinks; `codex-shim app` launches
 `codex app` through the installed Python entry point and does not need them.
 
-Alternative on macOS/Linux/WSL/Git Bash (no install, run straight from the
-checkout):
+Alternative on macOS/Linux/WSL/Git Bash (no global install, run from the
+checkout via uv):
 
 ```bash
 git clone https://github.com/0xSero/codex-shim ~/codex-shim
 cd ~/codex-shim
-python3 -m pip install --user aiohttp
-mkdir -p ~/.local/bin
-ln -sf "$PWD/bin/codex-shim" ~/.local/bin/codex-shim
-ln -sf "$PWD/bin/codex-app" ~/.local/bin/codex-app
-ln -sf "$PWD/bin/codex-model" ~/.local/bin/codex-model
+uv sync
+uv run codex-shim generate
 ```
 
 For running the test suite:
 
 ```bash
-python3 -m pip install --user -e ".[dev]"
+uv sync --extra dev
+uv run pytest tests/ -q
 ```
-
-On Arch Linux, add `--break-system-packages` as with the main install above.
 
 If your POSIX shell cannot find the commands, make sure `~/.local/bin` is on
 `PATH`:
@@ -159,7 +158,7 @@ Use one of these setups:
 
 | Setup | Status | Notes |
 |---|---|---|
-| Native Windows PowerShell/cmd | Supported | Install with `py -3.11 -m pip install --user -e .` and run `codex-shim ...`. |
+| Native Windows PowerShell/cmd | Supported | Install with `uv sync` and `uv tool install -e .`, then run `codex-shim ...`. |
 | WSL | Supported | Works like Linux. Best when Codex CLI/Desktop is also being driven from WSL. |
 | Git Bash | Supported | Works with the POSIX `bin/` wrappers if Python/Codex are on `PATH`. |
 | `bin/codex-app`, `bin/codex-model` in PowerShell/cmd | Not native | These are shell scripts. Use `codex-shim app ...` and `codex-shim model ...` instead. |
@@ -168,7 +167,8 @@ Use one of these setups:
 Native Windows quick check:
 
 ```powershell
-py -3.11 -m pip install --user -e .
+uv sync
+uv tool install -e .
 codex-shim generate
 codex-shim start
 codex-shim status

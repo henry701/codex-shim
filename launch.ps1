@@ -34,7 +34,7 @@ function Get-ShimCommand {
     if ($python) { return [PSCustomObject]@{ File = $python.Source; Args = @("-m", "codex_shim.cli") } }
     $installed = Get-Command "codex-shim" -ErrorAction SilentlyContinue
     if ($installed) { return [PSCustomObject]@{ File = $installed.Source; Args = @() } }
-    throw "Could not find Python or codex-shim on PATH. Install with: py -3.11 -m pip install --user -e ."
+    throw "Could not find Python or codex-shim on PATH. Install with: uv sync; uv tool install -e ."
 }
 
 $shimCommand = Get-ShimCommand

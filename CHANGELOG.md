@@ -7,6 +7,11 @@ and this project does not yet follow semantic versioning (pre-1.0).
 
 ## Unreleased
 
+### Changed
+
+- Package management and docs now use uv (`uv.lock`, `uv sync`, `uv tool install
+  -e .`, `uv run pytest`) instead of pip; CI uses `astral-sh/setup-uv`.
+
 ### Added
 
 - `codex_shim/tool_translate.py`: rewrite upstream MCP `function_call` items into
@@ -51,7 +56,7 @@ and this project does not yet follow semantic versioning (pre-1.0).
 - GitHub Actions CI (`.github/workflows/ci.yml`) running pytest and
   `compileall` on Python 3.11 and 3.12.
 - `[project.optional-dependencies] dev` in `pyproject.toml` so
-  `pip install -e ".[dev]"` pulls `pytest` and `pytest-asyncio` in one step.
+  `uv sync --extra dev` pulls `pytest` and `pytest-asyncio` in one step.
 - `CONTRIBUTING.md` documenting the dev loop, what kinds of PRs are useful,
   and what to include in bug reports.
 - `.github/ISSUE_TEMPLATE/` with structured bug and feature request templates.

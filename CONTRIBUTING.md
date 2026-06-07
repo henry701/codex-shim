@@ -4,13 +4,15 @@ Thanks for hacking on the shim. Issues and PRs welcome.
 
 ## Dev loop
 
+Install [uv](https://docs.astral.sh/uv/getting-started/installation/), then:
+
 ```bash
 git clone https://github.com/0xSero/codex-shim
 cd codex-shim
-python3 -m pip install -e ".[dev]"
+uv sync --extra dev
 
-python3 -m pytest tests/ -q
-python3 -m compileall codex_shim/ -q
+uv run pytest tests/ -q
+uv run python -m compileall codex_shim/ -q
 ```
 
 CI runs the same commands on Python 3.11 and 3.12 via
