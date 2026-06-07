@@ -18,10 +18,13 @@ from urllib.request import urlopen
 from . import router as router_module
 from .catalog import _toml_escape, codex_config_overrides, write_catalog, write_config
 from .cursor_passthrough import (
+    cursor_catalog_models,
     cursor_passthrough_available,
     cursor_passthrough_display_names,
+    cursor_upstream_model,
     is_cursor_passthrough_slug,
 )
+from .discover import discover_byok_models, discover_summary
 from .settings import (
     CHATGPT_MODEL_SLUG,
     DEFAULT_SETTINGS,
@@ -81,6 +84,15 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--port", type=int, default=DEFAULT_PORT)
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("generate")
+    discover_parser = sub.add_parser(
+        "discover",
+        help="List models that would be auto-discovered from provider CLIs/APIs.",
+    )
+    discover_parser.add_argument(
+        "--refresh",
+        action="store_true",
+        help="Bypass cached Cursor model listings.",
+    )
     sub.add_parser("list")
     sub.add_parser("start")
     sub.add_parser("enable")
@@ -108,6 +120,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "generate":
         generate(args.settings, args.port)
         return 0
+    if args.command == "discover":
+        return discover_models(args.settings, refresh=getattr(args, "refresh", False))
     if args.command == "list":
         return list_models(args.settings)
     if args.command in {"start", "enable"}:
@@ -155,6 +169,17 @@ def main(argv: list[str] | None = None) -> int:
     return 2
 
 
+def _load_settings_data(settings_path: Path) -> dict | None:
+    expanded = Path(settings_path).expanduser()
+    if not expanded.exists():
+        return None
+    try:
+        data = json.loads(expanded.read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
 def _load_models(settings_path: Path):
     expanded = Path(settings_path).expanduser()
     try:
@@ -185,12 +210,64 @@ def generate(settings_path: Path, port: int) -> None:
     router_config = router_module.load_router_config(Path(settings_path).expanduser())
     write_catalog(models, CATALOG_PATH, router_config=router_config)
     write_config(models, CONFIG_PATH, CATALOG_PATH, port)
-    print(f"Generated {len(models)} model entries:")
+    discovered_count = sum(1 for model in models if model.raw.get("discovered"))
+    print(f"Generated {len(models)} model entries ({discovered_count} auto-discovered):")
     if _active_router(models, settings_path) is not None:
         print(f"  auto router: {router_config.slug} ({router_config.display_name})")
     print(f"  catalog: {CATALOG_PATH}")
     print(f"  config:  {CONFIG_PATH}")
     print("No files under ~/.codex were modified.")
+
+
+def discover_models(settings_path: Path, *, refresh: bool = False) -> int:
+    expanded = Path(settings_path).expanduser()
+    settings_data = _load_settings_data(expanded)
+    try:
+        explicit = ModelSettings(expanded).load_explicit() if expanded.exists() else []
+    except FileNotFoundError:
+        explicit = []
+    except json.JSONDecodeError as exc:
+        raise SystemExit(f"Settings file is not valid JSON: {expanded}: {exc}") from exc
+
+    if refresh and cursor_passthrough_available():
+        cursor_catalog_models(force_refresh=True)
+
+    rows = discover_summary(explicit, settings_data=settings_data)
+    if cursor_passthrough_available():
+        for model in cursor_catalog_models(force_refresh=refresh):
+            rows.append(
+                {
+                    "slug": model.catalog_slug,
+                    "model": model.upstream_id,
+                    "display_name": model.display_name,
+                    "description": f"{model.display_name} via Cursor subscription.",
+                    "kind": "cursor",
+                }
+            )
+    if chatgpt_passthrough_available():
+        for slug, display_name in chatgpt_passthrough_display_names().items():
+            rows.append(
+                {
+                    "slug": slug,
+                    "model": slug,
+                    "display_name": display_name,
+                    "description": f"{display_name} via ChatGPT passthrough.",
+                    "kind": "chatgpt",
+                }
+            )
+
+    if not rows:
+        print("No discoverable models. Add provider templates to ~/.codex-shim/models.json.")
+        return 1
+
+    width = max(len(row["slug"]) for row in rows)
+    for row in sorted(rows, key=lambda item: (item["kind"], item["slug"])):
+        print(
+            f"{row['slug']:<{width}}  [{row['kind']}]  {row['display_name']}  ->  {row['model']}",
+            flush=True,
+        )
+    print(f"\n{len(rows)} discoverable models.")
+    return 0
 
 
 def install_codex_config(settings_path: Path, port: int, model_slug: str | None = None) -> None:
@@ -246,8 +323,8 @@ def list_models(settings_path: Path) -> int:
         for slug, display_name in chatgpt_passthrough_display_names().items():
             rows.append((slug, display_name, slug, "chatgpt"))
     if cursor_passthrough_available():
-        for slug, display_name in cursor_passthrough_display_names().items():
-            rows.append((slug, display_name, "composer-2.5", "cursor-subscription"))
+        for model in cursor_catalog_models():
+            rows.append((model.catalog_slug, model.display_name, model.upstream_id, "cursor-subscription"))
     rows.extend((model.slug, model.display_name, model.model, model.provider) for model in usable_byok_models(models))
     for model in models:
         if model not in usable_byok_models(models):
@@ -1064,7 +1141,12 @@ def _resolve_model_slug(models, requested: str | None, router_config=None) -> st
                 "Composer passthrough requires Cursor CLI login. "
                 "Run `cursor-agent login`, then `cursor-agent status`."
             )
-        return requested if requested in cursor_passthrough_display_names() else "composer-2-5"
+        if requested in cursor_passthrough_display_names():
+            return requested
+        for model in cursor_catalog_models():
+            if requested in {model.catalog_slug, model.upstream_id}:
+                return model.catalog_slug
+        return cursor_upstream_model(requested)
     by_slug = {model.slug: model.slug for model in models}
     by_model: dict[str, list[str]] = {}
     for model in models:

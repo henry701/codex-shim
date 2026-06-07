@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import Any
 
 from . import router as router_module
 from .settings import (
@@ -14,7 +15,7 @@ from .settings import (
     load_chatgpt_passthrough_catalog_models,
     usable_byok_models,
 )
-from .cursor_passthrough import cursor_catalog_entry, cursor_passthrough_available
+from .cursor_passthrough import cursor_passthrough_available, cursor_passthrough_entries
 
 
 PLAN_TIERS = ["free", "plus", "pro", "team", "business", "enterprise"]
@@ -115,9 +116,10 @@ def write_catalog(models: list[ShimModel], path: Path, router_config=None) -> Pa
     if chatgpt_passthrough_available():
         entries.extend(chatgpt_passthrough_entries())
     if cursor_passthrough_available():
-        entry = cursor_catalog_entry()
-        entry["isDefault"] = not chatgpt_passthrough_available()
-        entries.append(entry)
+        cursor_entries = cursor_passthrough_entries()
+        if cursor_entries and not chatgpt_passthrough_available():
+            cursor_entries[0]["isDefault"] = True
+        entries.extend(cursor_entries)
     entries.extend(catalog_entry(model) for model in usable_byok_models(models))
     payload = {"models": entries}
     path.write_text(json.dumps(payload, indent=2, sort_keys=False) + "\n")

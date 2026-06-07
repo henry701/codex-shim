@@ -4,16 +4,32 @@ import json
 
 from codex_shim.cursor_passthrough import (
     CursorStreamParser,
+    _parse_cursor_list_models_output,
     build_cursor_prompt,
+    cursor_upstream_model,
     is_cursor_passthrough_slug,
     iter_cursor_agent_events,
 )
 
 
-def test_is_cursor_passthrough_slug():
+def test_parse_cursor_list_models_output():
+    models = _parse_cursor_list_models_output(
+        "auto - Auto\ncomposer-2.5 - Composer 2.5\ngpt-5.3-codex - Codex 5.3\n"
+    )
+    assert models["composer-2-5"].upstream_id == "composer-2.5"
+    assert models["composer-2-5"].display_name == "Composer 2.5"
+    assert models["gpt-5-3-codex"].upstream_id == "gpt-5.3-codex"
+
+
+def test_is_cursor_passthrough_slug(monkeypatch):
+    monkeypatch.setattr(
+        "codex_shim.cursor_passthrough._load_cursor_catalog_models",
+        lambda **_: _parse_cursor_list_models_output("composer-2.5 - Composer 2.5\n"),
+    )
     assert is_cursor_passthrough_slug("composer-2-5")
     assert is_cursor_passthrough_slug("composer-2.5")
     assert not is_cursor_passthrough_slug("gpt-5.5")
+    assert cursor_upstream_model("composer-2-5") == "composer-2.5"
 
 
 def test_build_cursor_prompt_from_responses_body():

@@ -3,20 +3,33 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import shutil
 import subprocess
 import time
 from collections.abc import AsyncIterator
+from dataclasses import dataclass
 from typing import Any
 
+from .naming import description_for_route, display_name_from_slug
+from .settings import slugify
 from .translate import responses_to_chat, strip_think
 
 CURSOR_MODEL_SLUG = "composer-2-5"
 CURSOR_UPSTREAM_MODEL = "composer-2.5"
 CURSOR_DISPLAY_NAME = "Composer 2.5"
-CURSOR_PASSTHROUGH_SLUGS = frozenset({CURSOR_MODEL_SLUG, "composer-2.5"})
+_LIST_MODELS_RE = re.compile(r"^(\S+)\s+-\s+(.+)$")
 _AUTH_PROBE_TTL_SEC = 30.0
+_MODELS_CACHE_TTL_SEC = 300.0
 _auth_probe_cache: tuple[float, bool] | None = None
+_models_cache: tuple[float, dict[str, "CursorCatalogModel"]] | None = None
+
+
+@dataclass(frozen=True)
+class CursorCatalogModel:
+    catalog_slug: str
+    upstream_id: str
+    display_name: str
 
 
 def cursor_spawn_env() -> dict[str, str]:
@@ -92,12 +105,81 @@ def cursor_passthrough_available(*, force_refresh: bool = False) -> bool:
     return available
 
 
+def _fallback_cursor_models() -> dict[str, CursorCatalogModel]:
+    return {
+        CURSOR_MODEL_SLUG: CursorCatalogModel(
+            catalog_slug=CURSOR_MODEL_SLUG,
+            upstream_id=CURSOR_UPSTREAM_MODEL,
+            display_name=CURSOR_DISPLAY_NAME,
+        )
+    }
+
+
+def _parse_cursor_list_models_output(output: str) -> dict[str, CursorCatalogModel]:
+    models: dict[str, CursorCatalogModel] = {}
+    for line in output.splitlines():
+        match = _LIST_MODELS_RE.match(line.strip())
+        if not match:
+            continue
+        upstream_id, display_name = match.group(1).strip(), match.group(2).strip()
+        if not upstream_id or upstream_id.lower() == "auto":
+            continue
+        catalog_slug = slugify(upstream_id)
+        models[catalog_slug] = CursorCatalogModel(
+            catalog_slug=catalog_slug,
+            upstream_id=upstream_id,
+            display_name=display_name,
+        )
+        models[upstream_id] = models[catalog_slug]
+    return models or _fallback_cursor_models()
+
+
+def _load_cursor_catalog_models(*, force_refresh: bool = False) -> dict[str, CursorCatalogModel]:
+    global _models_cache
+    now = time.monotonic()
+    if not force_refresh and _models_cache is not None:
+        cached_at, cached = _models_cache
+        if now - cached_at < _MODELS_CACHE_TTL_SEC:
+            return cached
+    if not shutil.which(_cursor_agent_bin()) and not os.environ.get("CURSOR_AGENT_BIN"):
+        models = _fallback_cursor_models()
+        _models_cache = (now, models)
+        return models
+    try:
+        result = subprocess.run(
+            [_cursor_agent_bin(), "--list-models"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            env=cursor_spawn_env(),
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        models = _fallback_cursor_models()
+        _models_cache = (now, models)
+        return models
+    output = f"{result.stdout}\n{result.stderr}"
+    models = _parse_cursor_list_models_output(output)
+    _models_cache = (now, models)
+    return models
+
+
+def cursor_catalog_models(*, force_refresh: bool = False) -> list[CursorCatalogModel]:
+    by_slug: dict[str, CursorCatalogModel] = {}
+    for model in _load_cursor_catalog_models(force_refresh=force_refresh).values():
+        by_slug[model.catalog_slug] = model
+    return sorted(by_slug.values(), key=lambda item: item.display_name.lower())
+
+
 def is_cursor_passthrough_slug(slug: str) -> bool:
-    return slug in CURSOR_PASSTHROUGH_SLUGS
+    return slug in _load_cursor_catalog_models()
 
 
-def cursor_upstream_model(_slug: str) -> str:
-    return CURSOR_UPSTREAM_MODEL
+def cursor_upstream_model(slug: str) -> str:
+    model = _load_cursor_catalog_models().get(slug)
+    if model is not None:
+        return model.upstream_id
+    return slug.replace("-", ".")
 
 
 def cursor_workspace() -> str:
@@ -106,14 +188,18 @@ def cursor_workspace() -> str:
 
 
 def cursor_passthrough_display_names() -> dict[str, str]:
-    return {CURSOR_MODEL_SLUG: CURSOR_DISPLAY_NAME}
+    return {model.catalog_slug: model.display_name for model in cursor_catalog_models()}
 
 
-def cursor_catalog_entry() -> dict[str, Any]:
+def cursor_catalog_entry(model: CursorCatalogModel, *, priority: int = 11_000) -> dict[str, Any]:
+    display_name = model.display_name
     return {
-        "slug": CURSOR_MODEL_SLUG,
-        "display_name": CURSOR_DISPLAY_NAME,
-        "description": "Cursor Composer 2.5 routed through your Cursor subscription (cursor-agent login).",
+        "slug": model.catalog_slug,
+        "display_name": display_name,
+        "description": description_for_route(
+            display_name,
+            "routed through your Cursor subscription (cursor-agent login)",
+        ),
         "context_window": 272_000,
         "max_context_window": 272_000,
         "auto_compact_token_limit": 217_600,
@@ -142,15 +228,25 @@ def cursor_catalog_entry() -> dict[str, Any]:
         "supported_in_api": True,
         "availability_nux": None,
         "upgrade": None,
-        "priority": 11000,
+        "priority": priority,
         "prefer_websockets": False,
         "available_in_plans": ["free", "plus", "pro", "team", "business", "enterprise"],
-        "base_instructions": "You are Codex, a coding agent powered by Composer 2.5.",
+        "base_instructions": f"You are Codex, a coding agent powered by {display_name}.",
         "model_messages": {
-            "instructions_template": "You are Codex, a coding agent powered by Composer 2.5.",
-            "instructions_variables": {"model_name": CURSOR_DISPLAY_NAME},
+            "instructions_template": f"You are Codex, a coding agent powered by {display_name}.",
+            "instructions_variables": {"model_name": display_name},
         },
     }
+
+
+def cursor_passthrough_entries() -> list[dict[str, Any]]:
+    models = cursor_catalog_models()
+    if not models:
+        return [cursor_catalog_entry(_fallback_cursor_models()[CURSOR_MODEL_SLUG])]
+    return [
+        cursor_catalog_entry(model, priority=11_000 + index)
+        for index, model in enumerate(models)
+    ]
 
 
 def build_cursor_prompt(body: dict[str, Any]) -> str:

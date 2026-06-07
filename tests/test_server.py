@@ -1439,6 +1439,8 @@ async def test_health_and_models_hide_chatgpt_passthrough_when_auth_missing(tmp_
 
 @pytest.fixture
 def cursor_present(monkeypatch):
+    from codex_shim.cursor_passthrough import CursorCatalogModel, _fallback_cursor_models
+
     def _on(**_kwargs):
         return True
 
@@ -1449,6 +1451,10 @@ def cursor_present(monkeypatch):
         "codex_shim.cli.cursor_passthrough_available",
     ):
         monkeypatch.setattr(target, _on)
+    monkeypatch.setattr(
+        "codex_shim.cursor_passthrough._load_cursor_catalog_models",
+        lambda **_: _fallback_cursor_models(),
+    )
 
 
 @pytest.fixture

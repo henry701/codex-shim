@@ -118,19 +118,43 @@ def _minimal_chatgpt_passthrough_entry(slug: str, display_name: str) -> dict[str
     }
 
 
-def load_chatgpt_passthrough_catalog_models(cache_path: Path | None = None) -> list[dict[str, Any]]:
+def _load_chatgpt_cache_catalog_models(cache_path: Path | None = None) -> list[dict[str, Any]]:
     path = Path(cache_path or DEFAULT_CODEX_MODELS_CACHE).expanduser()
-    if path.exists():
-        try:
-            data = json.loads(path.read_text())
-        except (OSError, json.JSONDecodeError):
-            data = None
-        if isinstance(data, dict):
-            models = data.get("models")
-            if isinstance(models, list):
-                entries = [dict(model) for model in models if isinstance(model, dict) and _is_listed_gpt_model(model)]
-                if entries:
-                    return entries
+    if not path.exists():
+        return []
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return []
+    if not isinstance(data, dict):
+        return []
+    models = data.get("models")
+    if not isinstance(models, list):
+        return []
+    return [dict(model) for model in models if isinstance(model, dict) and _is_listed_gpt_model(model)]
+
+
+def load_chatgpt_passthrough_catalog_models(cache_path: Path | None = None) -> list[dict[str, Any]]:
+    from .discover import discover_chatgpt_model_ids_from_openai_api, discover_chatgpt_models_from_cursor
+    from .naming import display_name_from_slug
+
+    by_slug: dict[str, dict[str, Any]] = {}
+    for upstream, display_name in discover_chatgpt_models_from_cursor():
+        by_slug[upstream] = _minimal_chatgpt_passthrough_entry(upstream, display_name)
+    for upstream in discover_chatgpt_model_ids_from_openai_api():
+        by_slug.setdefault(
+            upstream,
+            _minimal_chatgpt_passthrough_entry(
+                upstream,
+                FALLBACK_CHATGPT_DISPLAY_NAMES.get(upstream, display_name_from_slug(upstream)),
+            ),
+        )
+    for entry in _load_chatgpt_cache_catalog_models(cache_path):
+        slug = str(entry.get("slug") or "").strip()
+        if slug:
+            by_slug[slug] = entry
+    if by_slug:
+        return list(by_slug.values())
     return [
         _minimal_chatgpt_passthrough_entry(
             slug,
@@ -200,12 +224,29 @@ class ModelSettings:
     def __init__(self, path: Path | None = None):
         self.path = Path(path or DEFAULT_SETTINGS).expanduser()
 
-    def load(self) -> list[ShimModel]:
+    def load_explicit(self) -> list[ShimModel]:
         if not self.path.exists():
             if self.path == DEFAULT_SETTINGS:
                 return []
             raise FileNotFoundError(self.path)
         data = json.loads(self.path.read_text())
+        return self._models_from_settings_data(data)
+
+    def load(self) -> list[ShimModel]:
+        if not self.path.exists():
+            if self.path == DEFAULT_SETTINGS:
+                from .discover import discover_byok_models
+
+                return discover_byok_models([], settings_data=None)
+            raise FileNotFoundError(self.path)
+        data = json.loads(self.path.read_text())
+        explicit = self._models_from_settings_data(data)
+        from .discover import discover_byok_models
+
+        settings_data = data if isinstance(data, dict) else None
+        return discover_byok_models(explicit, settings_data=settings_data)
+
+    def _models_from_settings_data(self, data: Any) -> list[ShimModel]:
         rows = _model_rows(data)
         model_counts: dict[str, int] = {}
         for row in rows:

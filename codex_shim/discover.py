@@ -1,0 +1,591 @@
+from __future__ import annotations
+
+from dataclasses import dataclass, replace
+import ipaddress
+import json
+import os
+import re
+import shutil
+import subprocess
+from typing import Any
+from urllib.error import URLError
+from urllib.parse import urlparse
+from urllib.request import Request, urlopen
+
+from .naming import description_for_route, display_name_from_slug
+from .settings import ShimModel, slugify
+
+ZEN_MODELS_URL = "https://opencode.ai/zen/v1/models"
+OPENAI_MODELS_URL = "https://api.openai.com/v1/models"
+DISCOVER_INDEX_BASE = 10_000
+
+_NVIDIA_SKIP_RE = re.compile(
+    r"(embed|embedding|rerank|bge-|flux|dracarys|image|schnell|kontext|esm|paligemma|vision)",
+    re.IGNORECASE,
+)
+_OPENROUTER_FREE_SUFFIX = ":free"
+_OPENROUTER_FREE_ROUTER = "openrouter/free"
+_CHATGPT_MODEL_RE = re.compile(r"^(gpt-|codex-|o\d)", re.IGNORECASE)
+_ZEN_PUBLIC_IDS = frozenset(
+    {
+        "big-pickle",
+        "minimax-m2.5",
+        "minimax-m2.7",
+    }
+)
+
+
+@dataclass(frozen=True)
+class DiscoverTemplate:
+    kind: str
+    base_url: str
+    provider: str
+    slug_prefix: str
+    api_key: str
+    extra_headers: dict[str, str]
+    label_prefix: str | None = None
+
+
+@dataclass(frozen=True)
+class LocalModelRecord:
+    model_id: str
+    max_context_limit: int | None = None
+
+
+ZEN_PUBLIC_TEMPLATE = DiscoverTemplate(
+    kind="zen_public",
+    base_url="https://opencode.ai/zen/v1",
+    provider="generic-chat-completion-api",
+    slug_prefix="zen",
+    api_key="public",
+    extra_headers={},
+    label_prefix="zen",
+)
+
+OPENROUTER_FREE_TEMPLATE = DiscoverTemplate(
+    kind="openrouter_free",
+    base_url="https://openrouter.ai/api/v1",
+    provider="generic-chat-completion-api",
+    slug_prefix="or",
+    api_key="${OPENROUTER_API_KEY}",
+    extra_headers={
+        "HTTP-Referer": "https://opencode.ai/",
+        "X-Title": "codex-shim",
+    },
+    label_prefix="or",
+)
+
+NVIDIA_INTEGRATE_TEMPLATE = DiscoverTemplate(
+    kind="nvidia_integrate",
+    base_url="https://integrate.api.nvidia.com/v1",
+    provider="generic-chat-completion-api",
+    slug_prefix="nvidia",
+    api_key="${NVIDIA_API_KEY}",
+    extra_headers={
+        "HTTP-Referer": "https://opencode.ai/",
+        "X-Title": "codex-shim",
+        "X-BILLING-INVOKE-ORIGIN": "OpenCode",
+    },
+    label_prefix="nvidia",
+)
+
+_BUILTIN_TEMPLATES: dict[str, DiscoverTemplate] = {
+    "zen_public": ZEN_PUBLIC_TEMPLATE,
+    "openrouter_free": OPENROUTER_FREE_TEMPLATE,
+    "nvidia_integrate": NVIDIA_INTEGRATE_TEMPLATE,
+}
+
+
+def discover_enabled(settings_data: dict[str, Any] | None, kind: str, *, has_template: bool) -> bool:
+    if not has_template and kind not in _BUILTIN_TEMPLATES:
+        return False
+    if not isinstance(settings_data, dict):
+        return True
+    discover = settings_data.get("discover")
+    if discover is None:
+        return True
+    if isinstance(discover, bool):
+        return discover
+    if isinstance(discover, dict):
+        aliases = {
+            "zen_public": ("zen_public", "zen"),
+            "openrouter_free": ("openrouter_free", "openrouter"),
+            "nvidia_integrate": ("nvidia_integrate", "nvidia"),
+        }
+        keys = aliases.get(kind, (kind,))
+        value = next((discover.get(key) for key in keys if key in discover), None)
+        if value is None:
+            return True
+        return bool(value)
+    return True
+
+
+def is_zen_public_model(model_id: str) -> bool:
+    lower = model_id.lower()
+    return lower in _ZEN_PUBLIC_IDS or lower.endswith("-free")
+
+
+def is_local_base_url(base_url: str) -> bool:
+    host = (urlparse(base_url).hostname or "").strip().lower()
+    if not host:
+        return False
+    if host in {"localhost", "127.0.0.1", "::1"}:
+        return True
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    return ip.is_private or ip.is_loopback
+
+
+def infer_discover_templates(models: list[ShimModel]) -> list[DiscoverTemplate]:
+    templates: dict[tuple[str, str], DiscoverTemplate] = {}
+    for model in models:
+        base_url = model.base_url.rstrip("/")
+        lower = base_url.lower()
+        kind: str | None = None
+        slug_prefix = ""
+        label_prefix: str | None = None
+        if "opencode.ai/zen" in lower:
+            if model.api_key.strip() in {"", "public"}:
+                continue
+            kind = "zen"
+            slug_prefix = _infer_slug_prefix(model.slug, default="zen")
+            label_prefix = "zen"
+        elif "openrouter.ai" in lower:
+            continue
+        elif "integrate.api.nvidia.com" in lower:
+            continue
+        if kind is None:
+            continue
+        key = (kind, base_url)
+        if key in templates:
+            continue
+        templates[key] = DiscoverTemplate(
+            kind=kind,
+            base_url=base_url,
+            provider=model.provider,
+            slug_prefix=slug_prefix,
+            api_key=model.api_key,
+            extra_headers=dict(model.extra_headers),
+            label_prefix=label_prefix,
+        )
+    return list(templates.values())
+
+
+def discover_byok_models(
+    explicit_models: list[ShimModel],
+    *,
+    settings_data: dict[str, Any] | None = None,
+) -> list[ShimModel]:
+    """Return explicit models plus auto-discovered entries from provider listings."""
+    explicit_models = refresh_local_explicit_models(explicit_models, settings_data=settings_data)
+    templates: list[DiscoverTemplate] = []
+    for kind, builtin in _BUILTIN_TEMPLATES.items():
+        if discover_enabled(settings_data, kind, has_template=True):
+            templates.append(_enrich_builtin_template(builtin, explicit_models))
+    templates.extend(infer_discover_templates(explicit_models))
+
+    discovered: list[ShimModel] = []
+    for template in templates:
+        if not discover_enabled(settings_data, template.kind, has_template=True):
+            continue
+        if not _template_has_credentials(template):
+            continue
+        rows = _discover_rows_for_template(template)
+        discovered.extend(_rows_to_shim_models(rows, template))
+    return merge_discovered_models(explicit_models, discovered)
+
+
+def refresh_local_explicit_models(
+    explicit_models: list[ShimModel],
+    *,
+    settings_data: dict[str, Any] | None = None,
+) -> list[ShimModel]:
+    refreshed: list[ShimModel] = []
+    for model in explicit_models:
+        if not _should_refresh_local_model(model, settings_data):
+            refreshed.append(model)
+            continue
+        records = fetch_local_openai_models(model.base_url, model.api_key)
+        if not records:
+            refreshed.append(model)
+            continue
+        if len(records) == 1:
+            record = records[0]
+            refreshed.append(
+                replace(
+                    model,
+                    model=record.model_id,
+                    display_name=_local_display_name(record.model_id),
+                    max_context_limit=record.max_context_limit or model.max_context_limit,
+                    raw={**model.raw, "discovered_local": True},
+                )
+            )
+            continue
+        slug_prefix = model.slug or "local"
+        for offset, record in enumerate(records):
+            slug = slug_prefix if offset == 0 else f"{slug_prefix}-{slugify(record.model_id)}"
+            refreshed.append(
+                ShimModel(
+                    slug=slug,
+                    model=record.model_id,
+                    display_name=_local_display_name(record.model_id),
+                    provider=model.provider,
+                    base_url=model.base_url,
+                    api_key=model.api_key,
+                    index=model.index + offset,
+                    max_context_limit=record.max_context_limit or model.max_context_limit,
+                    max_output_tokens=model.max_output_tokens,
+                    no_image_support=model.no_image_support,
+                    supports_reasoning_summaries=model.supports_reasoning_summaries,
+                    extra_headers=dict(model.extra_headers),
+                    raw={**model.raw, "discovered_local": True},
+                )
+            )
+    return refreshed
+
+
+def _should_refresh_local_model(model: ShimModel, settings_data: dict[str, Any] | None) -> bool:
+    row = model.raw if isinstance(model.raw, dict) else {}
+    discover_flag = row.get("discover")
+    if discover_flag is False:
+        return False
+    if discover_flag in {True, "local", "true"}:
+        return True
+    if discover_enabled(settings_data, "local", has_template=True) and is_local_base_url(model.base_url):
+        return True
+    return False
+
+
+def _local_display_name(model_id: str) -> str:
+    body = model_id.removesuffix(".gguf")
+    return display_name_from_slug(slugify(body), label_prefix="local")
+
+
+def merge_discovered_models(explicit: list[ShimModel], discovered: list[ShimModel]) -> list[ShimModel]:
+    explicit_models = {model.model for model in explicit}
+    explicit_slugs = {model.slug for model in explicit}
+    merged = list(explicit)
+    next_index = max((model.index for model in explicit), default=-1) + 1
+    for model in discovered:
+        if model.model in explicit_models or model.slug in explicit_slugs:
+            continue
+        merged.append(
+            ShimModel(
+                slug=model.slug,
+                model=model.model,
+                display_name=model.display_name,
+                provider=model.provider,
+                base_url=model.base_url,
+                api_key=model.api_key,
+                index=next_index,
+                max_context_limit=model.max_context_limit,
+                max_output_tokens=model.max_output_tokens,
+                no_image_support=model.no_image_support,
+                supports_reasoning_summaries=model.supports_reasoning_summaries,
+                extra_headers=model.extra_headers,
+                raw={"discovered": True, **model.raw},
+            )
+        )
+        explicit_models.add(model.model)
+        explicit_slugs.add(model.slug)
+        next_index += 1
+    return merged
+
+
+def fetch_http_json(url: str, *, headers: dict[str, str] | None = None, timeout: float = 20.0) -> Any:
+    merged = {
+        "User-Agent": "codex-shim/1.0 (+https://github.com/henry701/codex-shim)",
+        "Accept": "application/json",
+    }
+    if headers:
+        merged.update(headers)
+    request = Request(url, headers=merged)
+    with urlopen(request, timeout=timeout) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
+def _parse_openai_model_list(payload: Any) -> list[str]:
+    if not isinstance(payload, dict):
+        return []
+    rows = payload.get("data")
+    if not isinstance(rows, list):
+        return []
+    ids: list[str] = []
+    for row in rows:
+        if isinstance(row, dict) and row.get("id"):
+            ids.append(str(row["id"]).strip())
+    return ids
+
+
+def fetch_zen_model_ids() -> list[str]:
+    try:
+        return _parse_openai_model_list(fetch_http_json(ZEN_MODELS_URL))
+    except (OSError, URLError, json.JSONDecodeError, ValueError):
+        return discover_opencode_cli_ids("opencode")
+
+
+def fetch_zen_public_model_ids() -> list[str]:
+    discovered: set[str] = set()
+    for model_id in fetch_zen_model_ids():
+        if is_zen_public_model(model_id):
+            discovered.add(model_id)
+    for model_id in discover_opencode_cli_ids("opencode"):
+        discovered.add(model_id)
+    return sorted(discovered)
+
+
+def is_openrouter_free_model(model_id: str) -> bool:
+    lower = model_id.lower()
+    return lower == _OPENROUTER_FREE_ROUTER or lower.endswith(_OPENROUTER_FREE_SUFFIX)
+
+
+def fetch_openrouter_free_model_ids() -> list[str]:
+    ids = discover_opencode_cli_ids("openrouter")
+    free = [model_id for model_id in ids if is_openrouter_free_model(model_id)]
+    if free:
+        return sorted(set(free))
+    return [_OPENROUTER_FREE_ROUTER]
+
+
+def fetch_nvidia_integrate_model_ids() -> list[str]:
+    ids = discover_opencode_cli_ids("nvidia")
+    return sorted(
+        {model_id for model_id in ids if model_id and not _NVIDIA_SKIP_RE.search(model_id)}
+    )
+
+
+def fetch_local_openai_models(base_url: str, api_key: str) -> list[LocalModelRecord]:
+    url = f"{base_url.rstrip('/')}/models"
+    headers: dict[str, str] = {}
+    token = api_key.strip()
+    if token and token not in {"local", "ollama"}:
+        headers["Authorization"] = f"Bearer {token}"
+    try:
+        payload = fetch_http_json(url, headers=headers, timeout=5.0)
+    except (OSError, URLError, json.JSONDecodeError, ValueError):
+        return []
+    if not isinstance(payload, dict):
+        return []
+    rows = payload.get("data")
+    if not isinstance(rows, list):
+        return []
+    records: list[LocalModelRecord] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        model_id = str(row.get("id") or "").strip()
+        if not model_id:
+            continue
+        records.append(LocalModelRecord(model_id=model_id, max_context_limit=_context_from_model_row(row)))
+    return records
+
+
+def discover_chatgpt_model_ids_from_openai_api() -> list[str]:
+    api_key = os.environ.get("OPENAI_API_KEY", "").strip()
+    if not api_key:
+        return []
+    try:
+        ids = _parse_openai_model_list(
+            fetch_http_json(OPENAI_MODELS_URL, headers={"Authorization": f"Bearer {api_key}"})
+        )
+    except (OSError, URLError, json.JSONDecodeError, ValueError):
+        return []
+    return [model_id for model_id in ids if _CHATGPT_MODEL_RE.match(model_id)]
+
+
+def discover_chatgpt_models_from_cursor() -> list[tuple[str, str]]:
+    from .cursor_passthrough import _cursor_agent_bin, _parse_cursor_list_models_output, cursor_spawn_env
+
+    if not shutil.which(_cursor_agent_bin()) and not os.environ.get("CURSOR_AGENT_BIN"):
+        return []
+    try:
+        result = subprocess.run(
+            [_cursor_agent_bin(), "--list-models"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            env=cursor_spawn_env(),
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    output = f"{result.stdout}\n{result.stderr}"
+    models = _parse_cursor_list_models_output(output)
+    rows: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for model in models.values():
+        upstream = model.upstream_id
+        if not _CHATGPT_MODEL_RE.match(upstream):
+            continue
+        if upstream in seen:
+            continue
+        seen.add(upstream)
+        rows.append((upstream, model.display_name))
+    return sorted(rows, key=lambda item: item[0])
+
+
+def list_opencode_cli_models() -> list[str]:
+    binary = shutil.which("opencode")
+    if not binary:
+        return []
+    try:
+        result = subprocess.run(
+            [binary, "models"],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    output = result.stdout or ""
+    if result.returncode != 0:
+        output = f"{result.stdout}\n{result.stderr}"
+    return [line.strip() for line in output.splitlines() if line.strip()]
+
+
+def discover_opencode_cli_ids(prefix: str) -> list[str]:
+    needle = f"{prefix.rstrip('/')}/"
+    return [line[len(needle) :] for line in list_opencode_cli_models() if line.startswith(needle)]
+
+
+def _discover_rows_for_template(template: DiscoverTemplate) -> list[str]:
+    if template.kind == "zen_public":
+        return fetch_zen_public_model_ids()
+    if template.kind == "zen":
+        ids = fetch_zen_model_ids() or discover_opencode_cli_ids("opencode")
+        public_ids = set(fetch_zen_public_model_ids())
+        return [model_id for model_id in ids if model_id not in public_ids]
+    if template.kind in {"openrouter", "openrouter_free"}:
+        return fetch_openrouter_free_model_ids()
+    if template.kind in {"nvidia", "nvidia_integrate"}:
+        return fetch_nvidia_integrate_model_ids()
+    return []
+
+
+def _rows_to_shim_models(model_ids: list[str], template: DiscoverTemplate) -> list[ShimModel]:
+    models: list[ShimModel] = []
+    used_slugs: set[str] = set()
+    for offset, model_id in enumerate(model_ids):
+        slug = _catalog_slug_for_model(model_id, template.slug_prefix, used_slugs, offset)
+        display_name = display_name_from_slug(slug, label_prefix=template.label_prefix)
+        models.append(
+            ShimModel(
+                slug=slug,
+                model=model_id,
+                display_name=display_name,
+                provider=template.provider,
+                base_url=template.base_url,
+                api_key=_resolved_api_key(_api_key_for_discovered_model(model_id, template)),
+                index=DISCOVER_INDEX_BASE + offset,
+                extra_headers=dict(template.extra_headers),
+                raw={"discovered": True, "discover_kind": template.kind},
+            )
+        )
+    return models
+
+
+def _catalog_slug_for_model(
+    model_id: str,
+    slug_prefix: str,
+    used_slugs: set[str],
+    offset: int,
+) -> str:
+    body = slugify(model_id.replace("/", "-").replace(":", "-"))
+    slug = f"{slug_prefix}-{body}" if slug_prefix else body
+    if slug in used_slugs:
+        slug = f"{slug}-{offset}"
+    used_slugs.add(slug)
+    return slug
+
+
+def _api_key_for_discovered_model(model_id: str, template: DiscoverTemplate) -> str:
+    if template.kind in {"zen", "zen_public"} and is_zen_public_model(model_id):
+        return "public"
+    return template.api_key
+
+
+def _resolved_api_key(api_key: str) -> str:
+    raw = api_key.strip()
+    if raw.startswith("${") and raw.endswith("}"):
+        return os.environ.get(raw[2:-1].strip(), "")
+    return raw
+
+
+def _enrich_builtin_template(template: DiscoverTemplate, explicit_models: list[ShimModel]) -> DiscoverTemplate:
+    needle = {
+        "openrouter_free": "openrouter.ai",
+        "nvidia_integrate": "integrate.api.nvidia.com",
+    }.get(template.kind, "")
+    if not needle:
+        return template
+    for model in explicit_models:
+        if needle not in model.base_url.lower():
+            continue
+        return DiscoverTemplate(
+            kind=template.kind,
+            base_url=template.base_url,
+            provider=template.provider,
+            slug_prefix=template.slug_prefix,
+            api_key=model.api_key or template.api_key,
+            extra_headers={**template.extra_headers, **model.extra_headers},
+            label_prefix=template.label_prefix,
+        )
+    return template
+
+
+def _template_has_credentials(template: DiscoverTemplate) -> bool:
+    if template.kind in {"zen", "zen_public", "openrouter_free", "nvidia_integrate"}:
+        return True
+    return bool(_resolved_api_key(template.api_key))
+
+
+def _context_from_model_row(row: dict[str, Any]) -> int | None:
+    for key in ("context_length", "max_context_length", "n_ctx"):
+        value = row.get(key)
+        if value not in (None, ""):
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                pass
+    meta = row.get("meta")
+    if isinstance(meta, dict):
+        for key in ("n_ctx_train", "n_ctx", "context_length"):
+            value = meta.get(key)
+            if value not in (None, ""):
+                try:
+                    return int(value)
+                except (TypeError, ValueError):
+                    pass
+    return None
+
+
+def _infer_slug_prefix(slug: str, *, default: str) -> str:
+    if "-" not in slug:
+        return default
+    prefix = slug.split("-", 1)[0]
+    return prefix or default
+
+
+def discover_summary(
+    explicit_models: list[ShimModel],
+    *,
+    settings_data: dict[str, Any] | None = None,
+) -> list[dict[str, str]]:
+    merged = discover_byok_models(explicit_models, settings_data=settings_data)
+    discovered = [model for model in merged if model.raw.get("discovered") or model.raw.get("discovered_local")]
+    rows: list[dict[str, str]] = []
+    for model in discovered:
+        kind = "local" if model.raw.get("discovered_local") else str(model.raw.get("discover_kind") or "byok")
+        rows.append(
+            {
+                "slug": model.slug,
+                "model": model.model,
+                "display_name": model.display_name,
+                "description": description_for_route(model.display_name, "via local Codex shim"),
+                "kind": kind,
+            }
+        )
+    return rows

@@ -41,3 +41,6 @@ codex-shim = "codex_shim.cli:_entrypoint"
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
+markers = [
+  "enable_model_discovery: allow live provider discovery during tests",
+]
