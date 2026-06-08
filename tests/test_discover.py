@@ -7,11 +7,13 @@ import pytest
 from codex_shim.discover import (
     LocalModelRecord,
     _parse_models_dev_opencode_free_ids,
+    _parse_models_dev_opencode_paid_ids,
     discover_byok_models,
     discover_enabled,
     fetch_nvidia_integrate_model_ids,
     fetch_openrouter_free_model_ids,
     fetch_zen_model_ids,
+    fetch_zen_paid_model_ids,
     fetch_zen_public_model_ids,
     is_openrouter_free_model,
     is_zen_public_model,
@@ -45,6 +47,7 @@ def test_discover_enabled_defaults_true():
     assert discover_enabled(None, "zen", has_template=True) is True
     assert discover_enabled({"discover": {"zen": False}}, "zen", has_template=True) is False
     assert discover_enabled({"discover": False}, "zen", has_template=True) is False
+    assert discover_enabled({"discover": {"zen_paid": False}}, "zen", has_template=True) is False
 
 
 def test_merge_discovered_models_keeps_explicit_entries():
@@ -77,6 +80,45 @@ def test_discover_byok_models_adds_zen_public_models(monkeypatch):
     assert "zen-kimi-k2-6" not in slugs
 
 
+def test_parse_models_dev_opencode_paid_ids_skips_free_and_deprecated():
+    payload = {
+        "opencode": {
+            "models": {
+                "big-pickle": {
+                    "id": "big-pickle",
+                    "status": "active",
+                    "cost": {"input": 0, "output": 0},
+                },
+                "kimi-k2.6": {
+                    "id": "kimi-k2.6",
+                    "status": "active",
+                    "cost": {"input": 0.3, "output": 1.2},
+                },
+                "minimax-m3": {
+                    "id": "minimax-m3",
+                    "status": "deprecated",
+                    "cost": {"input": 0.5, "output": 1.0},
+                },
+            }
+        }
+    }
+    assert _parse_models_dev_opencode_paid_ids(payload) == ["kimi-k2.6"]
+
+
+def test_fetch_zen_paid_model_ids_requires_api_key(monkeypatch):
+    monkeypatch.setattr(
+        "codex_shim.discover.fetch_models_dev_opencode_paid_model_ids",
+        lambda: ["kimi-k2.6"],
+    )
+    assert fetch_zen_paid_model_ids(api_key="") == ["kimi-k2.6"]
+    monkeypatch.setattr("codex_shim.discover.fetch_models_dev_opencode_paid_model_ids", lambda: [])
+    monkeypatch.setattr(
+        "codex_shim.discover.fetch_zen_model_ids",
+        lambda api_key="": ["kimi-k2.6"] if api_key else [],
+    )
+    assert fetch_zen_paid_model_ids(api_key="sk-test") == ["kimi-k2.6"]
+
+
 def test_parse_models_dev_opencode_free_ids_skips_deprecated_and_paid(monkeypatch):
     payload = {
         "opencode": {
@@ -106,7 +148,7 @@ def test_fetch_zen_public_model_ids_falls_back_to_opencode_cli(monkeypatch):
     monkeypatch.setattr("codex_shim.discover.fetch_models_dev_opencode_free_model_ids", lambda: [])
     monkeypatch.setattr(
         "codex_shim.discover.discover_opencode_cli_ids",
-        lambda prefix: ["big-pickle", "mimo-v2.5-free"] if prefix == "opencode" else [],
+        lambda prefix: ["big-pickle", "mimo-v2.5-free", "kimi-k2.6"] if prefix == "opencode" else [],
     )
     assert fetch_zen_public_model_ids() == ["big-pickle", "mimo-v2.5-free"]
 

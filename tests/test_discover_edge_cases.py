@@ -63,8 +63,60 @@ def test_discover_openrouter_alias_respects_openrouter_key(monkeypatch):
     assert not any(model.slug == "or-openrouter-free" for model in disabled)
 
 
-def test_paid_zen_is_not_auto_discovered(monkeypatch):
+def test_paid_zen_not_discovered_without_api_key(monkeypatch):
     monkeypatch.setattr("codex_shim.discover.fetch_models_dev_opencode_free_model_ids", lambda: [])
+    monkeypatch.setattr(
+        "codex_shim.discover.fetch_zen_paid_model_ids",
+        lambda api_key="": ["deepseek-v4-flash"] if api_key else [],
+    )
+    monkeypatch.setattr(
+        "codex_shim.discover.discover_opencode_cli_ids",
+        lambda prefix: ["big-pickle"] if prefix == "opencode" else [],
+    )
+    models = discover_byok_models([])
+    slugs = {model.slug for model in models}
+    assert "zen-deepseek-v4-flash" not in slugs
+    assert "oc-free-big-pickle" in slugs
+
+
+def test_paid_zen_discovered_from_opencode_api_key_env(monkeypatch):
+    monkeypatch.setenv("OPENCODE_API_KEY", "sk-opencode-env")
+    monkeypatch.setattr("codex_shim.discover.fetch_models_dev_opencode_free_model_ids", lambda: [])
+    monkeypatch.setattr("codex_shim.discover.discover_opencode_cli_ids", lambda prefix: [])
+    monkeypatch.setattr(
+        "codex_shim.discover.fetch_zen_paid_model_ids",
+        lambda api_key="": ["deepseek-v4-flash"] if api_key == "sk-opencode-env" else [],
+    )
+    models = discover_byok_models([])
+    slugs = {model.slug for model in models}
+    assert "zen-deepseek-v4-flash" in slugs
+    paid = next(model for model in models if model.slug == "zen-deepseek-v4-flash")
+    assert paid.api_key == "sk-opencode-env"
+
+
+def test_paid_zen_wins_over_oc_free_for_same_model_id(monkeypatch):
+    monkeypatch.setenv("OPENCODE_API_KEY", "sk-opencode-env")
+    monkeypatch.setattr(
+        "codex_shim.discover.fetch_models_dev_opencode_free_model_ids",
+        lambda: ["kimi-k2.6"],
+    )
+    monkeypatch.setattr(
+        "codex_shim.discover.fetch_zen_paid_model_ids",
+        lambda api_key="": ["kimi-k2.6"] if api_key else [],
+    )
+    monkeypatch.setattr("codex_shim.discover.discover_opencode_cli_ids", lambda prefix: [])
+    models = discover_byok_models([])
+    slugs = {model.slug for model in models}
+    assert "zen-kimi-k2-6" in slugs
+    assert "oc-free-kimi-k2-6" not in slugs
+
+
+def test_paid_zen_discovered_with_api_key(monkeypatch):
+    monkeypatch.setattr("codex_shim.discover.fetch_models_dev_opencode_free_model_ids", lambda: [])
+    monkeypatch.setattr(
+        "codex_shim.discover.fetch_zen_paid_model_ids",
+        lambda api_key="": ["kimi-k2.6", "deepseek-v4-flash"] if api_key else [],
+    )
     monkeypatch.setattr(
         "codex_shim.discover.discover_opencode_cli_ids",
         lambda prefix: ["big-pickle"] if prefix == "opencode" else [],
@@ -82,10 +134,13 @@ def test_paid_zen_is_not_auto_discovered(monkeypatch):
     models = discover_byok_models(explicit)
     slugs = {model.slug for model in models}
     assert "zen-kimi-k2-6" in slugs
-    assert "zen-deepseek-v4-flash" not in slugs
+    assert "zen-deepseek-v4-flash" in slugs
     assert "oc-free-minimax-m3-free" not in slugs
     assert "oc-free-big-pickle" in slugs
     assert sum(model.model == "kimi-k2.6" for model in models) == 1
+    paid = next(model for model in models if model.slug == "zen-deepseek-v4-flash")
+    assert paid.api_key == "sk-opencode-test"
+    assert paid.raw.get("discover_kind") == "zen"
 
 
 def test_local_refresh_keeps_explicit_when_endpoint_unreachable(monkeypatch):

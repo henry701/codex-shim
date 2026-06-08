@@ -58,6 +58,16 @@ ZEN_PUBLIC_TEMPLATE = DiscoverTemplate(
     label_prefix="oc-free",
 )
 
+ZEN_PAID_TEMPLATE = DiscoverTemplate(
+    kind="zen",
+    base_url="https://opencode.ai/zen/v1",
+    provider="generic-chat-completion-api",
+    slug_prefix="zen",
+    api_key="${OPENCODE_API_KEY}",
+    extra_headers={},
+    label_prefix="zen",
+)
+
 OPENROUTER_FREE_TEMPLATE = DiscoverTemplate(
     kind="openrouter_free",
     base_url="https://openrouter.ai/api/v1",
@@ -87,9 +97,12 @@ NVIDIA_INTEGRATE_TEMPLATE = DiscoverTemplate(
 
 _BUILTIN_TEMPLATES: dict[str, DiscoverTemplate] = {
     "zen_public": ZEN_PUBLIC_TEMPLATE,
+    "zen": ZEN_PAID_TEMPLATE,
     "openrouter_free": OPENROUTER_FREE_TEMPLATE,
     "nvidia_integrate": NVIDIA_INTEGRATE_TEMPLATE,
 }
+
+_BUILTIN_TEMPLATE_ORDER = ("zen", "zen_public", "openrouter_free", "nvidia_integrate")
 
 
 def discover_enabled(settings_data: dict[str, Any] | None, kind: str, *, has_template: bool) -> bool:
@@ -105,6 +118,7 @@ def discover_enabled(settings_data: dict[str, Any] | None, kind: str, *, has_tem
     if isinstance(discover, dict):
         aliases = {
             "zen_public": ("zen_public", "zen"),
+            "zen": ("zen", "zen_paid"),
             "openrouter_free": ("openrouter_free", "openrouter"),
             "nvidia_integrate": ("nvidia_integrate", "nvidia"),
         }
@@ -135,7 +149,6 @@ def is_local_base_url(base_url: str) -> bool:
 
 
 def infer_discover_templates(models: list[ShimModel]) -> list[DiscoverTemplate]:
-    """Reserved for future explicit-template inference; paid OpenCode Zen is not auto-discovered."""
     _ = models
     return []
 
@@ -148,7 +161,10 @@ def discover_byok_models(
     """Return explicit models plus auto-discovered entries from provider listings."""
     explicit_models = refresh_local_explicit_models(explicit_models, settings_data=settings_data)
     templates: list[DiscoverTemplate] = []
-    for kind, builtin in _BUILTIN_TEMPLATES.items():
+    for kind in _BUILTIN_TEMPLATE_ORDER:
+        builtin = _BUILTIN_TEMPLATES.get(kind)
+        if builtin is None:
+            continue
         if discover_enabled(settings_data, kind, has_template=True):
             templates.append(_enrich_builtin_template(builtin, explicit_models))
     templates.extend(infer_discover_templates(explicit_models))
@@ -286,9 +302,13 @@ def _parse_openai_model_list(payload: Any) -> list[str]:
     return ids
 
 
-def fetch_zen_model_ids() -> list[str]:
+def fetch_zen_model_ids(*, api_key: str = "") -> list[str]:
+    headers: dict[str, str] = {}
+    token = api_key.strip()
+    if token and token != "public":
+        headers["Authorization"] = f"Bearer {token}"
     try:
-        return _parse_openai_model_list(fetch_http_json(ZEN_MODELS_URL))
+        return _parse_openai_model_list(fetch_http_json(ZEN_MODELS_URL, headers=headers or None))
     except (OSError, URLError, json.JSONDecodeError, ValueError):
         return discover_opencode_cli_ids("opencode")
 
@@ -344,11 +364,69 @@ def fetch_models_dev_opencode_free_model_ids() -> list[str]:
     return _parse_models_dev_opencode_free_ids(payload)
 
 
+def _parse_models_dev_opencode_paid_ids(payload: Any) -> list[str]:
+    if not isinstance(payload, dict):
+        return []
+    provider = payload.get(MODELS_DEV_OPENCODE_PROVIDER)
+    if not isinstance(provider, dict):
+        return []
+    models = provider.get("models")
+    if not isinstance(models, dict):
+        return []
+    ids: list[str] = []
+    for model_key, row in models.items():
+        if not isinstance(row, dict):
+            continue
+        if _models_dev_model_status(row) == "deprecated":
+            continue
+        cost_input = _models_dev_model_cost_input(row)
+        if cost_input in (None, 0):
+            continue
+        model_id = str(row.get("id") or model_key).strip()
+        if model_id and not is_zen_public_model(model_id):
+            ids.append(model_id)
+    return sorted(set(ids))
+
+
+def fetch_models_dev_opencode_paid_model_ids() -> list[str]:
+    try:
+        payload = fetch_http_json(MODELS_DEV_API_URL)
+    except (OSError, URLError, json.JSONDecodeError, ValueError):
+        return []
+    return _parse_models_dev_opencode_paid_ids(payload)
+
+
+def fetch_zen_paid_model_ids(*, api_key: str = "") -> list[str]:
+    token = api_key.strip()
+    if token and token != "public":
+        from_api = [
+            model_id
+            for model_id in fetch_zen_model_ids(api_key=token)
+            if model_id and not is_zen_public_model(model_id)
+        ]
+        if from_api:
+            return sorted(set(from_api))
+    from_models_dev = fetch_models_dev_opencode_paid_model_ids()
+    if from_models_dev:
+        return from_models_dev
+    return sorted(
+        {
+            model_id
+            for model_id in discover_opencode_cli_ids("opencode")
+            if model_id and not is_zen_public_model(model_id)
+        }
+    )
+
+
 def fetch_zen_public_model_ids() -> list[str]:
     from_models_dev = fetch_models_dev_opencode_free_model_ids()
     if from_models_dev:
-        return from_models_dev
-    return sorted(discover_opencode_cli_ids("opencode"))
+        return [model_id for model_id in from_models_dev if is_zen_public_model(model_id)]
+    return sorted(
+        model_id
+        for model_id in discover_opencode_cli_ids("opencode")
+        if is_zen_public_model(model_id)
+    )
 
 
 def is_openrouter_free_model(model_id: str) -> bool:
@@ -469,6 +547,8 @@ def discover_opencode_cli_ids(prefix: str) -> list[str]:
 def _discover_rows_for_template(template: DiscoverTemplate) -> list[str]:
     if template.kind == "zen_public":
         return fetch_zen_public_model_ids()
+    if template.kind == "zen":
+        return fetch_zen_paid_model_ids(api_key=_resolved_api_key(template.api_key))
     if template.kind in {"openrouter", "openrouter_free"}:
         return fetch_openrouter_free_model_ids()
     if template.kind in {"nvidia", "nvidia_integrate"}:
@@ -527,6 +607,7 @@ def _resolved_api_key(api_key: str) -> str:
 
 def _enrich_builtin_template(template: DiscoverTemplate, explicit_models: list[ShimModel]) -> DiscoverTemplate:
     needle = {
+        "zen": "opencode.ai/zen",
         "openrouter_free": "openrouter.ai",
         "nvidia_integrate": "integrate.api.nvidia.com",
     }.get(template.kind, "")
@@ -534,6 +615,8 @@ def _enrich_builtin_template(template: DiscoverTemplate, explicit_models: list[S
         return template
     for model in explicit_models:
         if needle not in model.base_url.lower():
+            continue
+        if template.kind == "zen" and _resolved_api_key(model.api_key) in {"", "public"}:
             continue
         return DiscoverTemplate(
             kind=template.kind,
@@ -548,7 +631,9 @@ def _enrich_builtin_template(template: DiscoverTemplate, explicit_models: list[S
 
 
 def _template_has_credentials(template: DiscoverTemplate) -> bool:
-    if template.kind in {"zen", "zen_public", "openrouter_free", "nvidia_integrate"}:
+    if template.kind == "zen":
+        return bool(_resolved_api_key(template.api_key))
+    if template.kind in {"zen_public", "openrouter_free", "nvidia_integrate"}:
         return True
     return bool(_resolved_api_key(template.api_key))
 
