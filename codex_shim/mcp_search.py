@@ -141,6 +141,22 @@ def parse_mcp_function_name(name: str) -> tuple[str, str] | None:
     return server_key[len("mcp__") :], tool
 
 
+def parse_mcp_tool_reference(raw_name: str) -> tuple[str, str] | None:
+    """Resolve MCP ``(server, tool)`` from legacy ``__`` or dot-notated chat names."""
+    parsed = parse_mcp_function_name(raw_name)
+    if parsed:
+        return parsed
+    if "." not in raw_name:
+        return None
+    namespace, tool = raw_name.split(".", 1)
+    if not namespace.startswith("mcp__") or not tool:
+        return None
+    server = namespace[len("mcp__") :]
+    if not server:
+        return None
+    return server, tool
+
+
 def is_tool_search_call(name: str) -> bool:
     return name in {CODEX_TOOL_SEARCH_NAME, MCP_TOOL_SEARCH_NAME}
 

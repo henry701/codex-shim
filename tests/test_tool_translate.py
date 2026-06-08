@@ -8,6 +8,17 @@ def test_parse_mcp_function_name():
     )
 
 
+def test_parse_mcp_tool_reference_accepts_dot_notation():
+    assert mcp_search.parse_mcp_tool_reference("mcp__exa.web_search_exa") == (
+        "exa",
+        "web_search_exa",
+    )
+    assert mcp_search.parse_mcp_tool_reference("mcp__exa__web_search_exa") == (
+        "exa",
+        "web_search_exa",
+    )
+
+
 def test_mcp_function_call_item_matches_passthrough_shape():
     item = tool_translate.mcp_function_call_item(
         "call_1",

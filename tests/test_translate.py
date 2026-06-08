@@ -514,3 +514,76 @@ def test_responses_to_chat_after_prepare_omits_web_search_for_byok():
 
     assert out["parallel_tool_calls"] is True
     assert [tool["function"]["name"] for tool in out["tools"]] == ["tool_search"]
+
+
+def test_responses_to_chat_expands_namespace_tools_with_dot_notation():
+    body = {
+        "model": "slug",
+        "input": [{"role": "user", "content": "hi"}],
+        "tools": [
+            {
+                "type": "namespace",
+                "name": "multi_agent_v1",
+                "description": "Multi-agent tools",
+                "tools": [
+                    {
+                        "type": "function",
+                        "name": "spawn_agent",
+                        "description": "Spawn a sub-agent",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"task": {"type": "string"}},
+                        },
+                    }
+                ],
+            }
+        ],
+    }
+    out = responses_to_chat(body, "upstream")
+    names = [t["function"]["name"] for t in out["tools"]]
+    assert names == ["multi_agent_v1.spawn_agent"]
+
+
+def test_function_call_round_trip_preserves_namespace_with_dots():
+    from codex_shim.translate import function_call_item_from_chat_tool
+
+    body = {
+        "input": [
+            {
+                "type": "function_call",
+                "call_id": "call_1",
+                "namespace": "multi_agent_v1",
+                "name": "spawn_agent",
+                "arguments": '{"task":"review"}',
+            }
+        ],
+    }
+    chat = responses_to_chat(body, "upstream")
+    assert chat["messages"][0]["tool_calls"][0]["function"]["name"] == "multi_agent_v1.spawn_agent"
+
+    completion = {
+        "id": "chatcmpl-1",
+        "choices": [
+            {
+                "message": {
+                    "tool_calls": chat["messages"][0]["tool_calls"],
+                }
+            }
+        ],
+    }
+    response = chat_completion_to_response(completion, "slug")
+    item = response["output"][0]
+    assert item["namespace"] == "multi_agent_v1"
+    assert item["name"] == "spawn_agent"
+
+    direct = function_call_item_from_chat_tool(
+        {
+            "id": "call_2",
+            "function": {
+                "name": "mcp__exa.web_search_exa",
+                "arguments": '{"query":"hi"}',
+            },
+        }
+    )
+    assert direct["namespace"] == "mcp__exa"
+    assert direct["name"] == "web_search_exa"

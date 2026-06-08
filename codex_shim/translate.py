@@ -6,9 +6,51 @@ from collections.abc import Mapping
 from typing import Any
 
 from . import mcp_search
+from .tool_translate import mcp_namespace
 
 
 THINK_RE = re.compile(r"<think>.*?</think>", re.IGNORECASE | re.DOTALL)
+
+
+def namespaced_tool_chat_name(namespace: str, name: str) -> str:
+    if namespace:
+        return f"{namespace}.{name}"
+    return name
+
+
+def split_namespaced_tool_chat_name(raw_name: str) -> tuple[str | None, str]:
+    if mcp_search.parse_mcp_tool_reference(raw_name):
+        return None, raw_name
+    parts = raw_name.split(".", 1)
+    if len(parts) == 2 and parts[0] and parts[1]:
+        return parts[0], parts[1]
+    return None, raw_name
+
+
+def function_call_item_from_chat_tool(call: dict[str, Any]) -> dict[str, Any]:
+    fn = call.get("function") or {}
+    raw_name = fn.get("name", "")
+    call_id = call.get("id", "call_0")
+    item: dict[str, Any] = {
+        "id": call_id,
+        "type": "function_call",
+        "status": "completed",
+        "call_id": call_id,
+        "arguments": fn.get("arguments", ""),
+    }
+    mcp_parsed = mcp_search.parse_mcp_tool_reference(raw_name)
+    if mcp_parsed:
+        server, tool = mcp_parsed
+        item["namespace"] = mcp_namespace(server)
+        item["name"] = tool
+        return item
+    namespace, tool_name = split_namespaced_tool_chat_name(raw_name)
+    if namespace is not None:
+        item["namespace"] = namespace
+        item["name"] = tool_name
+    else:
+        item["name"] = raw_name
+    return item
 
 SHIM_ENCRYPTED_CONTENT_PREFIX = "anthropic-thinking-v1:"
 _THINKING_MAGIC = SHIM_ENCRYPTED_CONTENT_PREFIX
@@ -432,17 +474,7 @@ def chat_completion_to_response(payload: dict[str, Any], requested_model: str) -
             }
         )
     for call in message.get("tool_calls") or []:
-        fn = call.get("function") or {}
-        output.append(
-            {
-                "id": call.get("id", "call_0"),
-                "type": "function_call",
-                "status": "completed",
-                "call_id": call.get("id", "call_0"),
-                "name": fn.get("name", ""),
-                "arguments": fn.get("arguments", ""),
-            }
-        )
+        output.append(function_call_item_from_chat_tool(call))
     return {
         "id": payload.get("id", "resp_chat"),
         "object": "response",
@@ -573,8 +605,8 @@ def _responses_input_to_messages(value: Any) -> list[dict[str, Any]]:
             call_id = item.get("call_id") or item.get("id") or "call_0"
             fn_name = item.get("name") or ""
             namespace = item.get("namespace") or ""
-            if namespace and fn_name and not fn_name.startswith("mcp__"):
-                fn_name = f"{namespace}__{fn_name}"
+            if namespace and fn_name:
+                fn_name = namespaced_tool_chat_name(namespace, fn_name)
             pending_tool_calls.append(
                 {
                     "id": call_id,
@@ -946,6 +978,29 @@ def _responses_tools_to_chat_tools(tools: Any) -> list[dict[str, Any]]:
         return []
     converted = []
     for tool in tools:
+        if isinstance(tool, dict) and tool.get("type") == "namespace":
+            namespace = str(tool.get("name") or "")
+            desc = str(tool.get("description") or f"Tools in the {namespace} namespace.")
+            for sub_tool in tool.get("tools") or []:
+                if not isinstance(sub_tool, dict):
+                    continue
+                if sub_tool.get("type") != "function":
+                    continue
+                sub_name = str(sub_tool.get("name") or "")
+                if not sub_name:
+                    continue
+                converted.append(
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": namespaced_tool_chat_name(namespace, sub_name),
+                            "description": sub_tool.get("description") or desc,
+                            "parameters": sub_tool.get("parameters")
+                            or {"type": "object", "properties": {}},
+                        },
+                    }
+                )
+            continue
         function_tool = _responses_tool_to_chat_function(tool)
         if function_tool is None:
             continue

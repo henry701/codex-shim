@@ -274,6 +274,10 @@ class ShimModel:
     def is_openai_chat(self) -> bool:
         return self.provider in {"openai", "generic-chat-completion-api"}
 
+    @property
+    def is_openai_responses(self) -> bool:
+        return self.provider == "openai-responses"
+
 
 class ModelSettings:
     def __init__(self, path: Path | None = None):

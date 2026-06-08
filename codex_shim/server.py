@@ -57,6 +57,7 @@ from .translate import (
     prepare_codex_byok_responses_body,
     responses_to_anthropic,
     responses_to_chat,
+    split_namespaced_tool_chat_name,
     _chat_finish_to_anthropic_stop,
     _responses_usage_to_anthropic_usage,
 )
@@ -272,6 +273,10 @@ class ShimServer:
         body = await request.json()
         body = await self._maybe_apply_auto_router(body)
         route = await self._route(body)
+        if route.is_openai_responses:
+            raise web.HTTPBadGateway(
+                text="openai-responses provider does not support /v1/chat/completions"
+            )
         if route.is_openai_chat:
             forwarded = dict(body)
             forwarded["model"] = route.model
@@ -320,6 +325,8 @@ class ShimServer:
             return await self._chatgpt_passthrough(request, body, response_model_override=model)
         route = await self._route(body)
         body = prepare_codex_byok_responses_body(body, request.headers)
+        if route.is_openai_responses:
+            return await self._post_openai_responses(request, route, body)
         if route.is_openai_chat:
             forwarded = responses_to_chat(body, route.model)
             return await self._post_openai_chat(request, route, forwarded, as_responses=True)
@@ -353,6 +360,9 @@ class ShimServer:
         route = await self._route(body)
         compact_body = _compact_request_body(body, route.model)
         compact_body = prepare_codex_byok_responses_body(compact_body, request.headers)
+        if route.is_openai_responses:
+            compact_body["stream"] = False
+            return await self._post_openai_responses(request, route, compact_body)
         if route.is_openai_chat:
             forwarded = responses_to_chat(compact_body, route.model)
             forwarded["stream"] = False
@@ -361,7 +371,9 @@ class ShimServer:
         if route.is_anthropic:
             forwarded = responses_to_anthropic(compact_body, route.model, route.max_output_tokens)
             forwarded["stream"] = False
-            response = await self._post_openai_chat(request, route, forwarded, as_responses=True)
+            response = await self._post_anthropic(
+                request, route, forwarded, as_responses=True
+            )
             return await _as_compact_response(response, route.slug)
         raise web.HTTPBadGateway(text=f"Unsupported model provider: {route.provider}")
 
@@ -915,6 +927,8 @@ class ShimServer:
         route = await self._route(body)
         client_slug = response_slug or route.slug
         body = prepare_codex_byok_responses_body(body, request.headers)
+        if route.is_openai_responses:
+            return await self._post_openai_responses(request, route, body)
         if route.is_openai_chat:
             forwarded = responses_to_chat(body, route.model)
             return await self._post_openai_chat(
@@ -938,6 +952,9 @@ class ShimServer:
         client_slug = response_slug or route.slug
         compact_body = _compact_request_body(body, route.model)
         compact_body = prepare_codex_byok_responses_body(compact_body, request.headers)
+        if route.is_openai_responses:
+            compact_body["stream"] = False
+            return await self._post_openai_responses(request, route, compact_body)
         if route.is_openai_chat:
             forwarded = responses_to_chat(compact_body, route.model)
             forwarded["stream"] = False
@@ -988,6 +1005,49 @@ class ShimServer:
                 flush=True,
             )
             return None
+
+    async def _post_openai_responses(
+        self,
+        request: web.Request,
+        route: ShimModel,
+        body: dict[str, Any],
+    ) -> web.StreamResponse:
+        """Forward a Responses API request directly to the upstream /responses endpoint."""
+        url = _join_url(route.base_url, "/responses")
+        forwarded = dict(body)
+        forwarded["model"] = route.model
+        headers = _openai_headers(route)
+        headers.setdefault("OpenAI-Beta", "responses=2026-02-06")
+        if forwarded.get("stream"):
+            headers.setdefault("Accept", "text/event-stream")
+        _dump_debug_request(route.slug, url, forwarded)
+        async with ClientSession(timeout=self.timeout) as session:
+            upstream = await session.post(url, json=forwarded, headers=headers)
+            if upstream.status >= 400:
+                text = await upstream.text()
+                code, message = parse_upstream_error(text, upstream.status)
+                upstream.release()
+                return web.json_response(
+                    _responses_error_payload(route.slug, code, message),
+                    status=upstream.status,
+                )
+            if not forwarded.get("stream"):
+                payload = await upstream.json(content_type=None)
+                return web.json_response(payload)
+            response = _sse_response()
+            await response.prepare(request)
+            try:
+                async for chunk in _iter_upstream_chunks(upstream.content, request):
+                    await _safe_write(response, chunk)
+            except ClientDisconnected:
+                pass
+            finally:
+                upstream.release()
+            try:
+                await response.write_eof()
+            except Exception:
+                pass
+            return response
 
     async def _post_openai_chat(
         self, request: web.Request, route: ShimModel, body: dict[str, Any], as_responses: bool,
@@ -1381,7 +1441,7 @@ def _tool_call_arguments_complete(tc: dict[str, Any]) -> bool:
 def _should_defer_tool_name(name: str) -> bool:
     if not name:
         return True
-    if mcp_search.is_tool_search_call(name) or mcp_search.parse_mcp_function_name(name):
+    if mcp_search.is_tool_search_call(name) or mcp_search.parse_mcp_tool_reference(name):
         return False
     return name.startswith("mcp")
 
@@ -1715,7 +1775,7 @@ class ResponsesStreamState:
                 continue
             if mcp_search.is_tool_search_call(state.get("name") or ""):
                 continue
-            if mcp_search.parse_mcp_function_name(state.get("name") or ""):
+            if mcp_search.parse_mcp_tool_reference(state.get("name") or ""):
                 continue
             if _tool_call_arguments_complete(state):
                 await self._close_tool(response, state)
@@ -1879,7 +1939,7 @@ class ResponsesStreamState:
         if mcp_search.is_tool_search_call(name) or index in self.tool_search_calls:
             await self._chat_tool_search_delta(response, index, call, fn, name)
             return
-        if mcp_search.parse_mcp_function_name(name) or index in self.mcp_tool_calls:
+        if mcp_search.parse_mcp_tool_reference(name) or index in self.mcp_tool_calls:
             await self._chat_mcp_tool_delta(response, index, call, fn, name)
             return
         state = self.tool_calls.get(index)
@@ -1896,8 +1956,13 @@ class ResponsesStreamState:
                 }
                 await self._finalize_pending_tool(response, index)
                 return
+            namespace, tool_name = split_namespaced_tool_chat_name(name)
             state = await self._open_tool(
-                response, key=index, call_id=call_id, name=name
+                response,
+                key=index,
+                call_id=call_id,
+                name=tool_name,
+                namespace=namespace,
             )
             state["emitted"] = True
             arg_delta = fn.get("arguments") or ""
@@ -1955,7 +2020,7 @@ class ResponsesStreamState:
                 "closed": False,
             }
             return
-        if mcp_search.parse_mcp_function_name(name):
+        if mcp_search.parse_mcp_tool_reference(name):
             pending = self.tool_calls.pop(index)
             self.mcp_tool_calls[index] = {
                 **pending,
@@ -1969,20 +2034,28 @@ class ResponsesStreamState:
             await self._close_message(response)
         output_index = self.next_output_index
         self.next_output_index += 1
+        namespace, tool_name = split_namespaced_tool_chat_name(name)
+        if namespace is not None:
+            state["namespace"] = namespace
+            state["name"] = tool_name
+            name = tool_name
         state.update({"output_index": output_index, "emitted": True})
+        item: dict[str, Any] = {
+            "id": state["call_id"],
+            "type": "function_call",
+            "status": "in_progress",
+            "call_id": state["call_id"],
+            "name": name,
+            "arguments": "",
+        }
+        if namespace is not None:
+            item["namespace"] = namespace
         await _write_sse(
             response,
             {
                 "type": "response.output_item.added",
                 "output_index": output_index,
-                "item": {
-                    "id": state["call_id"],
-                    "type": "function_call",
-                    "status": "in_progress",
-                    "call_id": state["call_id"],
-                    "name": name,
-                    "arguments": "",
-                },
+                "item": item,
             },
         )
         if _tool_call_arguments_complete(state) and not state.get("closed"):
@@ -2090,13 +2163,13 @@ class ResponsesStreamState:
                 "opened": False,
             }
             self.mcp_tool_calls[index] = state
-        elif mcp_search.parse_mcp_function_name(name):
+        elif mcp_search.parse_mcp_tool_reference(name):
             state["name"] = name
         elif fn.get("name"):
             state["name"] = mcp_search.normalize_upstream_tool_name(
                 (state.get("name") or "") + fn.get("name")
             )
-        if not state.get("opened") and mcp_search.parse_mcp_function_name(state.get("name") or ""):
+        if not state.get("opened") and mcp_search.parse_mcp_tool_reference(state.get("name") or ""):
             state = await self._open_mcp_tool(response, index, state)
         arg_delta = fn.get("arguments") or ""
         if arg_delta:
@@ -2120,7 +2193,7 @@ class ResponsesStreamState:
         index: int,
         state: dict[str, Any],
     ) -> dict[str, Any]:
-        parsed = mcp_search.parse_mcp_function_name(state.get("name") or "")
+        parsed = mcp_search.parse_mcp_tool_reference(state.get("name") or "")
         if parsed is None:
             return state
         server, tool = parsed
@@ -2225,11 +2298,14 @@ class ResponsesStreamState:
                 if seed:
                     await self._text_delta(response, seed)
             elif btype == "tool_use":
+                raw_name = block.get("name") or ""
+                namespace, tool_name = split_namespaced_tool_chat_name(raw_name)
                 await self._open_tool(
                     response,
                     key=("anthropic", idx),
                     call_id=block.get("id") or f"call_{idx}",
-                    name=block.get("name") or "",
+                    name=tool_name,
+                    namespace=namespace,
                 )
             elif btype in {"thinking", "redacted_thinking"}:
                 await self._open_reasoning(
@@ -2381,7 +2457,15 @@ class ResponsesStreamState:
             },
         )
 
-    async def _open_tool(self, response: web.StreamResponse, *, key: Any, call_id: str, name: str) -> dict[str, Any]:
+    async def _open_tool(
+        self,
+        response: web.StreamResponse,
+        *,
+        key: Any,
+        call_id: str,
+        name: str,
+        namespace: str | None = None,
+    ) -> dict[str, Any]:
         if self.message_opened and not self.message_closed:
             await self._close_message(response)
         output_index = self.next_output_index
@@ -2390,24 +2474,28 @@ class ResponsesStreamState:
             "id": call_id,
             "call_id": call_id,
             "name": name,
+            "namespace": namespace,
             "arguments": "",
             "output_index": output_index,
             "closed": False,
         }
         self.tool_calls[key] = state
+        item: dict[str, Any] = {
+            "id": call_id,
+            "type": "function_call",
+            "status": "in_progress",
+            "call_id": call_id,
+            "name": name,
+            "arguments": "",
+        }
+        if namespace:
+            item["namespace"] = namespace
         await _write_sse(
             response,
             {
                 "type": "response.output_item.added",
                 "output_index": output_index,
-                "item": {
-                    "id": call_id,
-                    "type": "function_call",
-                    "status": "in_progress",
-                    "call_id": call_id,
-                    "name": name,
-                    "arguments": "",
-                },
+                "item": item,
             },
         )
         return state
@@ -2556,7 +2644,7 @@ class ResponsesStreamState:
         )
 
     def _tool_item(self, state: dict[str, Any], status: str) -> dict[str, Any]:
-        return {
+        item: dict[str, Any] = {
             "id": state["id"],
             "type": "function_call",
             "status": status,
@@ -2564,6 +2652,9 @@ class ResponsesStreamState:
             "name": state["name"],
             "arguments": state["arguments"],
         }
+        if state.get("namespace"):
+            item["namespace"] = state["namespace"]
+        return item
 
     def _response(self, status: str, *, final: bool = False) -> dict[str, Any]:
         output: list[dict[str, Any]] = []
@@ -2579,7 +2670,7 @@ class ResponsesStreamState:
                 ):
                     collected.append((turn["message_index"], self._message_item_for_turn(turn, "completed")))
                 for state in turn["tool_calls"].values():
-                    if mcp_search.parse_mcp_function_name(state.get("name") or ""):
+                    if mcp_search.parse_mcp_tool_reference(state.get("name") or ""):
                         continue
                     if mcp_search.is_tool_search_call(state.get("name") or ""):
                         continue

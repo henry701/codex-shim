@@ -625,6 +625,56 @@ async def test_chat_tool_delta_streams_exec_command_to_client():
     assert tool_items[0]["name"] == "exec_command"
 
 
+async def test_chat_tool_delta_streams_namespaced_tool_with_dot_notation():
+    class FakeResponse:
+        def __init__(self):
+            self.chunks: list[bytes] = []
+
+        async def write(self, data: bytes):
+            self.chunks.append(data)
+
+    downstream = FakeResponse()
+    state = ResponsesStreamState("local-llama")
+    await state.start(downstream)
+    await state.write_chat_delta(
+        downstream,
+        {
+            "choices": [
+                {
+                    "delta": {
+                        "tool_calls": [
+                            {
+                                "index": 0,
+                                "id": "call_ns",
+                                "function": {
+                                    "name": "multi_agent_v1.spawn_agent",
+                                    "arguments": '{"task":"review"}',
+                                },
+                            }
+                        ]
+                    }
+                }
+            ]
+        },
+    )
+    await state.finish(downstream, upstream_saw_done=True)
+
+    events = _sse_events(b"".join(downstream.chunks).decode())
+    function_added = [
+        event
+        for event in events
+        if event.get("type") == "response.output_item.added"
+        and (event.get("item") or {}).get("type") == "function_call"
+    ]
+    assert len(function_added) == 1
+    assert function_added[0]["item"]["namespace"] == "multi_agent_v1"
+    assert function_added[0]["item"]["name"] == "spawn_agent"
+    completed = [event for event in events if event.get("type") == "response.completed"][-1]
+    tool_items = [item for item in completed["response"]["output"] if item.get("type") == "function_call"]
+    assert tool_items[0]["namespace"] == "multi_agent_v1"
+    assert tool_items[0]["name"] == "spawn_agent"
+
+
 async def test_chat_tool_delta_streams_tool_search_call_to_client():
     class FakeResponse:
         def __init__(self):
@@ -1441,6 +1491,67 @@ async def test_responses_compact_routes_to_openai_chat_and_returns_compacted_win
     assert captured["body"]["stream"] is False
     assert "service_tier" not in captured["body"]
     assert "Compact the conversation" in captured["body"]["messages"][0]["content"]
+
+    await shim_client.close()
+    await upstream_client.close()
+
+
+async def test_responses_routes_openai_responses_provider_to_upstream_responses(tmp_path):
+    captured = {}
+
+    async def responses_handler(request):
+        captured["body"] = await request.json()
+        captured["headers"] = dict(request.headers)
+        return web.json_response(
+            {
+                "id": "resp_upstream",
+                "object": "response",
+                "status": "completed",
+                "model": "gpt-5.3-codex",
+                "output": [],
+            }
+        )
+
+    upstream = web.Application()
+    upstream.router.add_post("/v1/responses", responses_handler)
+    upstream_client = TestClient(TestServer(upstream))
+    await upstream_client.start_server()
+
+    settings = tmp_path / "settings.json"
+    settings.write_text(
+        json.dumps(
+            {
+                "customModels": [
+                    {
+                        "model": "upstream-codex-responses",
+                        "displayName": "Codex Responses",
+                        "provider": "openai-responses",
+                        "baseUrl": str(upstream_client.make_url("/v1")),
+                        "apiKey": "secret",
+                    }
+                ]
+            }
+        )
+    )
+    shim_client = TestClient(TestServer(ShimServer(settings).app()))
+    await shim_client.start_server()
+
+    resp = await shim_client.post(
+        "/v1/responses",
+        json={"model": "upstream-codex-responses", "input": "hello", "stream": False},
+    )
+    assert resp.status == 200
+    payload = await resp.json()
+    assert payload["id"] == "resp_upstream"
+    assert captured["body"]["model"] == "upstream-codex-responses"
+    assert captured["body"]["input"] == "hello"
+    assert captured["headers"]["Authorization"] == "Bearer secret"
+
+    chat_resp = await shim_client.post(
+        "/v1/chat/completions",
+        json={"model": "upstream-codex-responses", "messages": [{"role": "user", "content": "hi"}]},
+    )
+    assert chat_resp.status == 502
 
     await shim_client.close()
     await upstream_client.close()
