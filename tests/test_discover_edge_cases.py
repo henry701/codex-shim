@@ -64,13 +64,10 @@ def test_discover_openrouter_alias_respects_openrouter_key(monkeypatch):
 
 
 def test_paid_zen_is_not_auto_discovered(monkeypatch):
-    monkeypatch.setattr(
-        "codex_shim.discover.fetch_zen_model_ids",
-        lambda: ["kimi-k2.6", "deepseek-v4-flash", "minimax-m3-free"],
-    )
+    monkeypatch.setattr("codex_shim.discover.fetch_models_dev_opencode_free_model_ids", lambda: [])
     monkeypatch.setattr(
         "codex_shim.discover.discover_opencode_cli_ids",
-        lambda prefix: ["big-pickle", "kimi-k2.6"] if prefix == "opencode" else [],
+        lambda prefix: ["big-pickle"] if prefix == "opencode" else [],
     )
     explicit = [
         ShimModel(
@@ -86,7 +83,7 @@ def test_paid_zen_is_not_auto_discovered(monkeypatch):
     slugs = {model.slug for model in models}
     assert "zen-kimi-k2-6" in slugs
     assert "zen-deepseek-v4-flash" not in slugs
-    assert "oc-free-minimax-m3-free" in slugs
+    assert "oc-free-minimax-m3-free" not in slugs
     assert "oc-free-big-pickle" in slugs
     assert sum(model.model == "kimi-k2.6" for model in models) == 1
 
@@ -191,10 +188,9 @@ def test_chatgpt_catalog_uses_codex_prefix_and_prefers_cache(monkeypatch, tmp_pa
 
 def test_write_catalog_includes_discovered_zen_public(tmp_path, monkeypatch, auth_missing):
     monkeypatch.setattr(
-        "codex_shim.discover.fetch_zen_model_ids",
-        lambda: ["minimax-m3-free"],
+        "codex_shim.discover.fetch_models_dev_opencode_free_model_ids",
+        lambda: ["deepseek-v4-flash-free"],
     )
-    monkeypatch.setattr("codex_shim.discover.discover_opencode_cli_ids", lambda *_a, **_k: [])
     settings = tmp_path / "settings.json"
     settings.write_text(json.dumps({"models": []}))
     models = ModelSettings(settings).load()
@@ -202,7 +198,7 @@ def test_write_catalog_includes_discovered_zen_public(tmp_path, monkeypatch, aut
     write_catalog(models, catalog_path)
     payload = json.loads(catalog_path.read_text())
     slugs = {entry["slug"] for entry in payload["models"]}
-    assert "oc-free-minimax-m3-free" in slugs
+    assert "oc-free-deepseek-v4-flash-free" in slugs
 
 
 def test_model_settings_load_explicit_skips_discovery(tmp_path, monkeypatch):

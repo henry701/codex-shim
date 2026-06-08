@@ -16,6 +16,8 @@ from .naming import description_for_route, display_name_from_slug
 from .settings import ShimModel, slugify
 
 ZEN_MODELS_URL = "https://opencode.ai/zen/v1/models"
+MODELS_DEV_API_URL = "https://models.dev/api.json"
+MODELS_DEV_OPENCODE_PROVIDER = "opencode"
 OPENAI_MODELS_URL = "https://api.openai.com/v1/models"
 DISCOVER_INDEX_BASE = 10_000
 
@@ -291,15 +293,62 @@ def fetch_zen_model_ids() -> list[str]:
         return discover_opencode_cli_ids("opencode")
 
 
+def _models_dev_model_status(row: dict[str, Any]) -> str:
+    status = row.get("status")
+    if status in (None, ""):
+        return "active"
+    return str(status).strip().lower()
+
+
+def _models_dev_model_cost_input(row: dict[str, Any]) -> float | None:
+    cost = row.get("cost")
+    if not isinstance(cost, dict):
+        return None
+    value = cost.get("input")
+    if value in (None, ""):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _parse_models_dev_opencode_free_ids(payload: Any) -> list[str]:
+    if not isinstance(payload, dict):
+        return []
+    provider = payload.get(MODELS_DEV_OPENCODE_PROVIDER)
+    if not isinstance(provider, dict):
+        return []
+    models = provider.get("models")
+    if not isinstance(models, dict):
+        return []
+    ids: list[str] = []
+    for model_key, row in models.items():
+        if not isinstance(row, dict):
+            continue
+        if _models_dev_model_status(row) == "deprecated":
+            continue
+        if _models_dev_model_cost_input(row) != 0:
+            continue
+        model_id = str(row.get("id") or model_key).strip()
+        if model_id:
+            ids.append(model_id)
+    return sorted(set(ids))
+
+
+def fetch_models_dev_opencode_free_model_ids() -> list[str]:
+    try:
+        payload = fetch_http_json(MODELS_DEV_API_URL)
+    except (OSError, URLError, json.JSONDecodeError, ValueError):
+        return []
+    return _parse_models_dev_opencode_free_ids(payload)
+
+
 def fetch_zen_public_model_ids() -> list[str]:
-    discovered: set[str] = set()
-    for model_id in fetch_zen_model_ids():
-        if is_zen_public_model(model_id):
-            discovered.add(model_id)
-    for model_id in discover_opencode_cli_ids("opencode"):
-        if is_zen_public_model(model_id):
-            discovered.add(model_id)
-    return sorted(discovered)
+    from_models_dev = fetch_models_dev_opencode_free_model_ids()
+    if from_models_dev:
+        return from_models_dev
+    return sorted(discover_opencode_cli_ids("opencode"))
 
 
 def is_openrouter_free_model(model_id: str) -> bool:

@@ -8,6 +8,7 @@ def _disable_model_discovery_by_default(monkeypatch, request):
     if "enable_model_discovery" in request.keywords:
         return
     monkeypatch.setattr("codex_shim.discover.fetch_zen_model_ids", lambda: [])
+    monkeypatch.setattr("codex_shim.discover.fetch_models_dev_opencode_free_model_ids", lambda: [])
     monkeypatch.setattr("codex_shim.discover.fetch_zen_public_model_ids", lambda: [])
     monkeypatch.setattr("codex_shim.discover.fetch_openrouter_free_model_ids", lambda: [])
     monkeypatch.setattr("codex_shim.discover.fetch_nvidia_integrate_model_ids", lambda: [])

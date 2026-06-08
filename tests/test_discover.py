@@ -6,11 +6,13 @@ import pytest
 
 from codex_shim.discover import (
     LocalModelRecord,
+    _parse_models_dev_opencode_free_ids,
     discover_byok_models,
     discover_enabled,
     fetch_nvidia_integrate_model_ids,
     fetch_openrouter_free_model_ids,
     fetch_zen_model_ids,
+    fetch_zen_public_model_ids,
     is_openrouter_free_model,
     is_zen_public_model,
     merge_discovered_models,
@@ -64,15 +66,49 @@ def test_merge_discovered_models_keeps_explicit_entries():
 
 def test_discover_byok_models_adds_zen_public_models(monkeypatch):
     monkeypatch.setattr(
-        "codex_shim.discover.fetch_zen_model_ids",
-        lambda: ["big-pickle", "minimax-m2.5", "minimax-m3-free", "kimi-k2.6"],
+        "codex_shim.discover.fetch_models_dev_opencode_free_model_ids",
+        lambda: ["big-pickle", "deepseek-v4-flash-free"],
     )
     models = discover_byok_models([_zen_template()])
     slugs = {model.slug for model in models}
     assert "zen-big-pickle" in slugs
-    assert "oc-free-minimax-m3-free" in slugs
-    assert "oc-free-minimax-m2-5" not in slugs
+    assert "oc-free-deepseek-v4-flash-free" in slugs
+    assert "oc-free-minimax-m3-free" not in slugs
     assert "zen-kimi-k2-6" not in slugs
+
+
+def test_parse_models_dev_opencode_free_ids_skips_deprecated_and_paid(monkeypatch):
+    payload = {
+        "opencode": {
+            "models": {
+                "big-pickle": {
+                    "id": "big-pickle",
+                    "status": "active",
+                    "cost": {"input": 0, "output": 0},
+                },
+                "minimax-m3-free": {
+                    "id": "minimax-m3-free",
+                    "status": "deprecated",
+                    "cost": {"input": 0, "output": 0},
+                },
+                "kimi-k2.6": {
+                    "id": "kimi-k2.6",
+                    "status": "active",
+                    "cost": {"input": 0.3, "output": 1.2},
+                },
+            }
+        }
+    }
+    assert _parse_models_dev_opencode_free_ids(payload) == ["big-pickle"]
+
+
+def test_fetch_zen_public_model_ids_falls_back_to_opencode_cli(monkeypatch):
+    monkeypatch.setattr("codex_shim.discover.fetch_models_dev_opencode_free_model_ids", lambda: [])
+    monkeypatch.setattr(
+        "codex_shim.discover.discover_opencode_cli_ids",
+        lambda prefix: ["big-pickle", "mimo-v2.5-free"] if prefix == "opencode" else [],
+    )
+    assert fetch_zen_public_model_ids() == ["big-pickle", "mimo-v2.5-free"]
 
 
 def test_refresh_local_explicit_models_uses_endpoint_name(monkeypatch):
@@ -137,7 +173,7 @@ def test_fetch_nvidia_integrate_model_ids(monkeypatch):
 
 
 def test_discover_byok_models_adds_openrouter_free_and_nvidia(monkeypatch):
-    monkeypatch.setattr("codex_shim.discover.fetch_zen_model_ids", lambda: [])
+    monkeypatch.setattr("codex_shim.discover.fetch_models_dev_opencode_free_model_ids", lambda: [])
     monkeypatch.setattr(
         "codex_shim.discover.discover_opencode_cli_ids",
         lambda prefix: {
