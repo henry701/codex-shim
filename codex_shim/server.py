@@ -988,7 +988,19 @@ class ShimServer:
         async with ClientSession(timeout=self.timeout) as session:
             upstream = await session.post(url, json=body, headers=_openai_headers(route))
             if upstream.status >= 400:
-                return await _error_response(upstream, slug=route.slug)
+                text = await upstream.text()
+                if as_responses:
+                    code, message = parse_upstream_error(text, upstream.status)
+                    return web.json_response(
+                        _responses_error_payload(client_slug, code, message),
+                        status=upstream.status,
+                    )
+                upstream.release()
+                return web.Response(
+                    status=upstream.status,
+                    text=text,
+                    content_type=upstream.content_type or "text/plain",
+                )
             payload = await upstream.json(content_type=None)
         if as_responses:
             response_payload = chat_completion_to_response(payload, client_slug)
@@ -1025,14 +1037,18 @@ class ShimServer:
                     upstream = await session.post(url, json=turn_body, headers=headers)
                     if upstream.status >= 400:
                         text = await upstream.text()
+                        code, message = parse_upstream_error(text, upstream.status)
                         print(
-                            f"[stream] model={route.slug} upstream HTTP {upstream.status}: {text[:500]}",
+                            f"[stream] model={route.slug} upstream HTTP {upstream.status}: {message[:500]}",
                             flush=True,
                         )
-                        if not as_responses or state is None:
+                        if as_responses and state is not None:
+                            await state.fail(response, message, code=code)
+                        else:
                             await _safe_write(
                                 response,
-                                json.dumps({"error": f"upstream {upstream.status}: {text[:200]}"}).encode() + b"\n",
+                                json.dumps({"error": f"upstream {upstream.status}: {message[:200]}"}).encode()
+                                + b"\n",
                             )
                         upstream.release()
                         break
@@ -1046,6 +1062,10 @@ class ShimServer:
                             except json.JSONDecodeError:
                                 continue
                             if isinstance(event, dict) and event.get("error"):
+                                if as_responses and state is not None:
+                                    code, message = parse_upstream_error(json.dumps(event), 502)
+                                    await state.fail(response, message, code=code)
+                                    break
                                 await _write_sse(response, event)
                                 continue
                             if as_responses and state is not None:
@@ -1058,10 +1078,16 @@ class ShimServer:
                             f"{type(exc).__name__}: {exc}",
                             flush=True,
                         )
+                        if as_responses and state is not None and not state.failed:
+                            await state.fail(
+                                response,
+                                f"Upstream stream disconnected: {exc}",
+                                code="upstream_disconnect",
+                            )
                     finally:
                         await _close_upstream(upstream)
                     break
-            if as_responses and state is not None:
+            if as_responses and state is not None and not state.failed:
                 await state.finish(response, upstream_saw_done=upstream_saw_done)
             elif upstream_saw_done:
                 await _safe_write(response, b"data: [DONE]\n\n")
@@ -1086,7 +1112,14 @@ class ShimServer:
         async with ClientSession(timeout=self.timeout) as session:
             upstream = await session.post(url, json=body, headers=headers)
             if upstream.status >= 400:
-                return await _error_response(upstream)
+                if as_responses and body.get("stream"):
+                    return await _stream_responses_upstream_error(
+                        request,
+                        client_slug,
+                        upstream,
+                        slug=route.slug,
+                    )
+                return await _error_response(upstream, slug=route.slug)
             if body.get("stream"):
                 return await self._stream_anthropic(
                     request, upstream, route, as_responses, response_slug=client_slug
@@ -1124,6 +1157,10 @@ class ShimServer:
                     except json.JSONDecodeError:
                         continue
                     if isinstance(event, dict) and event.get("error"):
+                        if as_responses and state is not None:
+                            code, message = parse_upstream_error(json.dumps(event), 502)
+                            await state.fail(response, message, code=code)
+                            break
                         await _write_sse(response, event)
                         continue
                     if as_responses:
@@ -1136,7 +1173,13 @@ class ShimServer:
                     f"{type(exc).__name__}: {exc}",
                     flush=True,
                 )
-            if as_responses:
+                if as_responses and not state.failed:
+                    await state.fail(
+                        response,
+                        f"Upstream stream disconnected: {exc}",
+                        code="upstream_disconnect",
+                    )
+            if as_responses and not state.failed:
                 await state.finish(response, upstream_saw_done=upstream_saw_done)
             elif upstream_saw_done:
                 await _safe_write(response, b"data: [DONE]\n\n")
@@ -1256,6 +1299,7 @@ class ResponsesStreamState:
         self.response_id = f"resp_{int(time.time() * 1000)}"
         self.message_item_id = f"msg_{int(time.time() * 1000)}"
         self.model = model
+        self.failed = False
         self.message_index: int | None = None  # output_index for the assistant message
         self.message_text = ""
         self.message_opened = False
@@ -1276,7 +1320,36 @@ class ResponsesStreamState:
     async def start(self, response: web.StreamResponse) -> None:
         await _write_sse(response, {"type": "response.created", "response": self._response("in_progress")})
 
+    async def fail(
+        self,
+        response: web.StreamResponse,
+        message: str,
+        *,
+        code: str = "upstream_error",
+    ) -> None:
+        if self.failed:
+            return
+        self.failed = True
+        await self.close_turn_items(response)
+        await _write_sse(
+            response,
+            {
+                "type": "error",
+                "code": code,
+                "message": message,
+            },
+        )
+        failed_response = self._response("failed", final=True)
+        failed_response["error"] = {"code": code, "message": message}
+        await _write_sse(
+            response,
+            {"type": "response.failed", "response": failed_response},
+        )
+        await response.write(b"data: [DONE]\n\n")
+
     async def finish(self, response: web.StreamResponse, *, upstream_saw_done: bool) -> None:
+        if self.failed:
+            return
         await self.close_turn_items(response)
         if upstream_saw_done and not self._has_open_incomplete_items():
             await _write_sse(
@@ -2547,14 +2620,87 @@ def _compact_response_payload(model: str, summary: str, usage: Any = None) -> di
     return payload
 
 
+def parse_upstream_error(body: str, http_status: int) -> tuple[str, str]:
+    text = (body or "").strip()
+    code = f"upstream_http_{http_status}"
+    message = text or f"Upstream returned HTTP {http_status}"
+    if not text:
+        return code, message
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError:
+        return code, text[:2000]
+    if not isinstance(payload, dict):
+        return code, text[:2000]
+
+    err = payload.get("error")
+    if isinstance(err, dict):
+        nested_message = err.get("message")
+        if isinstance(nested_message, str) and nested_message.strip():
+            message = nested_message.strip()
+        nested_code = err.get("type") or err.get("code")
+        if isinstance(nested_code, str) and nested_code.strip():
+            code = nested_code.strip()
+    elif isinstance(err, str) and err.strip():
+        message = err.strip()
+
+    top_message = payload.get("message")
+    if isinstance(top_message, str) and top_message.strip():
+        message = top_message.strip()
+    top_code = payload.get("code")
+    if isinstance(top_code, str) and top_code.strip():
+        code = top_code.strip()
+
+    return code, message
+
+
+def _responses_error_payload(model: str, code: str, message: str) -> dict[str, Any]:
+    return {
+        "id": f"resp_{int(time.time() * 1000)}",
+        "object": "response",
+        "created_at": int(time.time()),
+        "status": "failed",
+        "model": model,
+        "output": [],
+        "error": {"code": code, "message": message},
+    }
+
+
+async def _stream_responses_upstream_error(
+    request: web.Request,
+    client_slug: str,
+    upstream,
+    *,
+    slug: str | None = None,
+) -> web.StreamResponse:
+    text = await upstream.text()
+    status = upstream.status
+    content_type = upstream.content_type or "text/plain"
+    upstream.release()
+    code, message = parse_upstream_error(text, status)
+    if slug:
+        print(f"[err] upstream {slug} returned {status}: {message[:500]}", flush=True)
+    response = _sse_response()
+    await response.prepare(request)
+    state = ResponsesStreamState(client_slug)
+    await state.start(response)
+    await state.fail(response, message, code=code)
+    try:
+        await response.write_eof()
+    except Exception:
+        pass
+    return response
+
+
 async def _error_response(upstream, *, slug: str | None = None) -> web.Response:
     text = await upstream.text()
+    status = upstream.status
+    content_type = upstream.content_type or "text/plain"
+    code, message = parse_upstream_error(text, status)
     if slug:
-        print(
-            f"[err] upstream {slug} returned {upstream.status}: {text[:500]}",
-            flush=True,
-        )
-    return web.Response(status=upstream.status, text=text, content_type=upstream.content_type or "text/plain")
+        print(f"[err] upstream {slug} returned {status}: {message[:500]}", flush=True)
+    upstream.release()
+    return web.Response(status=status, text=text, content_type=content_type)
 
 
 def _normalize_roles(messages: list[dict]) -> list[dict]:

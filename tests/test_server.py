@@ -20,6 +20,7 @@ from codex_shim.server import (
     _rewrite_response_model,
     _sanitize_chatgpt_passthrough_body,
     _set_active_model,
+    parse_upstream_error,
 )
 from codex_shim.catalog_slugs import codex_catalog_slug
 from codex_shim.settings import FALLBACK_CHATGPT_PASSTHROUGH_SLUGS
@@ -319,6 +320,45 @@ def _sse_events(text: str) -> list[dict]:
         if data and data != "[DONE]":
             events.append(json.loads(data))
     return events
+
+
+def test_parse_upstream_error_reads_zen_model_error():
+    body = json.dumps(
+        {
+            "type": "error",
+            "error": {
+                "type": "ModelError",
+                "message": (
+                    "Free promotion has ended for MiniMax M3 Free. "
+                    "You can continue using the model by subscribing to OpenCode Go"
+                ),
+            },
+        }
+    )
+    code, message = parse_upstream_error(body, 400)
+    assert code == "ModelError"
+    assert "Free promotion has ended" in message
+
+
+async def test_responses_stream_state_fail_emits_terminal_error_events():
+    class FakeResponse:
+        def __init__(self):
+            self.chunks: list[bytes] = []
+
+        async def write(self, data: bytes):
+            self.chunks.append(data)
+
+    downstream = FakeResponse()
+    state = ResponsesStreamState("oc-free-minimax-m3-free")
+    await state.start(downstream)
+    await state.fail(downstream, "Free promotion has ended", code="ModelError")
+    events = _sse_events(b"".join(downstream.chunks).decode())
+    assert events[1]["type"] == "error"
+    assert events[1]["message"] == "Free promotion has ended"
+    assert events[-1]["type"] == "response.failed"
+    assert events[-1]["response"]["status"] == "failed"
+    assert events[-1]["response"]["error"]["message"] == "Free promotion has ended"
+    assert b"data: [DONE]" in b"".join(downstream.chunks)
 
 
 async def test_streaming_openai_chat_response_completed_includes_usage(tmp_path):
