@@ -17,4 +17,6 @@ def test_systemd_unit_runs_sync_desktop_then_foreground(monkeypatch, tmp_path):
     assert "sync-desktop" in unit
     assert f'source "{load_env}"' in unit
     assert "ExecStart=" in unit
-    assert "WantedBy=default.target" in unit
+    assert "WantedBy=graphical-session.target" in unit
+    assert "network-online.target" not in unit
+    assert "network-ready-user.service" not in unit

@@ -466,8 +466,6 @@ def _systemd_unit_content(
     run_cmd = _systemd_shell_command(codex_shim_bin, common_args, "run")
     return f"""[Unit]
 Description=Codex BYOK shim
-After=network-online.target
-Wants=network-online.target
 
 [Service]
 Type=simple
@@ -477,8 +475,28 @@ Restart=on-failure
 RestartSec=3
 
 [Install]
-WantedBy=default.target
+WantedBy=graphical-session.target
 """
+
+
+SYSTEMD_NETWORK_READY_DROPIN = (
+    SYSTEMD_USER_UNIT.parent / "codex-shim.service.d" / "10-network-ready.conf"
+)
+NETWORK_READY_USER_UNIT = SYSTEMD_USER_UNIT.parent / "network-ready-user.service"
+
+
+def _ensure_network_ready_dropin() -> None:
+    if not NETWORK_READY_USER_UNIT.is_file():
+        return
+    SYSTEMD_NETWORK_READY_DROPIN.parent.mkdir(parents=True, exist_ok=True)
+    if SYSTEMD_NETWORK_READY_DROPIN.is_file():
+        return
+    SYSTEMD_NETWORK_READY_DROPIN.write_text(
+        """[Unit]
+After=network-ready-user.service
+Wants=network-ready-user.service
+"""
+    )
 
 
 def install_service(settings_path: Path, port: int) -> int:
@@ -498,6 +516,7 @@ def install_service(settings_path: Path, port: int) -> int:
             port=port,
         )
     )
+    _ensure_network_ready_dropin()
     for cmd in (
         ["systemctl", "--user", "daemon-reload"],
         ["systemctl", "--user", "enable", "--now", "codex-shim.service"],

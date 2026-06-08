@@ -11,9 +11,19 @@ and this project does not yet follow semantic versioning (pre-1.0).
 
 - Package management and docs now use uv (`uv.lock`, `uv sync`, `uv tool install
   -e .`, `uv run pytest`) instead of pip; CI uses `astral-sh/setup-uv`.
+- Namespace tool translation uses dot notation (`namespace.tool`) instead of
+  double underscores for BYOK chat/anthropic routes; `type: "namespace"` tools
+  in requests are expanded for upstream models.
+- `responses_compact` anthropic path now calls `_post_anthropic` instead of
+  incorrectly posting to chat completions.
 
 ### Added
 
+- `openai-responses` provider (`ShimModel.is_openai_responses`): passthrough to
+  upstream `/v1/responses` without chat-completions translation (raw SSE/JSON).
+- `parse_mcp_tool_reference()` accepts MCP chat names in both `mcp__srv__tool`
+  and `mcp__srv.tool` forms; streaming and non-streaming response paths preserve
+  `namespace` + `name` on `function_call` items for generic namespaces and MCP.
 - `codex_shim/tool_translate.py`: rewrite upstream MCP `function_call` items into
   passthrough shape (`namespace: "mcp__<server>"`, short tool name) so Codex
   CLI/Desktop executes MCP locally and `codex exec --json` shows `mcp_tool_call`

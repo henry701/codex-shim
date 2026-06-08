@@ -1,5 +1,13 @@
 # codex-shim
 
+> **Canonical upstream:** [0xSero/codex-shim](https://github.com/0xSero/codex-shim) is the
+> original project and the reference implementation most users should start from.
+>
+> **This repository** ([henry701/codex-shim](https://github.com/henry701/codex-shim)) is a
+> personal fork maintained for local Codex Desktop + BYOK workflows on my machines. It is
+> **not** focused on upstreaming changes. Upstream (or other forks) are welcome to borrow
+> ideas from here and reimplement them independently if they fit their goals.
+
 Run **Codex Desktop** against any BYOK model you can describe in
 `~/.codex-shim/models.json`, plus an optional passthrough to your **ChatGPT
 subscription's Codex model** — without rebuilding Codex.
@@ -11,10 +19,58 @@ Anthropic Messages, a generic OpenAI-shaped chat endpoint, or ChatGPT Codex
 passthrough), then translates streaming responses back into the shape Codex
 expects.
 
-> Tested on Codex Desktop **0.133.0-alpha.1** for macOS arm64. The shim server
-> and routing layer are plain Python/aiohttp and work on Windows, macOS, Linux,
-> WSL, and Git Bash. The only macOS-specific piece is the optional Desktop picker
-> ASAR patch, needed when Codex hides custom catalog entries.
+> Tested on Codex Desktop **0.133.0-alpha.1** for macOS arm64 and **26.602.x** on Linux
+> x64 (with an optional shim-picker rebuild). The shim server and routing layer are plain
+> Python/aiohttp and work on Windows, macOS, Linux, WSL, and Git Bash. macOS and Linux
+> Desktop builds may need an ASAR patch when Codex hides custom catalog entries.
+
+---
+
+## This fork (henry701)
+
+Upstream covers the core shim, translation layer, ChatGPT/Cursor passthrough, Auto Router,
+and the macOS picker patch. **This fork adds and hardens the pieces below** for a
+multi-provider local catalog that stays in sync with Codex Desktop.
+
+| Area | What the fork adds |
+|---|---|
+| **Auto-discovery** | `codex-shim discover` lists models pulled from provider APIs/CLIs: OpenCode Zen (free + paid), OpenRouter `:free` models, NVIDIA Integrate, and local OpenAI-compatible endpoints. `discover --refresh` busts cached Cursor catalog metadata. |
+| **Provider-prefixed slugs** | Discovered routes get stable prefixes (`or-`, `zen-`, `nvidia-`, `oc-free-`, …) so hundreds of models stay identifiable in the picker and logs. |
+| **`sync-desktop`** | Writes `~/.codex/custom_model_catalog.json` and the managed `codex_shim` block in `~/.codex/config.toml` (not only repo-local `.codex-shim/`). Used on login/systemd startup so Desktop always sees the latest catalog. |
+| **systemd user service** | `codex-shim install-service` installs a user unit that runs `sync-desktop` then `run` in the foreground. Targets `graphical-session.target` and, when present, a local `network-ready-user.service` drop-in so model refresh waits for NM + DNS. |
+| **Namespace tools (dot notation)** | Responses `type: "namespace"` tools (including `multi_agent_v1` / multi-agent V2) expand to `namespace.tool` on BYOK chat/anthropic routes and round-trip back to `namespace` + `name` on responses and streams. MCP refs accept `mcp__srv__tool` and `mcp__srv.tool`. |
+| **`openai-responses` provider** | Raw passthrough to upstream `/v1/responses` (no chat-completions translation) for providers that speak the Responses API natively. |
+| **BYOK agent-loop parity** | Codex-native `tool_search_call` / deferred MCP, namespaced MCP `function_call` items, streaming narration before tool calls, and fuller tool-output round-trips on BYOK routes (see changelog for the full fix list). |
+| **Toolchain** | [uv](https://docs.astral.sh/uv/) for install, lockfile, dev deps, and CI (`uv sync`, `uv tool install -e .`, `uv run pytest`). |
+
+**Typical fork workflow**
+
+```bash
+uv tool install -e .                    # or: uv sync && uv tool install -e .
+codex-shim discover --refresh           # preview auto-discovered routes
+codex-shim sync-desktop                 # push catalog + provider config into ~/.codex
+codex-shim install-service              # optional: user systemd unit at graphical login
+```
+
+On Linux, pair with [CodexDesktop-Rebuild](https://github.com/henry701/CodexDesktop-Rebuild) and
+`USE_SHIM_MODEL_PICKER=1` if Desktop's Statsig allowlist hides shim catalog entries.
+
+Discovery can be tuned in `~/.codex-shim/models.json`:
+
+```jsonc
+{
+  "discover": {
+    "zen": true,
+    "zen_public": true,
+    "openrouter_free": true,
+    "nvidia_integrate": true,
+    "local": true
+  },
+  "models": [ /* explicit BYOK entries */ ]
+}
+```
+
+Set `"discover": false` to disable all auto-discovery, or toggle individual keys.
 
 ---
 
@@ -83,16 +139,22 @@ Recommended on macOS/Linux/WSL/Git Bash (installs the `codex-shim` entry
 point from `pyproject.toml`):
 
 ```bash
-git clone https://github.com/0xSero/codex-shim ~/codex-shim
+git clone https://github.com/henry701/codex-shim ~/codex-shim
 cd ~/codex-shim
 uv sync
 uv tool install -e .
 ```
 
+For the canonical upstream tree instead:
+
+```bash
+git clone https://github.com/0xSero/codex-shim ~/codex-shim
+```
+
 Recommended on native Windows PowerShell/cmd:
 
 ```powershell
-git clone https://github.com/0xSero/codex-shim $HOME\codex-shim
+git clone https://github.com/henry701/codex-shim $HOME\codex-shim
 cd $HOME\codex-shim
 uv sync
 uv tool install -e .
@@ -115,7 +177,7 @@ Alternative on macOS/Linux/WSL/Git Bash (no global install, run from the
 checkout via uv):
 
 ```bash
-git clone https://github.com/0xSero/codex-shim ~/codex-shim
+git clone https://github.com/henry701/codex-shim ~/codex-shim
 cd ~/codex-shim
 uv sync
 uv run codex-shim generate
@@ -246,13 +308,16 @@ adapter, not an Internet-facing proxy.
 ### 2. Point Codex Desktop at it
 
 ```bash
+codex-shim sync-desktop      # fork: write ~/.codex/custom_model_catalog.json + config
 codex-shim app .             # launch Codex Desktop with the shim wired in
 ```
 
-`app` generates the catalog, starts the local daemon if needed, and writes a
-small managed block into `~/.codex/config.toml` so Codex Desktop uses the local
-provider. The previous config is backed up under `.codex-shim/` and the managed
-block can be removed with:
+`sync-desktop` (this fork) regenerates the catalog from `models.json` plus
+auto-discovered routes, writes `~/.codex/custom_model_catalog.json`, and installs
+the managed `codex_shim` provider block in `~/.codex/config.toml`. `app` does the
+same config wiring, starts the local daemon if needed, and launches Desktop. The
+previous config is backed up under `.codex-shim/` and the managed block can be
+removed with:
 
 ```bash
 codex-shim disable
@@ -345,8 +410,14 @@ Supported `provider` values:
 | provider | upstream API |
 |---|---|
 | `openai` | OpenAI `/v1/chat/completions` |
+| `openai-responses` | OpenAI `/v1/responses` (passthrough; no chat translation) |
 | `generic-chat-completion-api` | OpenAI-shaped chat completions |
 | `anthropic` | Anthropic `/v1/messages` |
+
+Namespace tools (`type: "namespace"` in Responses requests, including
+`multi_agent_v1` / multi-agent V2) are expanded to dotted chat names
+(`namespace.tool`) on BYOK chat/anthropic routes and split back into
+`namespace` + `name` on responses.
 
 The shim also accepts Anthropic Messages requests at
 `http://127.0.0.1:8765/v1/messages`. For `openai` and
@@ -912,7 +983,13 @@ network path, and how often the agent calls tools.
 
 ```text
 codex-shim generate          regenerate catalog/config without starting daemon
+codex-shim sync-desktop      fork: regenerate + write ~/.codex catalog and config
+codex-shim discover          fork: list auto-discoverable provider models
+codex-shim discover --refresh
+                            fork: refresh discovery caches (e.g. Cursor catalog)
 codex-shim start             regenerate catalog and start local shim daemon
+codex-shim run               run shim in foreground (systemd / debugging)
+codex-shim install-service   fork: install+enable user systemd unit
 codex-shim enable            start daemon; write managed ~/.codex/config.toml (model, provider, tool_search flag)
 codex-shim status            health check + model count
 codex-shim stop              stop daemon
@@ -1172,7 +1249,14 @@ streams.
 
 ## Contributing
 
-Good contributions include:
+**Upstream:** send general-purpose shim improvements to
+[0xSero/codex-shim](https://github.com/0xSero/codex-shim).
+
+**This fork:** issues and PRs here are fine for fork-specific workflow (discovery,
+`sync-desktop`, systemd, Linux Desktop packaging). There is no expectation that
+fork-only features will be cherry-picked upstream.
+
+Good contributions (either venue) include:
 
 - new provider translation tests;
 - captured stream fixtures for tricky tool-call/reasoning cases;
