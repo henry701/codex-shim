@@ -2230,12 +2230,9 @@ def _stub_codex_config(monkeypatch, tmp_path, *, model: str = "kimi-k26") -> "Pa
     config = tmp_path / "config.toml"
     config.write_text(
         f'model = "{model}"\n'
-        'model_provider = "codex_shim"\n'
-        '\n'
-        '[model_providers.codex_shim]\n'
-        'name = "Codex Shim"\n'
-        'base_url = "http://127.0.0.1:8765/v1"\n'
-        'wire_api = "responses"\n'
+        'model_provider = "openai"\n'
+        'openai_base_url = "http://127.0.0.1:8765/v1"\n'
+        'model_catalog_json = "/tmp/catalog.json"\n'
     )
     monkeypatch.setattr(server_module, "CODEX_CONFIG_PATH", config)
     return config
@@ -2258,12 +2255,12 @@ def test_current_managed_model_returns_none_when_config_missing(monkeypatch, tmp
     assert _current_managed_model() is None
 
 
-def test_set_active_model_rewrites_model_and_provider_name(monkeypatch, tmp_path):
+def test_set_active_model_rewrites_model_line(monkeypatch, tmp_path):
     config = _stub_codex_config(monkeypatch, tmp_path)
     _set_active_model("deepseek-v4-pro", "DeepSeek V4 Pro")
     text = config.read_text()
     assert 'model = "deepseek-v4-pro"' in text
-    assert 'name = "DeepSeek V4 Pro"' in text
+    assert 'model = "kimi-k26"' not in text
 
 
 def test_set_active_model_no_op_when_config_missing(monkeypatch, tmp_path):
@@ -2341,7 +2338,6 @@ async def test_switch_model_rewrites_config_without_restart(
         assert payload == {"ok": True, "model": "deepseek-v4-pro", "restarted": False}
         text = config.read_text()
         assert 'model = "deepseek-v4-pro"' in text
-        assert 'name = "DeepSeek V4 Pro"' in text
         assert restart_calls == []
     finally:
         await shim_client.close()

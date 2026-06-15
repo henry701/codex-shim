@@ -32,6 +32,7 @@ from .settings import (
     DEFAULT_SETTINGS,
     DEFAULT_HOST,
     DEFAULT_PORT,
+    OPENAI_PROVIDER_ID,
     PROVIDER_NAME,
     ModelSettings,
     available_model_slugs,
@@ -49,6 +50,7 @@ from .opencode_go import (
     OPENCODE_GO_BASE_URL,
     refresh_opencode_go_settings,
 )
+from .thread_migrate import migrate_thread_providers
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -68,7 +70,7 @@ WINDOWS_PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 WINDOWS_STILL_ACTIVE = 259
 PREVIOUS_TOP_LEVEL_PREFIX = "# codex-shim previous-top-level = "
 PREVIOUS_FEATURES_PREFIX = "# codex-shim previous-features = "
-MANAGED_TOP_LEVEL_KEYS = {"model", "model_provider", "model_catalog_json"}
+MANAGED_TOP_LEVEL_KEYS = {"model", "model_provider", "model_catalog_json", "openai_base_url"}
 MANAGED_FEATURES_SECTION = "features"
 MANAGED_FEATURE_KEY = "tool_search_always_defer_mcp_tools"
 MANAGED_FEATURE_KEYS = {MANAGED_FEATURE_KEY}
@@ -112,7 +114,7 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("run", help="Run the shim in the foreground (for systemd and debugging).")
     sub.add_parser(
         "sync-desktop",
-        help="Regenerate catalogs and sync ~/.codex/config.toml for Codex Desktop.",
+        help="Regenerate catalogs under ~/.codex (does not modify ~/.codex/config.toml).",
     )
     sub.add_parser(
         "install-service",
@@ -121,6 +123,15 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("status")
     sub.add_parser("patch-app", help="Patch Codex Desktop picker/sidebar handling for custom shim models.")
     sub.add_parser("restore-app", help="Restore Codex Desktop app.asar from the pre-patch backup.")
+    migrate_threads_parser = sub.add_parser(
+        "migrate-threads",
+        help="Rewrite legacy codex_shim thread rows to model_provider=openai in ~/.codex/state_*.sqlite.",
+    )
+    migrate_threads_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Report how many threads would be updated without writing.",
+    )
 
     opencode_parser = sub.add_parser("opencode-go", help="Discover and configure OpenCode Go models.")
     opencode_sub = opencode_parser.add_subparsers(dest="opencode_go_command", required=True)
@@ -179,6 +190,8 @@ def main(argv: list[str] | None = None) -> int:
         return patch_codex_app()
     if args.command == "restore-app":
         return restore_codex_app_bundle()
+    if args.command == "migrate-threads":
+        return migrate_threads_command(dry_run=args.dry_run)
     if args.command == "opencode-go":
         if args.opencode_go_command == "refresh":
             return refresh_opencode_go(args.settings, args.api_key_env, args.base_url, args.prefer, args.timeout)
@@ -263,7 +276,7 @@ def generate(settings_path: Path, port: int) -> None:
     print("No files under ~/.codex were modified.")
 
 
-def sync_desktop(settings_path: Path, port: int, model_slug: str | None = None) -> int:
+def sync_desktop(settings_path: Path, port: int, model_slug: str | None = None, *, install_config: bool = False) -> int:
     models = _load_models(settings_path)
     try:
         default_model_slug(models)
@@ -272,12 +285,16 @@ def sync_desktop(settings_path: Path, port: int, model_slug: str | None = None) 
     router_config = router_module.load_router_config(Path(settings_path).expanduser())
     desktop_catalog = _publish_catalog(models, router_config)
     write_config(models, CONFIG_PATH, CATALOG_PATH, port)
-    install_codex_config(settings_path, port, model_slug)
+    if install_config:
+        install_codex_config(settings_path, port, model_slug)
     discovered_count = sum(1 for model in models if model.raw.get("discovered"))
     catalog_models = len(json.loads(desktop_catalog.read_text()).get("models", []))
     print(f"Synced {catalog_models} Desktop catalog entries ({discovered_count} auto-discovered routes):")
     print(f"  desktop catalog: {desktop_catalog}")
-    print(f"  codex config:    {CODEX_CONFIG_PATH}")
+    if install_config:
+        print(f"  codex config:    {CODEX_CONFIG_PATH}")
+    else:
+        print(f"  codex config:    (unchanged; run `codex-shim enable` to wire the shim provider)")
     return 0
 
 
@@ -383,18 +400,21 @@ def install_codex_config(settings_path: Path, port: int, model_slug: str | None 
             MANAGED_FEATURE_KEYS,
         )
     cleaned = _remove_keys_from_section(cleaned, MANAGED_FEATURES_SECTION, MANAGED_FEATURE_KEYS)
-    provider_name = _provider_display_name(models, default_slug, router_config)
-    top_block, provider_block = _managed_config_blocks(
+    managed_block = _managed_config_block(
         default_slug,
         port,
         previous_top_level,
-        provider_name=provider_name,
         previous_features=previous_features,
     )
     cleaned = _apply_managed_features(cleaned)
-    CODEX_CONFIG_PATH.write_text(
-        top_block + "\n" + cleaned.lstrip() + "\n" + provider_block
-    )
+    CODEX_CONFIG_PATH.write_text(managed_block + "\n" + cleaned.lstrip())
+    result = migrate_thread_providers()
+    updated = int(result["updated"])
+    if updated:
+        print(
+            f"Migrated {updated} thread(s) from {PROVIDER_NAME} to {OPENAI_PROVIDER_ID} "
+            f"in {len(result['databases'])} database(s)."
+        )
     print(f"Installed shim config into {CODEX_CONFIG_PATH}.")
 
 
@@ -428,7 +448,7 @@ def list_models(settings_path: Path) -> int:
 
 
 def run_foreground(settings_path: Path, port: int) -> int:
-    sync_desktop(settings_path, port)
+    sync_desktop(settings_path, port, install_config=False)
     from .server import main as server_main
 
     server_main(
@@ -996,6 +1016,40 @@ def _provider_display_name(models, slug: str, router_config=None) -> str:
     return "Codex Shim"
 
 
+def migrate_threads_command(*, dry_run: bool = False) -> int:
+    result = migrate_thread_providers(dry_run=dry_run)
+    updated = int(result["updated"])
+    databases = result["databases"]
+    if not databases:
+        print("No legacy codex_shim threads found.")
+        return 0
+    action = "Would migrate" if dry_run else "Migrated"
+    for path, count in databases.items():
+        print(f"{action} {count} thread(s) in {path}")
+    print(f"{action} {updated} thread(s) total.")
+    return 0
+
+
+def _managed_config_block(
+    default_slug: str,
+    port: int,
+    previous_top_level: dict[str, str] | None = None,
+    previous_features: dict[str, str] | None = None,
+) -> str:
+    metadata = ""
+    if previous_top_level:
+        metadata += PREVIOUS_TOP_LEVEL_PREFIX + json.dumps(previous_top_level, sort_keys=True) + "\n"
+    if previous_features:
+        metadata += PREVIOUS_FEATURES_PREFIX + json.dumps(previous_features, sort_keys=True) + "\n"
+    return f'''{MANAGED_BEGIN}
+{metadata}model = "{_toml_escape(default_slug)}"
+model_provider = "{OPENAI_PROVIDER_ID}"
+openai_base_url = "http://127.0.0.1:{port}/v1"
+model_catalog_json = "{_toml_escape(str(DESKTOP_CATALOG_PATH))}"
+{MANAGED_END}
+'''
+
+
 def _managed_config_blocks(
     default_slug: str,
     port: int,
@@ -1003,31 +1057,8 @@ def _managed_config_blocks(
     provider_name: str = "Codex Shim",
     previous_features: dict[str, str] | None = None,
 ) -> tuple[str, str]:
-    metadata = ""
-    if previous_top_level:
-        metadata += PREVIOUS_TOP_LEVEL_PREFIX + json.dumps(previous_top_level, sort_keys=True) + "\n"
-    if previous_features:
-        metadata += PREVIOUS_FEATURES_PREFIX + json.dumps(previous_features, sort_keys=True) + "\n"
-    top_block = f'''{MANAGED_BEGIN}
-{metadata}model = "{_toml_escape(default_slug)}"
-model_provider = "{PROVIDER_NAME}"
-model_catalog_json = "{_toml_escape(str(DESKTOP_CATALOG_PATH))}"
-{MANAGED_END}
-'''
-
-    provider_block = f'''{MANAGED_BEGIN}
-[model_providers.{PROVIDER_NAME}]
-name = "{_toml_escape(provider_name)}"
-base_url = "http://127.0.0.1:{port}/v1"
-wire_api = "responses"
-requires_openai_auth = true
-experimental_bearer_token = "dummy"
-request_max_retries = 3
-stream_max_retries = 3
-stream_idle_timeout_ms = 600000
-{MANAGED_END}
-'''
-    return top_block, provider_block
+    block = _managed_config_block(default_slug, port, previous_top_level, previous_features)
+    return block, ""
 
 
 def _managed_feature_block_lines() -> list[str]:

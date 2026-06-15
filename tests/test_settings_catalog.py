@@ -457,6 +457,8 @@ def test_managed_config_escapes_windows_catalog_path(monkeypatch):
     monkeypatch.setattr(cli, "DESKTOP_CATALOG_PATH", Path(desktop_catalog))
     top_block, _ = cli._managed_config_blocks("vendor\\model", 8765)
     assert 'model = "vendor\\\\model"' in top_block
+    assert 'model_provider = "openai"' in top_block
+    assert 'openai_base_url = "http://127.0.0.1:8765/v1"' in top_block
     assert 'model_catalog_json = "C:\\\\Users\\\\User\\\\.codex\\\\custom_model_catalog.json"' in top_block
 
 
@@ -480,8 +482,9 @@ def test_install_codex_config_is_idempotent(monkeypatch, tmp_path):
     cli.install_codex_config(settings, 8765, "llama3.2")
 
     text = config_path.read_text()
-    assert text.count("[model_providers.codex_shim]") == 1
-    assert text.count("model_provider = \"codex_shim\"") == 1
+    assert "[model_providers.codex_shim]" not in text
+    assert text.count('model_provider = "openai"') == 1
+    assert text.count('openai_base_url = "http://127.0.0.1:8765/v1"') == 1
     assert text.count("model_catalog_json") == 1
     assert text.count("[features]") == 1
     assert text.count("tool_search_always_defer_mcp_tools = true") == 1
@@ -626,7 +629,9 @@ def test_install_and_restore_preserve_displaced_top_level_config(monkeypatch, tm
     installed = config_path.read_text()
     assert cli.PREVIOUS_TOP_LEVEL_PREFIX in installed
     assert '\nmodel = "llama3-2"\n' in installed
-    assert '\nmodel_provider = "openai"\n' not in installed
+    assert installed.count('model_provider = "openai"') == 1
+    assert 'model = "gpt-5.5"' not in installed
+    assert 'model_catalog_json = "/tmp/catalog.json"' not in installed
     assert '[profiles.dev]\nmodel = "profile-model"' in installed
 
     cli.restore_codex_config()

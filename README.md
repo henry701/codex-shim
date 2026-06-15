@@ -36,8 +36,8 @@ multi-provider local catalog that stays in sync with Codex Desktop.
 |---|---|
 | **Auto-discovery** | `codex-shim discover` lists models pulled from provider APIs/CLIs: OpenCode Zen (free + paid), OpenRouter `:free` models, NVIDIA Integrate, and local OpenAI-compatible endpoints. `discover --refresh` busts cached Cursor catalog metadata. |
 | **Provider-prefixed slugs** | Discovered routes get stable prefixes (`or-`, `zen-`, `nvidia-`, `oc-free-`, …) so hundreds of models stay identifiable in the picker and logs. |
-| **`sync-desktop`** | Writes `~/.codex/custom_model_catalog.json` and the managed `codex_shim` block in `~/.codex/config.toml` (not only repo-local `.codex-shim/`). Used on login/systemd startup so Desktop always sees the latest catalog. |
-| **systemd user service** | `codex-shim install-service` installs a user unit that runs `sync-desktop` then `run` in the foreground. Targets `graphical-session.target` and, when present, a local `network-ready-user.service` drop-in so model refresh waits for NM + DNS. |
+| **`sync-desktop`** | Writes `~/.codex/custom_model_catalog.json` only. Does **not** change `~/.codex/config.toml` — use `codex-shim enable` (or `app`) to wire the shim provider. |
+| **systemd user service** | `codex-shim install-service` installs a user unit that runs `sync-desktop` then `run` in the foreground (catalog refresh only; CLI config stays on mainline until `enable`). Targets `graphical-session.target` and, when present, a local `network-ready-user.service` drop-in so model refresh waits for NM + DNS. |
 | **Namespace tools (dot notation)** | Responses `type: "namespace"` tools (including `multi_agent_v1` / multi-agent V2) expand to `namespace.tool` on BYOK chat/anthropic routes and round-trip back to `namespace` + `name` on responses and streams. MCP refs accept `mcp__srv__tool` and `mcp__srv.tool`. |
 | **`openai-responses` provider** | Raw passthrough to upstream `/v1/responses` (no chat-completions translation) for providers that speak the Responses API natively. |
 | **BYOK agent-loop parity** | Codex-native `tool_search_call` / deferred MCP, namespaced MCP `function_call` items, streaming narration before tool calls, and fuller tool-output round-trips on BYOK routes (see changelog for the full fix list). |
@@ -48,7 +48,8 @@ multi-provider local catalog that stays in sync with Codex Desktop.
 ```bash
 uv tool install -e .                    # or: uv sync && uv tool install -e .
 codex-shim discover --refresh           # preview auto-discovered routes
-codex-shim sync-desktop                 # push catalog + provider config into ~/.codex
+codex-shim sync-desktop                 # refresh ~/.codex catalog (config unchanged)
+codex-shim enable                       # wire shim into ~/.codex/config.toml + start daemon
 codex-shim install-service              # optional: user systemd unit at graphical login
 ```
 
@@ -308,16 +309,18 @@ adapter, not an Internet-facing proxy.
 ### 2. Point Codex Desktop at it
 
 ```bash
-codex-shim sync-desktop      # fork: write ~/.codex/custom_model_catalog.json + config
+codex-shim sync-desktop      # fork: refresh ~/.codex/custom_model_catalog.json only
+codex-shim enable            # wire shim provider into ~/.codex/config.toml + start daemon
 codex-shim app .             # launch Codex Desktop with the shim wired in
 ```
 
-`sync-desktop` (this fork) regenerates the catalog from `models.json` plus
-auto-discovered routes, writes `~/.codex/custom_model_catalog.json`, and installs
-the managed `codex_shim` provider block in `~/.codex/config.toml`. `app` does the
-same config wiring, starts the local daemon if needed, and launches Desktop. The
-previous config is backed up under `.codex-shim/` and the managed block can be
-removed with:
+`sync-desktop` regenerates the catalog from `models.json` plus auto-discovered routes
+and writes `~/.codex/custom_model_catalog.json`. It does **not** modify
+`~/.codex/config.toml` (so your CLI can stay on mainline `openai` while the systemd
+service keeps the catalog fresh). Run `codex-shim enable` or `codex-shim app` to
+install the managed `codex_shim` provider block. `app` also starts the local daemon if
+needed and launches Desktop. The previous config is backed up under `.codex-shim/` and
+the managed block can be removed with:
 
 ```bash
 codex-shim disable
@@ -983,7 +986,7 @@ network path, and how often the agent calls tools.
 
 ```text
 codex-shim generate          regenerate catalog/config without starting daemon
-codex-shim sync-desktop      fork: regenerate + write ~/.codex catalog and config
+codex-shim sync-desktop      fork: refresh ~/.codex catalog (config.toml unchanged)
 codex-shim discover          fork: list auto-discoverable provider models
 codex-shim discover --refresh
                             fork: refresh discovery caches (e.g. Cursor catalog)

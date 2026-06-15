@@ -33,7 +33,6 @@ from .settings import (
     DEFAULT_SETTINGS,
     DEFAULT_HOST,
     DEFAULT_PORT,
-    PROVIDER_NAME,
     ModelSettings,
     ShimModel,
     available_model_slugs,
@@ -3231,14 +3230,10 @@ def _current_managed_model() -> str | None:
 
 
 _MODEL_LINE_RE = re.compile(r'(?m)^(\s*model\s*=\s*")[^"]*(")')
-_PROVIDER_NAME_RE = re.compile(
-    r'(\[model_providers\.' + re.escape(PROVIDER_NAME) + r'\][^\[]*?\n\s*name\s*=\s*")[^"]*(")',
-    re.DOTALL,
-)
 
 
 def _set_active_model(slug: str, display_name: str | None = None) -> None:
-    """Rewrite the active model + provider label in ~/.codex/config.toml."""
+    """Rewrite the active model in ~/.codex/config.toml."""
     if not CODEX_CONFIG_PATH.exists():
         return
     try:
@@ -3246,14 +3241,13 @@ def _set_active_model(slug: str, display_name: str | None = None) -> None:
     except OSError:
         return
     text = _MODEL_LINE_RE.sub(rf'\g<1>{slug}\g<2>', text, count=1)
-    if display_name:
-        text = _PROVIDER_NAME_RE.sub(rf'\g<1>{display_name}\g<2>', text, count=1)
     try:
         CODEX_CONFIG_PATH.write_text(text)
     except OSError as exc:
         print(f"[switch] failed to write {CODEX_CONFIG_PATH}: {exc}", flush=True)
         return
-    print(f"[switch] set active model to {slug} ({display_name})", flush=True)
+    label = display_name or slug
+    print(f"[switch] set active model to {slug} ({label})", flush=True)
 
 
 def _restart_codex_app() -> None:
