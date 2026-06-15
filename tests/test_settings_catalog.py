@@ -628,6 +628,18 @@ def test_install_and_restore_preserve_displaced_top_level_config(monkeypatch, tm
     cli.install_codex_config(settings, 8765, "llama3.2")
     installed = config_path.read_text()
     assert cli.PREVIOUS_TOP_LEVEL_PREFIX in installed
+    previous_payload = json.loads(
+        next(
+            line[len(cli.PREVIOUS_TOP_LEVEL_PREFIX) :]
+            for line in installed.splitlines()
+            if line.strip().startswith(cli.PREVIOUS_TOP_LEVEL_PREFIX)
+        )
+    )
+    assert previous_payload == {
+        "model": '"gpt-5.5"',
+        "model_provider": '"openai"',
+        "model_catalog_json": '"/tmp/catalog.json"',
+    }
     assert '\nmodel = "llama3-2"\n' in installed
     assert installed.count('model_provider = "openai"') == 1
     assert 'model = "gpt-5.5"' not in installed
@@ -641,6 +653,63 @@ def test_install_and_restore_preserve_displaced_top_level_config(monkeypatch, tm
         'model_provider = "openai"\n'
         'model_catalog_json = "/tmp/catalog.json"\n'
         '[profiles.dev]\nmodel = "profile-model"\n'
+    )
+
+
+def test_restore_reads_legacy_full_line_previous_top_level_metadata(monkeypatch, tmp_path):
+    config_path = tmp_path / ".codex" / "config.toml"
+    config_path.parent.mkdir()
+    config_path.write_text(
+        f"{cli.MANAGED_BEGIN}\n"
+        '# codex-shim previous-top-level = {"model": "model = \\"gpt-5.5\\""}\n'
+        'model = "codex-gpt-5-5"\n'
+        'model_provider = "openai"\n'
+        'openai_base_url = "http://127.0.0.1:8765/v1"\n'
+        f"{cli.MANAGED_END}\n"
+        "\n"
+        "[features]\n"
+        "apps = true\n"
+    )
+    monkeypatch.setattr(cli, "CODEX_CONFIG_PATH", config_path)
+    monkeypatch.setattr(cli, "CODEX_CONFIG_BACKUP_PATH", tmp_path / "backup.toml")
+
+    cli.restore_codex_config()
+    restored = config_path.read_text().rstrip() + "\n"
+    assert restored == 'model = "gpt-5.5"\n[features]\napps = true\n'
+
+
+def test_install_and_restore_preserve_openai_base_url(monkeypatch, tmp_path):
+    settings = tmp_path / "models.json"
+    settings.write_text(
+        json.dumps(
+            {
+                "models": [
+                    {
+                        "model": "llama3.2",
+                        "display_name": "Llama",
+                        "provider": "generic-chat-completion-api",
+                        "base_url": "http://127.0.0.1:11434/v1",
+                    }
+                ]
+            }
+        )
+    )
+    config_path = tmp_path / ".codex" / "config.toml"
+    config_path.parent.mkdir()
+    config_path.write_text(
+        'model = "gpt-5.5"\n'
+        'openai_base_url = "https://api.openai.com/v1"\n'
+    )
+    monkeypatch.setattr(cli, "RUNTIME_DIR", tmp_path / ".codex-shim")
+    monkeypatch.setattr(cli, "CODEX_CONFIG_PATH", config_path)
+    monkeypatch.setattr(cli, "CODEX_CONFIG_BACKUP_PATH", tmp_path / ".codex-shim" / "config.toml.before-codex-shim")
+
+    cli.install_codex_config(settings, 8765, "llama3.2")
+    cli.restore_codex_config()
+    restored = config_path.read_text().rstrip() + "\n"
+    assert restored == (
+        'model = "gpt-5.5"\n'
+        'openai_base_url = "https://api.openai.com/v1"\n'
     )
 
 

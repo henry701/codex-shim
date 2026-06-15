@@ -71,6 +71,12 @@ WINDOWS_STILL_ACTIVE = 259
 PREVIOUS_TOP_LEVEL_PREFIX = "# codex-shim previous-top-level = "
 PREVIOUS_FEATURES_PREFIX = "# codex-shim previous-features = "
 MANAGED_TOP_LEVEL_KEYS = {"model", "model_provider", "model_catalog_json", "openai_base_url"}
+MANAGED_TOP_LEVEL_RESTORE_ORDER = (
+    "model",
+    "model_provider",
+    "openai_base_url",
+    "model_catalog_json",
+)
 MANAGED_FEATURES_SECTION = "features"
 MANAGED_FEATURE_KEY = "tool_search_always_defer_mcp_tools"
 MANAGED_FEATURE_KEYS = {MANAGED_FEATURE_KEY}
@@ -1127,6 +1133,24 @@ def _remove_managed_config(text: str) -> str:
     return text
 
 
+def _stored_config_rhs(key: str, stored: str) -> str:
+    """Return the TOML RHS for a stored value (value-only or legacy full assignment)."""
+    stripped = stored.strip()
+    if "=" in stripped:
+        lhs, rhs = stripped.split("=", 1)
+        if lhs.strip() == key:
+            return rhs.strip()
+    return stripped
+
+
+def _format_top_level_assignment(key: str, stored: str) -> str:
+    return f"{key} = {_stored_config_rhs(key, stored)}"
+
+
+def _format_section_assignment(key: str, stored: str) -> str:
+    return _format_top_level_assignment(key, stored)
+
+
 def _remove_top_level_keys(text: str, keys: set[str]) -> str:
     lines = text.splitlines()
     output: list[str] = []
@@ -1153,7 +1177,7 @@ def _extract_top_level_key_lines(text: str, keys: set[str]) -> dict[str, str]:
             continue
         key = stripped.split("=", 1)[0].strip()
         if key in keys:
-            found[key] = line
+            found[key] = stripped.split("=", 1)[1].strip()
     return found
 
 
@@ -1208,8 +1232,8 @@ def _restore_missing_top_level_keys(text: str, previous_top_level: dict[str, str
         return text
     current = _extract_top_level_key_lines(text, MANAGED_TOP_LEVEL_KEYS)
     lines = [
-        previous_top_level[key]
-        for key in ("model", "model_provider", "model_catalog_json")
+        _format_top_level_assignment(key, previous_top_level[key])
+        for key in MANAGED_TOP_LEVEL_RESTORE_ORDER
         if key in previous_top_level and key not in current
     ]
     if not lines:
@@ -1252,7 +1276,7 @@ def _extract_section_key_lines(text: str, section: str, keys: set[str]) -> dict[
             continue
         key = stripped.split("=", 1)[0].strip()
         if key in keys:
-            found[key] = line
+            found[key] = stripped.split("=", 1)[1].strip()
     return found
 
 
@@ -1279,10 +1303,15 @@ def _restore_features_keys(text: str, previous_features: dict[str, str]) -> str:
         return text
     restored = text
     for key in MANAGED_FEATURE_KEYS:
-        line = previous_features.get(key)
-        if not line:
+        stored = previous_features.get(key)
+        if not stored:
             continue
-        restored = _upsert_key_in_section(restored, MANAGED_FEATURES_SECTION, key, line)
+        restored = _upsert_key_in_section(
+            restored,
+            MANAGED_FEATURES_SECTION,
+            key,
+            _format_section_assignment(key, stored),
+        )
     return restored
 
 

@@ -14,6 +14,9 @@ and this project does not yet follow semantic versioning (pre-1.0).
   threads stay unified under the OpenAI provider. `enable` / `model use` migrate
   legacy `codex_shim` rows in `~/.codex/state_*.sqlite`; run `codex-shim
   migrate-threads` manually if needed.
+- Managed-config backup metadata stores displaced top-level values as TOML RHS
+  fragments (not full `key = value` lines), with backward-compatible restore for
+  older installs.
 - `sync-desktop` and the systemd/`run` path refresh `~/.codex/custom_model_catalog.json`
   only; they no longer write `~/.codex/config.toml`. Use `codex-shim enable` (or `app` /
   `model use`) to install the managed shim provider block so the CLI can stay on
