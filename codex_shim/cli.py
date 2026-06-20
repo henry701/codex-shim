@@ -301,7 +301,7 @@ def sync_desktop(settings_path: Path, port: int, model_slug: str | None = None, 
     if install_config:
         print(f"  codex config:    {CODEX_CONFIG_PATH}")
     else:
-        print(f"  codex config:    (unchanged; run `codex-shim enable` to wire the shim provider)")
+        print(f"  codex config:    (unchanged; run `codex-shim enable` to wire shim routing)")
     return 0
 
 
@@ -428,6 +428,13 @@ def install_codex_config(settings_path: Path, port: int, model_slug: str | None 
     )
     cleaned = _apply_managed_features(cleaned)
     CODEX_CONFIG_PATH.write_text(managed_block + "\n" + cleaned.lstrip())
+    result = migrate_thread_providers()
+    updated = int(result["updated"])
+    if updated:
+        print(
+            f"Migrated {updated} thread(s) from {PROVIDER_NAME} to {OPENAI_PROVIDER_ID} "
+            f"in {len(result['databases'])} database(s)."
+        )
     print(f"Installed shim config into {CODEX_CONFIG_PATH}.")
 
 
@@ -1060,15 +1067,9 @@ def _managed_config_block(
         metadata += PREVIOUS_FEATURES_PREFIX + json.dumps(previous_features, sort_keys=True) + "\n"
     return f'''{MANAGED_BEGIN}
 {metadata}model = "{_toml_escape(default_slug)}"
-model_provider = "{PROVIDER_NAME}"
+model_provider = "{OPENAI_PROVIDER_ID}"
+openai_base_url = "http://127.0.0.1:{port}/v1"
 model_catalog_json = "{_toml_escape(str(DESKTOP_CATALOG_PATH))}"
-
-[model_providers.{PROVIDER_NAME}]
-name = "Codex Shim"
-base_url = "http://127.0.0.1:{port}/v1"
-wire_api = "responses"
-requires_openai_auth = false
-supports_websockets = true
 {MANAGED_END}
 '''
 

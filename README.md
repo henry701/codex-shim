@@ -36,7 +36,7 @@ multi-provider local catalog that stays in sync with Codex Desktop.
 |---|---|
 | **Auto-discovery** | `codex-shim discover` lists models pulled from provider APIs/CLIs: OpenCode Zen (free + paid), OpenRouter `:free` models, NVIDIA Integrate, and local OpenAI-compatible endpoints. `discover --refresh` busts cached Cursor catalog metadata. |
 | **Provider-prefixed slugs** | Discovered routes get stable prefixes (`or-`, `zen-`, `nvidia-`, `oc-free-`, …) so hundreds of models stay identifiable in the picker and logs. |
-| **`sync-desktop`** | Writes `~/.codex/custom_model_catalog.json` only. Does **not** change `~/.codex/config.toml` — use `codex-shim enable` (or `app`) to wire the shim provider. |
+| **`sync-desktop`** | Writes `~/.codex/custom_model_catalog.json` only. Does **not** change `~/.codex/config.toml` — use `codex-shim enable` (or `app`) to wire OpenAI-provider shim routing. |
 | **systemd user service** | `codex-shim install-service` installs a user unit that runs `sync-desktop` then `run` in the foreground (catalog refresh only; CLI config stays untouched until `enable`). Targets `graphical-session.target` and, when present, a local `network-ready-user.service` drop-in so model refresh waits for NM + DNS. |
 | **Namespace tools (dot notation)** | Responses `type: "namespace"` tools (including `multi_agent_v1` / multi-agent V2) expand to `namespace.tool` on BYOK chat/anthropic routes and round-trip back to `namespace` + `name` on responses and streams. MCP refs accept `mcp__srv__tool` and `mcp__srv.tool`. |
 | **`openai-responses` provider** | Raw passthrough to upstream `/v1/responses` (no chat-completions translation) for providers that speak the Responses API natively. |
@@ -49,7 +49,7 @@ multi-provider local catalog that stays in sync with Codex Desktop.
 uv tool install -e .                    # or: uv sync && uv tool install -e .
 codex-shim discover --refresh           # preview auto-discovered routes
 codex-shim sync-desktop                 # refresh ~/.codex catalog (config unchanged)
-codex-shim enable                       # wire shim into ~/.codex/config.toml + start daemon
+codex-shim enable                       # wire OpenAI-provider shim routing into ~/.codex/config.toml + start daemon
 codex-shim install-service              # optional: user systemd unit at graphical login
 ```
 
@@ -310,7 +310,7 @@ adapter, not an Internet-facing proxy.
 
 ```bash
 codex-shim sync-desktop      # fork: refresh ~/.codex/custom_model_catalog.json only
-codex-shim enable            # wire shim provider into ~/.codex/config.toml + start daemon
+codex-shim enable            # wire OpenAI-provider shim routing into ~/.codex/config.toml + start daemon
 codex-shim app .             # launch Codex Desktop with the shim wired in
 ```
 
@@ -318,12 +318,15 @@ codex-shim app .             # launch Codex Desktop with the shim wired in
 and writes `~/.codex/custom_model_catalog.json`. It does **not** modify
 `~/.codex/config.toml`; the systemd service can keep the catalog fresh without
 changing the CLI's active provider. Run `codex-shim enable` or `codex-shim app`
-to install the managed `codex_shim` provider block. That provider supports
-Responses WebSockets for ChatGPT passthrough models and accepts zstd-compressed
-Codex request bodies. BYOK routes remain HTTPS-backed internally; if Codex uses
-the WebSocket transport for a BYOK slug, the shim bridges that frame through its
-existing local HTTP `/v1/responses` route and relays the resulting SSE events
-back over the WebSocket. `app` also starts the local daemon if needed and
+to install managed `model_provider = "openai"` routing with `openai_base_url`
+pointed at the local shim. This keeps Desktop sessions in the same provider
+namespace across restarts and migrates legacy `codex_shim` thread rows to
+`openai`. The route supports Responses WebSockets for ChatGPT passthrough models
+and accepts zstd-compressed Codex request bodies. BYOK routes remain HTTPS-backed
+internally; if Codex uses the WebSocket transport for a BYOK slug, the shim
+bridges that frame through its existing local HTTP `/v1/responses` route and
+relays the resulting SSE events back over the WebSocket. `app` also starts the
+local daemon if needed and
 launches Desktop. The previous config is backed up under
 `.codex-shim/` and the managed block can be removed with:
 
@@ -523,9 +526,9 @@ is supplied.
 
 Repeated `codex-shim enable`, `codex-shim app`, and `codex-shim model use ...`
 runs are idempotent: the shim-managed top-level keys,
-`[model_providers.codex_shim]`, and managed `[features]` block are removed before
-the new managed blocks are written, so duplicate profile/provider keys should not
-accumulate.
+legacy `[model_providers.codex_shim]` block, and managed `[features]` block are
+removed before the new managed blocks are written, so duplicate profile/provider
+keys should not accumulate.
 
 Codex may make small background calls to OpenAI model slugs such as
 `gpt-5.4-mini` for its own product behavior. Those calls are not Ollama routing
@@ -544,8 +547,8 @@ A single-boolean ASAR patch flips the allowlist branch off so the picker only
 checks the local `hidden` flag (which this catalog never sets). On recent
 Codex Desktop builds, the patch also changes the local recent-thread loader
 from `modelProviders: null` to `modelProviders: []` so the sidebar continues to
-show existing native `openai` chats while Desktop is routed through the
-`codex_shim` provider.
+show existing native `openai` chats even if Desktop is routed through a custom
+provider.
 
 The combined patch has been tested on Codex Desktop **26.519.41501** /
 `codex-cli 0.133.0-alpha.1` on macOS arm64.
@@ -1037,11 +1040,9 @@ restarting the CLI:
   the shim currently knows about, with the active one highlighted.
 - `GET /api/models` — JSON list backing the picker.
 - `POST /api/switch` — `{"slug": "...", "restart_codex": true|false}`. The
-  shim rewrites `model = "..."` and the `[model_providers.codex_shim]`
-  `name = "..."` in `~/.codex/config.toml` so the Codex Desktop UI shows
-  the selected model's display name (e.g. "Kimi K2.6") instead of the
-  generic "Codex Shim" label, and optionally relaunches Codex Desktop
-  (`open -a Codex` on macOS, `taskkill` + `Codex.exe` on Windows). This
+  shim rewrites the top-level `model = "..."` in `~/.codex/config.toml` and
+  optionally relaunches Codex Desktop (`open -a Codex` on macOS, `taskkill` +
+  `Codex.exe` on Windows). This
   state-changing endpoint requires the per-process
   `X-Codex-Shim-Picker-Token` header embedded in `/picker`.
 
@@ -1242,11 +1243,13 @@ Config behavior:
 - `codex-shim generate`, `start`, `stop`, `restart`, `list`, `status`, and
   `codex-shim codex -- ...` do not persistently modify `~/.codex/config.toml`.
 - `codex-shim enable`, `codex-shim app`, and `codex-shim model use <slug>` write
-  managed blocks to `~/.codex/config.toml`. The managed provider is
-  `codex_shim`, with `wire_api = "responses"`, `supports_websockets = true`,
-  and `requires_openai_auth = false`. If existing top-level Codex model keys or
-  managed `[features]` keys are displaced, the managed block records them so
-  disable can restore those keys without reverting unrelated config edits.
+  managed blocks to `~/.codex/config.toml`. The managed route uses
+  `model_provider = "openai"` and `openai_base_url = "http://127.0.0.1:8765/v1"`
+  so Codex Desktop keeps showing sessions under the same provider namespace.
+  Legacy `codex_shim` rows in `~/.codex/state_*.sqlite` are migrated to
+  `openai`. If existing top-level Codex model keys or managed `[features]` keys
+  are displaced, the managed block records them so disable can restore those keys
+  without reverting unrelated config edits.
 - `codex-shim disable` removes the managed blocks, restores displaced top-level
   model keys and prior `[features]` values when present, and stops the daemon.
 

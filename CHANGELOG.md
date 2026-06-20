@@ -9,18 +9,20 @@ and this project does not yet follow semantic versioning (pre-1.0).
 
 ### Changed
 
-- Shim routing uses a managed `[model_providers.codex_shim]` provider with
-  `supports_websockets = true` and `requires_openai_auth = false`. ChatGPT
-  passthrough models can use Codex's Responses WebSocket transport through the
-  shim; BYOK models are bridged through the shim's existing HTTPS-backed
-  `/v1/responses` translation path and relayed back over the WebSocket.
+- Shim routing again uses Codex's built-in `openai` provider with
+  `openai_base_url` pointed at the local shim, so Desktop recent threads stay in
+  the same provider namespace across reboots. `enable` / `model use` migrate
+  legacy `codex_shim` thread rows to `openai`. ChatGPT passthrough models can
+  use Codex's Responses WebSocket transport through the shim; BYOK models are
+  bridged through the shim's existing HTTPS-backed `/v1/responses` translation
+  path and relayed back over the WebSocket.
 - Managed-config backup metadata stores displaced top-level values as TOML RHS
   fragments (not full `key = value` lines), with backward-compatible restore for
   older installs.
 - `sync-desktop` and the systemd/`run` path refresh `~/.codex/custom_model_catalog.json`
   only; they no longer write `~/.codex/config.toml`. Use `codex-shim enable` (or `app` /
-  `model use`) to install the managed shim provider block while the background
-  service keeps the catalog current.
+  `model use`) to install the managed OpenAI-provider shim routing while the
+  background service keeps the catalog current.
 - Package management and docs now use uv (`uv.lock`, `uv sync`, `uv tool install
   -e .`, `uv run pytest`) instead of pip; CI uses `astral-sh/setup-uv`.
 - Namespace tool translation uses dot notation (`namespace.tool`) instead of
@@ -85,14 +87,11 @@ and this project does not yet follow semantic versioning (pre-1.0).
 - `CHANGELOG.md` (this file).
 - Web-based model picker at `GET /picker` (with `GET /api/models` and
   `POST /api/switch`) so the active shim model can be swapped from a browser
-  without the CLI. Switching rewrites `model = "..."` and the
-  `[model_providers.codex_shim]` `name = "..."` in `~/.codex/config.toml` so
-  the Codex Desktop UI shows the selected model name (e.g. "Kimi K2.6")
-  instead of the generic "Codex Shim" label. Optional auto-restart of Codex
-  Desktop is cross-platform (`taskkill` + `Codex.exe` on Windows,
-  `osascript` + `open -a Codex` on macOS). All picker routes are behind the
-  existing `Host`-header allowlist, so a visited web page still cannot drive
-  them via DNS rebinding.
+  without the CLI. Switching rewrites the top-level `model = "..."` in
+  `~/.codex/config.toml`. Optional auto-restart of Codex Desktop is
+  cross-platform (`taskkill` + `Codex.exe` on Windows, `osascript` + `open -a
+  Codex` on macOS). All picker routes are behind the existing `Host`-header
+  allowlist, so a visited web page still cannot drive them via DNS rebinding.
 - Responses WebSocket bridge for ChatGPT passthrough models. The shim accepts
   Codex `response.create` WebSocket frames on `/v1/responses`, forwards them to
   ChatGPT's native Responses endpoint, and relays upstream SSE events back as
@@ -146,7 +145,7 @@ and this project does not yet follow semantic versioning (pre-1.0).
   `extraHeaders`.
 - `codex-shim patch-app` now also patches the Codex Desktop sidebar's recent
   thread loader so native `openai` chats remain visible while Desktop is routed
-  through the `codex_shim` provider. Tested on Codex Desktop 26.519.41501 /
+  through any custom-provider shim config. Tested on Codex Desktop 26.519.41501 /
   `codex-cli 0.133.0-alpha.1` on macOS arm64.
 - `patch-app` now updates `ElectronAsarIntegrity` in `Info.plist` after
   repacking `app.asar`, and `restore-app` restores or recomputes that metadata

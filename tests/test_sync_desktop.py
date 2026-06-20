@@ -75,8 +75,8 @@ def test_sync_desktop_can_install_config(monkeypatch, tmp_path):
 
     config_text = config_path.read_text()
     assert str(desktop_catalog) in config_text
-    assert 'model_provider = "codex_shim"' in config_text
-    assert 'base_url = "http://127.0.0.1:8765/v1"' in config_text
-    assert "[model_providers.codex_shim]" in config_text
-    assert "supports_websockets = true" in config_text
+    assert 'model_provider = "openai"' in config_text
+    assert 'openai_base_url = "http://127.0.0.1:8765/v1"' in config_text
+    assert "[model_providers.codex_shim]" not in config_text
+    assert "supports_websockets" not in config_text
     assert "enable_request_compression" not in config_text
