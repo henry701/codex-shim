@@ -56,3 +56,12 @@ def test_stop_returns_error_when_process_survives_sigkill(monkeypatch, tmp_path)
 
     assert cli.stop() == 1
     assert pid_path.exists()
+
+
+def test_status_reports_healthy_foreground_service_without_pid(monkeypatch, tmp_path, capsys):
+    monkeypatch.setattr(cli, "PID_PATH", tmp_path / "missing.pid")
+    monkeypatch.setattr(cli, "_health", lambda port: {"models": 12})
+
+    assert cli.status(8765) == 0
+    out = capsys.readouterr().out
+    assert "Shim is running on http://127.0.0.1:8765 (12 models)." in out

@@ -680,15 +680,19 @@ def restore_codex_config() -> None:
 
 def status(port: int) -> int:
     pid = _read_pid()
+    health = _health(port)
     if _pid_running(pid):
-        health = _health(port)
         if health is not None:
             model_count = health.get("models", "unknown")
             print(f"Shim is running on http://{DEFAULT_HOST}:{port} with pid {pid} ({model_count} models).")
             return 0
-    if _pid_running(pid):
         print(f"Shim process {pid} exists but health check failed.")
         return 1
+    if health is not None:
+        PID_PATH.unlink(missing_ok=True)
+        model_count = health.get("models", "unknown")
+        print(f"Shim is running on http://{DEFAULT_HOST}:{port} ({model_count} models).")
+        return 0
     print("Shim is stopped.")
     return 1
 
