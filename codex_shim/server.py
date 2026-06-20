@@ -5,6 +5,7 @@ import asyncio
 import json
 import os
 import re
+import secrets
 import sys
 import time
 import uuid
@@ -63,6 +64,7 @@ from .translate import (
 
 DEBUG_DIR = Path(__file__).resolve().parents[1] / ".codex-shim"
 CODEX_CONFIG_PATH = Path.home() / ".codex" / "config.toml"
+PICKER_TOKEN_HEADER = "X-Codex-Shim-Picker-Token"
 _MODELS_CACHE_TTL_SEC = 30.0
 _STARTUP_REFRESH_TIMEOUT_SEC = 120.0
 
@@ -80,6 +82,8 @@ class ShimServer:
             "cursor_passthrough": False,
             "auto_router": False,
         }
+        self.picker_token = secrets.token_urlsafe(32)
+
     def app(self) -> web.Application:
         allowed_hosts = build_allowed_hosts(self.host)
         app = web.Application(
@@ -147,7 +151,7 @@ class ShimServer:
         return models
 
     async def picker_page(self, _request: web.Request) -> web.Response:
-        return web.Response(text=_picker_html(), content_type="text/html")
+        return web.Response(text=_picker_html(self.picker_token), content_type="text/html")
 
     async def api_models(self, _request: web.Request) -> web.Response:
         current = _current_managed_model()
@@ -193,7 +197,13 @@ class ShimServer:
             )
         return web.json_response(data)
 
+    def _valid_picker_token(self, request: web.Request) -> bool:
+        token = request.headers.get(PICKER_TOKEN_HEADER, "")
+        return secrets.compare_digest(token, self.picker_token)
+
     async def switch_model(self, request: web.Request) -> web.Response:
+        if not self._valid_picker_token(request):
+            return web.json_response({"error": "forbidden"}, status=403)
         try:
             body = await request.json()
         except json.JSONDecodeError:
@@ -3294,8 +3304,9 @@ def _restart_codex_app() -> None:
     _threading.Thread(target=_do_restart, daemon=True).start()
 
 
-def _picker_html() -> str:
-    return '''<!DOCTYPE html>
+def _picker_html(picker_token: str) -> str:
+    token_json = json.dumps(picker_token).replace("<", "\\u003c")
+    html = '''<!DOCTYPE html>
 <html>
 <head>
 <meta charset="utf-8">
@@ -3352,6 +3363,7 @@ def _picker_html() -> str:
   <p class="restart-note">Codex needs to restart to use the new model</p>
 </div>
 <script>
+const PICKER_TOKEN = @@TOKEN_JSON@@;
 async function loadModels() {
   const res = await fetch('/api/models');
   const models = await res.json();
@@ -3389,7 +3401,7 @@ async function switchModel(slug) {
   try {
     const res = await fetch('/api/switch', {
       method: 'POST',
-      headers: {'Content-Type': 'application/json'},
+      headers: {'Content-Type': 'application/json', '@@PICKER_HEADER@@': PICKER_TOKEN},
       body: JSON.stringify({slug, restart_codex: restart})
     });
     const data = await res.json();
@@ -3410,6 +3422,10 @@ loadModels();
 </script>
 </body>
 </html>'''
+    return (
+        html.replace("@@TOKEN_JSON@@", token_json, 1)
+        .replace("@@PICKER_HEADER@@", PICKER_TOKEN_HEADER, 1)
+    )
 
 
 def main(argv: list[str] | None = None) -> None:

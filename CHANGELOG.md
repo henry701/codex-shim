@@ -110,6 +110,9 @@ and this project does not yet follow semantic versioning (pre-1.0).
 
 ### Fixed
 
+- Protected the state-changing picker `/api/switch` endpoint with a
+  per-process picker token so third-party pages cannot trigger model switches
+  or Desktop restarts through the loopback server.
 - `codex-shim enable` / `disable` now manage `tool_search_always_defer_mcp_tools`
   in a shim-owned `[features]` block (with restore of any prior user value).
   Ephemeral `codex-shim codex` / `app` runs apply the same override via CLI flags.
