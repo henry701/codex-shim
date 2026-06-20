@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urljoin
 
-from aiohttp import ClientError, ClientSession, ClientTimeout, web
+from aiohttp import ClientError, ClientSession, ClientTimeout, WSMsgType, web
 
 from .cursor_passthrough import (
     CURSOR_MODEL_SLUG,
@@ -65,7 +65,7 @@ from .translate import (
 DEBUG_DIR = Path(__file__).resolve().parents[1] / ".codex-shim"
 CODEX_CONFIG_PATH = Path.home() / ".codex" / "config.toml"
 PICKER_TOKEN_HEADER = "X-Codex-Shim-Picker-Token"
-CHATGPT_ACCEPT_ENCODING = "gzip, deflate"
+CHATGPT_ACCEPT_ENCODING = "zstd, gzip, deflate"
 _MODELS_CACHE_TTL_SEC = 30.0
 _STARTUP_REFRESH_TIMEOUT_SEC = 120.0
 
@@ -96,6 +96,7 @@ class ShimServer:
         app.router.add_get("/v1/models", self.models)
         app.router.add_post("/v1/chat/completions", self.chat_completions)
         app.router.add_post("/v1/messages", self.anthropic_messages)
+        app.router.add_get("/v1/responses", self.responses_websocket)
         app.router.add_post("/v1/responses", self.responses)
         app.router.add_post("/v1/responses/compact", self.responses_compact)
         app.router.add_get("/picker", self.picker_page)
@@ -309,6 +310,115 @@ class ShimServer:
             forwarded["model"] = route.model
             return await self._post_anthropic_messages(request, route, forwarded)
         raise web.HTTPBadGateway(text=f"Unsupported model provider: {route.provider}")
+
+    async def responses_websocket(self, request: web.Request) -> web.WebSocketResponse:
+        ws = web.WebSocketResponse(compress=True, heartbeat=30)
+        await ws.prepare(request)
+        async for msg in ws:
+            if msg.type == WSMsgType.TEXT:
+                try:
+                    payload = json.loads(msg.data)
+                except json.JSONDecodeError:
+                    await _write_ws_error(ws, 400, "invalid_request_error", "invalid JSON websocket frame")
+                    continue
+                if not isinstance(payload, dict):
+                    await _write_ws_error(ws, 400, "invalid_request_error", "websocket frame must be a JSON object")
+                    continue
+                if payload.get("type") != "response.create":
+                    await _write_ws_error(ws, 400, "invalid_request_error", "only response.create websocket frames are supported")
+                    continue
+                await self._handle_response_create_websocket(request, ws, payload)
+            elif msg.type == WSMsgType.BINARY:
+                await _write_ws_error(ws, 400, "invalid_request_error", "binary websocket frames are not supported")
+            elif msg.type == WSMsgType.ERROR:
+                break
+        return ws
+
+    async def _handle_response_create_websocket(
+        self,
+        request: web.Request,
+        ws: web.WebSocketResponse,
+        payload: dict[str, Any],
+    ) -> None:
+        requested = str(payload.get("model") or "")
+        if not is_chatgpt_passthrough_slug(requested):
+            await self._handle_local_response_create_websocket(request, ws, payload)
+            return
+        auth_path = DEFAULT_CODEX_AUTH.expanduser()
+        try:
+            auth = json.loads(auth_path.read_text())
+        except FileNotFoundError:
+            await _write_ws_error(ws, 401, "unauthorized", "~/.codex/auth.json not found")
+            return
+        except json.JSONDecodeError:
+            await _write_ws_error(ws, 401, "unauthorized", "auth.json is not valid JSON")
+            return
+        tokens = auth.get("tokens") or {}
+        access_token = tokens.get("access_token")
+        account_id = tokens.get("account_id") or ""
+        if not access_token:
+            await _write_ws_error(ws, 401, "unauthorized", "auth.json has no access_token")
+            return
+
+        upstream_model = chatgpt_upstream_model(requested)
+        response_model_override = requested if requested != upstream_model else None
+        forwarded = _sanitize_chatgpt_passthrough_body({k: v for k, v in payload.items() if k != "type"})
+        forwarded["model"] = upstream_model
+        forwarded["stream"] = True
+        headers = {
+            "Authorization": f"Bearer {access_token}",
+            "Content-Type": "application/json",
+            "Accept": "text/event-stream",
+            "Accept-Encoding": CHATGPT_ACCEPT_ENCODING,
+            "OpenAI-Beta": "responses=2026-02-06",
+            "originator": "codex_cli_rs",
+            "chatgpt-account-id": account_id,
+            "session_id": request.headers.get("session_id", ""),
+        }
+        url = "https://chatgpt.com/backend-api/codex/responses"
+        async with ClientSession(timeout=self.timeout) as session:
+            upstream = await session.post(url, json=forwarded, headers=headers)
+            if upstream.status >= 400:
+                text = await upstream.text()
+                code, message = parse_upstream_error(text, upstream.status)
+                upstream.release()
+                await _write_ws_error(ws, upstream.status, code, message)
+                return
+            try:
+                await _relay_sse_response_to_ws(
+                    upstream,
+                    request,
+                    ws,
+                    response_model_override=response_model_override,
+                )
+            finally:
+                await _close_upstream(upstream)
+
+    async def _handle_local_response_create_websocket(
+        self,
+        request: web.Request,
+        ws: web.WebSocketResponse,
+        payload: dict[str, Any],
+    ) -> None:
+        forwarded = {k: v for k, v in payload.items() if k != "type"}
+        forwarded["stream"] = True
+        url = f"{request.scheme}://{request.host}/v1/responses"
+        headers = {
+            "Accept": "text/event-stream",
+            "Content-Type": "application/json",
+        }
+        async with ClientSession(timeout=self.timeout) as session:
+            upstream = await session.post(url, json=forwarded, headers=headers)
+            if upstream.status >= 400:
+                text = await upstream.text()
+                code, message = parse_upstream_error(text, upstream.status)
+                upstream.release()
+                await _write_ws_error(ws, upstream.status, code, message)
+                return
+            try:
+                await _relay_sse_response_to_ws(upstream, request, ws)
+            finally:
+                await _close_upstream(upstream)
 
     async def responses(self, request: web.Request) -> web.StreamResponse:
         body = await request.json()
@@ -2857,6 +2967,46 @@ async def _write_sse(response: web.StreamResponse, payload: dict[str, Any]) -> N
         }:
             raise ClientDisconnected() from exc
         raise
+
+
+async def _write_ws_json(ws: web.WebSocketResponse, payload: dict[str, Any]) -> None:
+    _log_stream_event(payload)
+    await ws.send_str(json.dumps(payload, separators=(",", ":")))
+
+
+async def _write_ws_error(ws: web.WebSocketResponse, status: int, code: str, message: str) -> None:
+    await _write_ws_json(
+        ws,
+        {
+            "type": "error",
+            "status": status,
+            "error": {
+                "type": code,
+                "code": code,
+                "message": message,
+            },
+        },
+    )
+
+
+async def _relay_sse_response_to_ws(
+    upstream,
+    request: web.Request,
+    ws: web.WebSocketResponse,
+    *,
+    response_model_override: str | None = None,
+) -> None:
+    async for line in _sse_lines(upstream, request):
+        if line == "[DONE]":
+            break
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            await _write_ws_error(ws, 502, "upstream_protocol_error", "upstream emitted non-JSON SSE data")
+            continue
+        if response_model_override:
+            _rewrite_response_model(event, response_model_override)
+        await _write_ws_json(ws, event)
 
 
 async def _write_anthropic_sse(response: web.StreamResponse, event: str, payload: dict[str, Any]) -> None:

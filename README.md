@@ -318,11 +318,14 @@ codex-shim app .             # launch Codex Desktop with the shim wired in
 and writes `~/.codex/custom_model_catalog.json`. It does **not** modify
 `~/.codex/config.toml`; the systemd service can keep the catalog fresh without
 changing the CLI's active provider. Run `codex-shim enable` or `codex-shim app`
-to install the managed `codex_shim` provider block. That provider disables
-Responses WebSockets and request-body compression because the shim is an HTTP
-loopback adapter. `app` also starts the local daemon if needed and launches
-Desktop. The previous config is backed up under `.codex-shim/` and the managed
-block can be removed with:
+to install the managed `codex_shim` provider block. That provider supports
+Responses WebSockets for ChatGPT passthrough models and accepts zstd-compressed
+Codex request bodies. BYOK routes remain HTTPS-backed internally; if Codex uses
+the WebSocket transport for a BYOK slug, the shim bridges that frame through its
+existing local HTTP `/v1/responses` route and relays the resulting SSE events
+back over the WebSocket. `app` also starts the local daemon if needed and
+launches Desktop. The previous config is backed up under
+`.codex-shim/` and the managed block can be removed with:
 
 ```bash
 codex-shim disable
@@ -874,10 +877,10 @@ rewrites it to the native `tool_search_call` Responses item (with `execution:
 `tool_search_output` on the next turn. BYOK catalog entries set
 `supports_search_tool: true` (matching ChatGPT passthrough models) so Codex
 builds that index. `codex-shim enable` installs a managed `[features]` block with
-`tool_search_always_defer_mcp_tools = true` so small MCP servers stay searchable,
-and `enable_request_compression = false` so Codex does not send zstd-compressed
-request bodies to the local shim. `codex-shim disable` restores any prior values.
-Ephemeral `codex-shim codex` / `app` runs apply the same overrides via CLI flags.
+`tool_search_always_defer_mcp_tools = true` so small MCP servers stay searchable.
+The shim accepts Codex zstd-compressed request bodies when request compression is
+enabled. `codex-shim disable` restores any prior values. Ephemeral
+`codex-shim codex` / `app` runs apply the same override via CLI flags.
 
 Discovery queries work best with short tokens (`exa`, `web_search_exa`); the shim
 injects a system hint steering models away from `mcp__`-prefixed search strings
@@ -1240,7 +1243,7 @@ Config behavior:
   `codex-shim codex -- ...` do not persistently modify `~/.codex/config.toml`.
 - `codex-shim enable`, `codex-shim app`, and `codex-shim model use <slug>` write
   managed blocks to `~/.codex/config.toml`. The managed provider is
-  `codex_shim`, with `wire_api = "responses"`, `supports_websockets = false`,
+  `codex_shim`, with `wire_api = "responses"`, `supports_websockets = true`,
   and `requires_openai_auth = false`. If existing top-level Codex model keys or
   managed `[features]` keys are displaced, the managed block records them so
   disable can restore those keys without reverting unrelated config edits.

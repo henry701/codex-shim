@@ -80,7 +80,7 @@ MANAGED_TOP_LEVEL_RESTORE_ORDER = (
 MANAGED_FEATURES_SECTION = "features"
 MANAGED_TOOL_SEARCH_FEATURE_KEY = "tool_search_always_defer_mcp_tools"
 MANAGED_REQUEST_COMPRESSION_FEATURE_KEY = "enable_request_compression"
-MANAGED_FEATURE_KEYS = {MANAGED_TOOL_SEARCH_FEATURE_KEY, MANAGED_REQUEST_COMPRESSION_FEATURE_KEY}
+MANAGED_FEATURE_KEYS = {MANAGED_TOOL_SEARCH_FEATURE_KEY}
 APP_ASAR_BACKUP_NAME = "app.asar.before-codex-shim-model-picker-patch"
 INFO_PLIST_BACKUP_NAME = "Info.plist.before-codex-shim-model-picker-patch"
 SYSTEM_CODEX_APP = Path("/Applications/Codex.app")
@@ -398,8 +398,13 @@ def install_codex_config(settings_path: Path, port: int, model_slug: str | None 
     cleaned = _remove_top_level_keys(cleaned, MANAGED_TOP_LEVEL_KEYS)
     cleaned = _remove_section(cleaned, f"model_providers.{PROVIDER_NAME}")
     previous_features = _extract_section_key_lines(cleaned, MANAGED_FEATURES_SECTION, MANAGED_FEATURE_KEYS)
+    legacy_previous_features = _managed_previous_features(original)
     if not previous_features:
-        previous_features = _managed_previous_features(original)
+        previous_features = {
+            key: value
+            for key, value in legacy_previous_features.items()
+            if key in MANAGED_FEATURE_KEYS
+        }
     if not previous_features and CODEX_CONFIG_BACKUP_PATH.exists():
         previous_features = _extract_section_key_lines(
             CODEX_CONFIG_BACKUP_PATH.read_text(),
@@ -407,6 +412,14 @@ def install_codex_config(settings_path: Path, port: int, model_slug: str | None 
             MANAGED_FEATURE_KEYS,
         )
     cleaned = _remove_keys_from_section(cleaned, MANAGED_FEATURES_SECTION, MANAGED_FEATURE_KEYS)
+    cleaned = _restore_features_keys(
+        cleaned,
+        {
+            key: value
+            for key, value in legacy_previous_features.items()
+            if key not in MANAGED_FEATURE_KEYS
+        },
+    )
     managed_block = _managed_config_block(
         default_slug,
         port,
@@ -1055,7 +1068,7 @@ name = "Codex Shim"
 base_url = "http://127.0.0.1:{port}/v1"
 wire_api = "responses"
 requires_openai_auth = false
-supports_websockets = false
+supports_websockets = true
 {MANAGED_END}
 '''
 
@@ -1075,7 +1088,6 @@ def _managed_feature_block_lines() -> list[str]:
     return [
         MANAGED_BEGIN,
         f"{MANAGED_TOOL_SEARCH_FEATURE_KEY} = true",
-        f"{MANAGED_REQUEST_COMPRESSION_FEATURE_KEY} = false",
         MANAGED_END,
     ]
 

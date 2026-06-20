@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import asyncio
 import json
+import subprocess
 from typing import Any
 
 import pytest
-from aiohttp import ClientSession, web
+from aiohttp import ClientSession, WSMsgType, web
 from aiohttp.test_utils import TestClient, TestServer
 
 from codex_shim import mcp_search
@@ -187,7 +188,7 @@ async def test_image_generation_routes_to_chatgpt_passthrough_and_rewrites_model
     await shim_client.close()
 
 
-async def test_chatgpt_passthrough_requests_avoid_zstd_encoding(monkeypatch, tmp_path, auth_present):
+async def test_chatgpt_passthrough_requests_advertise_zstd_encoding(monkeypatch, tmp_path, auth_present):
     captured = {}
 
     class FakeUpstream:
@@ -219,12 +220,57 @@ async def test_chatgpt_passthrough_requests_avoid_zstd_encoding(monkeypatch, tmp
 
     assert resp.status == 200
     assert captured["url"] == "https://chatgpt.com/backend-api/codex/responses"
-    assert captured["headers"]["Accept-Encoding"] == "gzip, deflate"
+    assert captured["headers"]["Accept-Encoding"] == "zstd, gzip, deflate"
 
     await shim_client.close()
 
 
-async def test_chatgpt_compact_passthrough_requests_avoid_zstd_encoding(monkeypatch, tmp_path, auth_present):
+def _zstd_compress(data: bytes) -> bytes:
+    return subprocess.run(
+        ["zstd", "-q", "-c", "-"],
+        input=data,
+        check=True,
+        stdout=subprocess.PIPE,
+    ).stdout
+
+
+async def test_zstd_compressed_responses_request_reaches_handler(monkeypatch, tmp_path, auth_present):
+    captured = {}
+
+    class FakeUpstream:
+        status = 200
+        content_type = "application/json"
+
+        async def json(self, content_type=None):
+            return {"id": "resp_1", "model": "gpt-5.5", "output": []}
+
+        def release(self):
+            pass
+
+    async def fake_post(self, url, json=None, headers=None):
+        captured["body"] = json
+        return FakeUpstream()
+
+    monkeypatch.setattr("codex_shim.server.ClientSession.post", fake_post)
+    settings = tmp_path / "settings.json"
+    settings.write_text("{}")
+    shim_client = TestClient(TestServer(ShimServer(settings).app()))
+    await shim_client.start_server()
+
+    raw = json.dumps({"model": "codex-gpt-5-5", "input": "hi"}).encode()
+    resp = await shim_client.post(
+        "/v1/responses",
+        data=_zstd_compress(raw),
+        headers={"Content-Type": "application/json", "Content-Encoding": "zstd"},
+    )
+
+    assert resp.status == 200
+    assert captured["body"]["model"] == "gpt-5.5"
+
+    await shim_client.close()
+
+
+async def test_chatgpt_compact_passthrough_requests_advertise_zstd_encoding(monkeypatch, tmp_path, auth_present):
     captured = {}
 
     class FakeUpstream:
@@ -256,9 +302,155 @@ async def test_chatgpt_compact_passthrough_requests_avoid_zstd_encoding(monkeypa
 
     assert resp.status == 200
     assert captured["url"] == "https://chatgpt.com/backend-api/codex/responses/compact"
-    assert captured["headers"]["Accept-Encoding"] == "gzip, deflate"
+    assert captured["headers"]["Accept-Encoding"] == "zstd, gzip, deflate"
 
     await shim_client.close()
+
+
+class _FakeSseContent:
+    def __init__(self, chunks: list[bytes]):
+        self._chunks = list(chunks)
+
+    async def readany(self):
+        await asyncio.sleep(0)
+        if not self._chunks:
+            return b""
+        return self._chunks.pop(0)
+
+
+async def test_chatgpt_passthrough_websocket_relays_sse_events(monkeypatch, tmp_path, auth_present):
+    captured = {}
+
+    class FakeUpstream:
+        status = 200
+        content_type = "text/event-stream"
+        content = _FakeSseContent(
+            [
+                b'data: {"type":"response.created","response":{"id":"resp_1","model":"gpt-5.5"}}\n\n',
+                b'data: {"type":"response.output_text.delta","delta":"ok"}\n\n',
+                b'data: {"type":"response.completed","response":{"id":"resp_1","model":"gpt-5.5","status":"completed"}}\n\n',
+            ]
+        )
+
+        def release(self):
+            pass
+
+    async def fake_post(self, url, json=None, headers=None):
+        captured["url"] = str(url)
+        captured["body"] = json
+        captured["headers"] = headers
+        return FakeUpstream()
+
+    monkeypatch.setattr("codex_shim.server.ClientSession.post", fake_post)
+    settings = tmp_path / "settings.json"
+    settings.write_text("{}")
+    shim_client = TestClient(TestServer(ShimServer(settings).app()))
+    await shim_client.start_server()
+
+    ws = await shim_client.ws_connect("/v1/responses")
+    await ws.send_json(
+        {
+            "type": "response.create",
+            "model": "codex-gpt-5-5",
+            "input": [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]}],
+            "tools": [],
+            "tool_choice": "auto",
+            "parallel_tool_calls": True,
+            "store": False,
+            "stream": True,
+            "include": [],
+        }
+    )
+
+    events = []
+    for _ in range(3):
+        msg = await ws.receive(timeout=2)
+        assert msg.type == WSMsgType.TEXT
+        events.append(json.loads(msg.data))
+
+    assert [event["type"] for event in events] == [
+        "response.created",
+        "response.output_text.delta",
+        "response.completed",
+    ]
+    assert events[0]["response"]["model"] == "codex-gpt-5-5"
+    assert events[2]["response"]["model"] == "codex-gpt-5-5"
+    assert captured["url"] == "https://chatgpt.com/backend-api/codex/responses"
+    assert captured["body"]["model"] == "gpt-5.5"
+    assert captured["body"]["stream"] is True
+    assert "type" not in captured["body"]
+    assert captured["headers"]["Authorization"] == "Bearer stub"
+
+    await ws.close()
+    await shim_client.close()
+
+
+async def test_responses_websocket_bridges_byok_models_through_http_route(tmp_path):
+    async def chat(request):
+        body = await request.json()
+        assert body["model"] == "real-openai"
+        response = web.StreamResponse(headers={"Content-Type": "text/event-stream"})
+        await response.prepare(request)
+        await response.write(b'data: {"choices":[{"delta":{"content":"hello"}}]}\n\n')
+        await response.write(b'data: {"choices":[{"delta":{}}]}\n\n')
+        await response.write(b"data: [DONE]\n\n")
+        await response.write_eof()
+        return response
+
+    upstream = web.Application()
+    upstream.router.add_post("/v1/chat/completions", chat)
+    upstream_client = TestClient(TestServer(upstream))
+    await upstream_client.start_server()
+
+    settings = tmp_path / "settings.json"
+    settings.write_text(
+        json.dumps(
+            {
+                "models": [
+                    {
+                        "model": "real-openai",
+                        "display_name": "Real OpenAI",
+                        "provider": "openai",
+                        "base_url": str(upstream_client.make_url("/v1")),
+                        "api_key": "secret",
+                    }
+                ]
+            }
+        )
+    )
+    shim_client = TestClient(TestServer(ShimServer(settings).app()))
+    await shim_client.start_server()
+
+    ws = await shim_client.ws_connect("/v1/responses")
+    await ws.send_json(
+        {
+            "type": "response.create",
+            "model": "real-openai",
+            "input": [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]}],
+            "tools": [],
+            "tool_choice": "auto",
+            "parallel_tool_calls": True,
+            "store": False,
+            "stream": True,
+            "include": [],
+        }
+    )
+
+    events = []
+    while True:
+        msg = await ws.receive(timeout=2)
+        assert msg.type == WSMsgType.TEXT
+        payload = json.loads(msg.data)
+        events.append(payload)
+        if payload.get("type") == "response.completed":
+            break
+
+    assert any(event.get("type") == "response.output_text.delta" and event.get("delta") == "hello" for event in events)
+    assert events[-1]["response"]["model"] == "real-openai"
+
+    await ws.close()
+    await shim_client.close()
+    await upstream_client.close()
 
 
 async def test_chatgpt_passthrough_falls_back_to_byok_on_error(monkeypatch, tmp_path, auth_present):

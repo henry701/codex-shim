@@ -400,7 +400,7 @@ def test_write_catalog_includes_gpt_models_when_auth_present(tmp_path, auth_pres
         )
 
 
-def test_write_catalog_forces_chatgpt_passthrough_off_websockets(tmp_path, auth_present, monkeypatch):
+def test_write_catalog_enables_chatgpt_passthrough_websockets(tmp_path, auth_present, monkeypatch):
     cache = tmp_path / "models-cache.json"
     cache.write_text(
         json.dumps(
@@ -424,7 +424,7 @@ def test_write_catalog_forces_chatgpt_passthrough_off_websockets(tmp_path, auth_
     data = json.loads(catalog_path.read_text())
     [entry] = data["models"]
     assert entry["slug"] == "codex-gpt-5-5"
-    assert entry["prefer_websockets"] is False
+    assert entry["prefer_websockets"] is True
 
 
 def test_write_catalog_byok_does_not_set_use_responses_lite(tmp_path, auth_present, monkeypatch):
@@ -490,7 +490,7 @@ def test_managed_config_escapes_windows_catalog_path(monkeypatch):
     assert 'base_url = "http://127.0.0.1:8765/v1"' in top_block
     assert 'wire_api = "responses"' in top_block
     assert "requires_openai_auth = false" in top_block
-    assert "supports_websockets = false" in top_block
+    assert "supports_websockets = true" in top_block
 
 
 def test_install_codex_config_is_idempotent(monkeypatch, tmp_path):
@@ -516,11 +516,11 @@ def test_install_codex_config_is_idempotent(monkeypatch, tmp_path):
     assert text.count("[model_providers.codex_shim]") == 1
     assert text.count('model_provider = "codex_shim"') == 1
     assert text.count('base_url = "http://127.0.0.1:8765/v1"') == 1
-    assert text.count("supports_websockets = false") == 1
+    assert text.count("supports_websockets = true") == 1
     assert text.count("model_catalog_json") == 1
     assert text.count("[features]") == 1
     assert text.count("tool_search_always_defer_mcp_tools = true") == 1
-    assert text.count("enable_request_compression = false") == 1
+    assert "enable_request_compression" not in text
 
 
 def test_install_and_restore_manage_tool_search_feature_flag(monkeypatch, tmp_path):
@@ -675,8 +675,8 @@ def test_install_and_restore_preserve_displaced_top_level_config(monkeypatch, tm
     }
     assert '\nmodel = "llama3-2"\n' in installed
     assert installed.count('model_provider = "codex_shim"') == 1
-    assert "supports_websockets = false" in installed
-    assert "enable_request_compression = false" in installed
+    assert "supports_websockets = true" in installed
+    assert "enable_request_compression" not in installed
     assert 'model = "gpt-5.5"' not in installed
     assert 'model_catalog_json = "/tmp/catalog.json"' not in installed
     assert '[profiles.dev]\nmodel = "profile-model"' in installed

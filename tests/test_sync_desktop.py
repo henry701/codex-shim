@@ -78,5 +78,5 @@ def test_sync_desktop_can_install_config(monkeypatch, tmp_path):
     assert 'model_provider = "codex_shim"' in config_text
     assert 'base_url = "http://127.0.0.1:8765/v1"' in config_text
     assert "[model_providers.codex_shim]" in config_text
-    assert "supports_websockets = false" in config_text
-    assert "enable_request_compression = false" in config_text
+    assert "supports_websockets = true" in config_text
+    assert "enable_request_compression" not in config_text

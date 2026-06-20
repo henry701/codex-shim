@@ -115,7 +115,7 @@ def _minimal_chatgpt_passthrough_entry(
         "availability_nux": None,
         "upgrade": None,
         "priority": 10000 if catalog_slug == CHATGPT_CATALOG_SLUG else 9000,
-        "prefer_websockets": False,
+        "prefer_websockets": True,
         "available_in_plans": ["free", "plus", "pro", "team", "business", "enterprise"],
         "base_instructions": f"You are Codex, a coding agent powered by {display_name}.",
         "model_messages": {

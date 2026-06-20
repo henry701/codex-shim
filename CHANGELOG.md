@@ -10,9 +10,10 @@ and this project does not yet follow semantic versioning (pre-1.0).
 ### Changed
 
 - Shim routing uses a managed `[model_providers.codex_shim]` provider with
-  `supports_websockets = false` and `requires_openai_auth = false`. This keeps
-  Codex CLI on HTTPS for the local loopback shim and avoids OpenAI-provider
-  zstd request compression.
+  `supports_websockets = true` and `requires_openai_auth = false`. ChatGPT
+  passthrough models can use Codex's Responses WebSocket transport through the
+  shim; BYOK models are bridged through the shim's existing HTTPS-backed
+  `/v1/responses` translation path and relayed back over the WebSocket.
 - Managed-config backup metadata stores displaced top-level values as TOML RHS
   fragments (not full `key = value` lines), with backward-compatible restore for
   older installs.
@@ -92,6 +93,15 @@ and this project does not yet follow semantic versioning (pre-1.0).
   `osascript` + `open -a Codex` on macOS). All picker routes are behind the
   existing `Host`-header allowlist, so a visited web page still cannot drive
   them via DNS rebinding.
+- Responses WebSocket bridge for ChatGPT passthrough models. The shim accepts
+  Codex `response.create` WebSocket frames on `/v1/responses`, forwards them to
+  ChatGPT's native Responses endpoint, and relays upstream SSE events back as
+  WebSocket JSON frames with model metadata rewritten to the selected shim slug.
+  Non-ChatGPT models use the same WebSocket entrypoint but are internally
+  bridged through the existing local HTTP `/v1/responses` route.
+- zstd request/response compression support via `backports.zstd` on Python
+  versions before 3.14. The managed config no longer disables Codex request
+  compression, and ChatGPT passthrough requests advertise `zstd, gzip, deflate`.
 - Best-effort dump of the last forwarded chat-completions request body to
   `.codex-shim/last_request.json` to make strict-provider tokenization /
   schema errors easier to triage. Upstream error bodies are now logged with
@@ -112,9 +122,9 @@ and this project does not yet follow semantic versioning (pre-1.0).
 - Protected the state-changing picker `/api/switch` endpoint with a
   per-process picker token so third-party pages cannot trigger model switches
   or Desktop restarts through the loopback server.
-- `codex-shim enable` / `disable` now manage `enable_request_compression = false`
-  alongside the tool-search flag, preventing Codex CLI from sending
-  zstd-compressed request bodies to the local aiohttp shim.
+- `codex-shim status` now treats a healthy `/health` endpoint as running even
+  when the shim is managed by foreground/systemd `run` mode instead of a local
+  `.codex-shim/shim.pid` file.
 - `codex-shim enable` / `disable` now manage `tool_search_always_defer_mcp_tools`
   in a shim-owned `[features]` block (with restore of any prior user value).
   Ephemeral `codex-shim codex` / `app` runs apply the same override via CLI flags.

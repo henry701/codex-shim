@@ -94,7 +94,7 @@ def chatgpt_passthrough_entries() -> list[dict]:
         entry.setdefault("available_in_plans", PLAN_TIERS)
         entry.setdefault("minimal_client_version", "0.0.1")
         entry.setdefault("supported_in_api", True)
-        entry["prefer_websockets"] = False
+        entry["prefer_websockets"] = True
         if entry.get("slug") == CHATGPT_CATALOG_SLUG:
             entry["isDefault"] = True
             entry["priority"] = max(int(entry.get("priority") or 0), 10000)
@@ -144,11 +144,10 @@ name = "{SHIM_PROVIDER_DISPLAY_NAME}"
 base_url = "http://127.0.0.1:{port}/v1"
 wire_api = "responses"
 requires_openai_auth = false
-supports_websockets = false
+supports_websockets = true
 
 [features]
 tool_search_always_defer_mcp_tools = true
-enable_request_compression = false
 '''
     path.write_text(text)
     return path
@@ -163,9 +162,8 @@ def codex_config_overrides(catalog_path: Path, default_slug: str, port: int) -> 
         f'model_providers.{PROVIDER_NAME}.base_url="http://127.0.0.1:{port}/v1"',
         f'model_providers.{PROVIDER_NAME}.wire_api="responses"',
         f'model_providers.{PROVIDER_NAME}.requires_openai_auth=false',
-        f'model_providers.{PROVIDER_NAME}.supports_websockets=false',
+        f'model_providers.{PROVIDER_NAME}.supports_websockets=true',
         "features.tool_search_always_defer_mcp_tools=true",
-        "features.enable_request_compression=false",
     ]
 
 
