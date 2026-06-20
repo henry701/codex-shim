@@ -9,18 +9,17 @@ and this project does not yet follow semantic versioning (pre-1.0).
 
 ### Changed
 
-- Shim routing uses `model_provider = "openai"` with `openai_base_url` pointing at
-  the local shim instead of a custom `[model_providers.codex_shim]` block, so
-  threads stay unified under the OpenAI provider. `enable` / `model use` migrate
-  legacy `codex_shim` rows in `~/.codex/state_*.sqlite`; run `codex-shim
-  migrate-threads` manually if needed.
+- Shim routing uses a managed `[model_providers.codex_shim]` provider with
+  `supports_websockets = false` and `requires_openai_auth = false`. This keeps
+  Codex CLI on HTTPS for the local loopback shim and avoids OpenAI-provider
+  zstd request compression.
 - Managed-config backup metadata stores displaced top-level values as TOML RHS
   fragments (not full `key = value` lines), with backward-compatible restore for
   older installs.
 - `sync-desktop` and the systemd/`run` path refresh `~/.codex/custom_model_catalog.json`
   only; they no longer write `~/.codex/config.toml`. Use `codex-shim enable` (or `app` /
-  `model use`) to install the managed shim provider block so the CLI can stay on
-  mainline `openai` while the background service keeps the catalog current.
+  `model use`) to install the managed shim provider block while the background
+  service keeps the catalog current.
 - Package management and docs now use uv (`uv.lock`, `uv sync`, `uv tool install
   -e .`, `uv run pytest`) instead of pip; CI uses `astral-sh/setup-uv`.
 - Namespace tool translation uses dot notation (`namespace.tool`) instead of
@@ -113,6 +112,9 @@ and this project does not yet follow semantic versioning (pre-1.0).
 - Protected the state-changing picker `/api/switch` endpoint with a
   per-process picker token so third-party pages cannot trigger model switches
   or Desktop restarts through the loopback server.
+- `codex-shim enable` / `disable` now manage `enable_request_compression = false`
+  alongside the tool-search flag, preventing Codex CLI from sending
+  zstd-compressed request bodies to the local aiohttp shim.
 - `codex-shim enable` / `disable` now manage `tool_search_always_defer_mcp_tools`
   in a shim-owned `[features]` block (with restore of any prior user value).
   Ephemeral `codex-shim codex` / `app` runs apply the same override via CLI flags.

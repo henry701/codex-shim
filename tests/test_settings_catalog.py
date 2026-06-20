@@ -400,6 +400,33 @@ def test_write_catalog_includes_gpt_models_when_auth_present(tmp_path, auth_pres
         )
 
 
+def test_write_catalog_forces_chatgpt_passthrough_off_websockets(tmp_path, auth_present, monkeypatch):
+    cache = tmp_path / "models-cache.json"
+    cache.write_text(
+        json.dumps(
+            {
+                "models": [
+                    {
+                        "slug": "gpt-5.5",
+                        "display_name": "GPT-5.5",
+                        "visibility": "list",
+                        "prefer_websockets": True,
+                    }
+                ]
+            }
+        )
+    )
+    monkeypatch.setattr("codex_shim.settings.DEFAULT_CODEX_MODELS_CACHE", cache)
+
+    catalog_path = tmp_path / "catalog.json"
+    write_catalog([], catalog_path)
+
+    data = json.loads(catalog_path.read_text())
+    [entry] = data["models"]
+    assert entry["slug"] == "codex-gpt-5-5"
+    assert entry["prefer_websockets"] is False
+
+
 def test_write_catalog_byok_does_not_set_use_responses_lite(tmp_path, auth_present, monkeypatch):
     missing_cache = tmp_path / "missing-models-cache.json"
     monkeypatch.setattr("codex_shim.settings.DEFAULT_CODEX_MODELS_CACHE", missing_cache)
@@ -457,9 +484,13 @@ def test_managed_config_escapes_windows_catalog_path(monkeypatch):
     monkeypatch.setattr(cli, "DESKTOP_CATALOG_PATH", Path(desktop_catalog))
     top_block, _ = cli._managed_config_blocks("vendor\\model", 8765)
     assert 'model = "vendor\\\\model"' in top_block
-    assert 'model_provider = "openai"' in top_block
-    assert 'openai_base_url = "http://127.0.0.1:8765/v1"' in top_block
+    assert 'model_provider = "codex_shim"' in top_block
     assert 'model_catalog_json = "C:\\\\Users\\\\User\\\\.codex\\\\custom_model_catalog.json"' in top_block
+    assert "[model_providers.codex_shim]" in top_block
+    assert 'base_url = "http://127.0.0.1:8765/v1"' in top_block
+    assert 'wire_api = "responses"' in top_block
+    assert "requires_openai_auth = false" in top_block
+    assert "supports_websockets = false" in top_block
 
 
 def test_install_codex_config_is_idempotent(monkeypatch, tmp_path):
@@ -482,12 +513,14 @@ def test_install_codex_config_is_idempotent(monkeypatch, tmp_path):
     cli.install_codex_config(settings, 8765, "llama3.2")
 
     text = config_path.read_text()
-    assert "[model_providers.codex_shim]" not in text
-    assert text.count('model_provider = "openai"') == 1
-    assert text.count('openai_base_url = "http://127.0.0.1:8765/v1"') == 1
+    assert text.count("[model_providers.codex_shim]") == 1
+    assert text.count('model_provider = "codex_shim"') == 1
+    assert text.count('base_url = "http://127.0.0.1:8765/v1"') == 1
+    assert text.count("supports_websockets = false") == 1
     assert text.count("model_catalog_json") == 1
     assert text.count("[features]") == 1
     assert text.count("tool_search_always_defer_mcp_tools = true") == 1
+    assert text.count("enable_request_compression = false") == 1
 
 
 def test_install_and_restore_manage_tool_search_feature_flag(monkeypatch, tmp_path):
@@ -641,7 +674,9 @@ def test_install_and_restore_preserve_displaced_top_level_config(monkeypatch, tm
         "model_catalog_json": '"/tmp/catalog.json"',
     }
     assert '\nmodel = "llama3-2"\n' in installed
-    assert installed.count('model_provider = "openai"') == 1
+    assert installed.count('model_provider = "codex_shim"') == 1
+    assert "supports_websockets = false" in installed
+    assert "enable_request_compression = false" in installed
     assert 'model = "gpt-5.5"' not in installed
     assert 'model_catalog_json = "/tmp/catalog.json"' not in installed
     assert '[profiles.dev]\nmodel = "profile-model"' in installed

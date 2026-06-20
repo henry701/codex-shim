@@ -65,6 +65,7 @@ from .translate import (
 DEBUG_DIR = Path(__file__).resolve().parents[1] / ".codex-shim"
 CODEX_CONFIG_PATH = Path.home() / ".codex" / "config.toml"
 PICKER_TOKEN_HEADER = "X-Codex-Shim-Picker-Token"
+CHATGPT_ACCEPT_ENCODING = "gzip, deflate"
 _MODELS_CACHE_TTL_SEC = 30.0
 _STARTUP_REFRESH_TIMEOUT_SEC = 120.0
 
@@ -592,6 +593,7 @@ class ShimServer:
             "Authorization": f"Bearer {access_token}",
             "Content-Type": "application/json",
             "Accept": "text/event-stream" if forwarded.get("stream") else "application/json",
+            "Accept-Encoding": CHATGPT_ACCEPT_ENCODING,
             "OpenAI-Beta": "responses=2026-02-06",
             "originator": "codex_cli_rs",
             "chatgpt-account-id": account_id,
@@ -702,6 +704,7 @@ class ShimServer:
             "Authorization": f"Bearer {access_token}",
             "Content-Type": "application/json",
             "Accept": "application/json",
+            "Accept-Encoding": CHATGPT_ACCEPT_ENCODING,
             "OpenAI-Beta": "responses=2026-02-06",
             "originator": "codex_cli_rs",
             "chatgpt-account-id": account_id,

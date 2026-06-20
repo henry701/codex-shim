@@ -187,6 +187,80 @@ async def test_image_generation_routes_to_chatgpt_passthrough_and_rewrites_model
     await shim_client.close()
 
 
+async def test_chatgpt_passthrough_requests_avoid_zstd_encoding(monkeypatch, tmp_path, auth_present):
+    captured = {}
+
+    class FakeUpstream:
+        status = 200
+        content_type = "application/json"
+
+        async def json(self, content_type=None):
+            return {"id": "resp_1", "model": "gpt-5.5", "output": []}
+
+        def release(self):
+            pass
+
+    async def fake_post(self, url, json=None, headers=None):
+        captured["url"] = str(url)
+        captured["headers"] = headers
+        return FakeUpstream()
+
+    monkeypatch.setattr("codex_shim.server.ClientSession.post", fake_post)
+    settings = tmp_path / "settings.json"
+    settings.write_text("{}")
+    shim_client = TestClient(TestServer(ShimServer(settings).app()))
+    await shim_client.start_server()
+
+    resp = await shim_client.post(
+        "/v1/responses",
+        json={"model": "codex-gpt-5-5", "input": "hi"},
+        headers={"Accept-Encoding": "zstd, gzip"},
+    )
+
+    assert resp.status == 200
+    assert captured["url"] == "https://chatgpt.com/backend-api/codex/responses"
+    assert captured["headers"]["Accept-Encoding"] == "gzip, deflate"
+
+    await shim_client.close()
+
+
+async def test_chatgpt_compact_passthrough_requests_avoid_zstd_encoding(monkeypatch, tmp_path, auth_present):
+    captured = {}
+
+    class FakeUpstream:
+        status = 200
+        content_type = "application/json"
+
+        async def json(self, content_type=None):
+            return {"id": "resp_compact", "model": "gpt-5.5", "output": []}
+
+        def release(self):
+            pass
+
+    async def fake_post(self, url, json=None, headers=None):
+        captured["url"] = str(url)
+        captured["headers"] = headers
+        return FakeUpstream()
+
+    monkeypatch.setattr("codex_shim.server.ClientSession.post", fake_post)
+    settings = tmp_path / "settings.json"
+    settings.write_text("{}")
+    shim_client = TestClient(TestServer(ShimServer(settings).app()))
+    await shim_client.start_server()
+
+    resp = await shim_client.post(
+        "/v1/responses/compact",
+        json={"model": "codex-gpt-5-5", "input": "summarize"},
+        headers={"Accept-Encoding": "zstd, gzip"},
+    )
+
+    assert resp.status == 200
+    assert captured["url"] == "https://chatgpt.com/backend-api/codex/responses/compact"
+    assert captured["headers"]["Accept-Encoding"] == "gzip, deflate"
+
+    await shim_client.close()
+
+
 async def test_chatgpt_passthrough_falls_back_to_byok_on_error(monkeypatch, tmp_path, auth_present):
     calls: list[str] = []
 

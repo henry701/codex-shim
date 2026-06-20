@@ -78,8 +78,9 @@ MANAGED_TOP_LEVEL_RESTORE_ORDER = (
     "model_catalog_json",
 )
 MANAGED_FEATURES_SECTION = "features"
-MANAGED_FEATURE_KEY = "tool_search_always_defer_mcp_tools"
-MANAGED_FEATURE_KEYS = {MANAGED_FEATURE_KEY}
+MANAGED_TOOL_SEARCH_FEATURE_KEY = "tool_search_always_defer_mcp_tools"
+MANAGED_REQUEST_COMPRESSION_FEATURE_KEY = "enable_request_compression"
+MANAGED_FEATURE_KEYS = {MANAGED_TOOL_SEARCH_FEATURE_KEY, MANAGED_REQUEST_COMPRESSION_FEATURE_KEY}
 APP_ASAR_BACKUP_NAME = "app.asar.before-codex-shim-model-picker-patch"
 INFO_PLIST_BACKUP_NAME = "Info.plist.before-codex-shim-model-picker-patch"
 SYSTEM_CODEX_APP = Path("/Applications/Codex.app")
@@ -414,13 +415,6 @@ def install_codex_config(settings_path: Path, port: int, model_slug: str | None 
     )
     cleaned = _apply_managed_features(cleaned)
     CODEX_CONFIG_PATH.write_text(managed_block + "\n" + cleaned.lstrip())
-    result = migrate_thread_providers()
-    updated = int(result["updated"])
-    if updated:
-        print(
-            f"Migrated {updated} thread(s) from {PROVIDER_NAME} to {OPENAI_PROVIDER_ID} "
-            f"in {len(result['databases'])} database(s)."
-        )
     print(f"Installed shim config into {CODEX_CONFIG_PATH}.")
 
 
@@ -1049,9 +1043,15 @@ def _managed_config_block(
         metadata += PREVIOUS_FEATURES_PREFIX + json.dumps(previous_features, sort_keys=True) + "\n"
     return f'''{MANAGED_BEGIN}
 {metadata}model = "{_toml_escape(default_slug)}"
-model_provider = "{OPENAI_PROVIDER_ID}"
-openai_base_url = "http://127.0.0.1:{port}/v1"
+model_provider = "{PROVIDER_NAME}"
 model_catalog_json = "{_toml_escape(str(DESKTOP_CATALOG_PATH))}"
+
+[model_providers.{PROVIDER_NAME}]
+name = "Codex Shim"
+base_url = "http://127.0.0.1:{port}/v1"
+wire_api = "responses"
+requires_openai_auth = false
+supports_websockets = false
 {MANAGED_END}
 '''
 
@@ -1070,7 +1070,8 @@ def _managed_config_blocks(
 def _managed_feature_block_lines() -> list[str]:
     return [
         MANAGED_BEGIN,
-        f"{MANAGED_FEATURE_KEY} = true",
+        f"{MANAGED_TOOL_SEARCH_FEATURE_KEY} = true",
+        f"{MANAGED_REQUEST_COMPRESSION_FEATURE_KEY} = false",
         MANAGED_END,
     ]
 
