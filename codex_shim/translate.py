@@ -27,10 +27,22 @@ def split_namespaced_tool_chat_name(raw_name: str) -> tuple[str | None, str]:
     return None, raw_name
 
 
-def function_call_item_from_chat_tool(call: dict[str, Any]) -> dict[str, Any]:
+def function_call_item_from_chat_tool(call: dict[str, Any], tool_types: dict[str, str] | None = None) -> dict[str, Any]:
     fn = call.get("function") or {}
     raw_name = fn.get("name", "")
     call_id = call.get("id", "call_0")
+    original_type = original_responses_tool_type(raw_name, tool_types)
+    if original_type == "apply_patch":
+        return {
+            "id": call_id,
+            "type": "custom_tool_call",
+            "status": "completed",
+            "call_id": call_id,
+            "name": "apply_patch",
+            "input": fn.get("arguments", ""),
+        }
+    if original_type.startswith("web_search"):
+        return _web_search_call_item(call_id, fn.get("arguments", ""))
     item: dict[str, Any] = {
         "id": call_id,
         "type": "function_call",
@@ -51,6 +63,61 @@ def function_call_item_from_chat_tool(call: dict[str, Any]) -> dict[str, Any]:
     else:
         item["name"] = raw_name
     return item
+
+
+def responses_tool_type_map(tools: Any) -> dict[str, str]:
+    if not isinstance(tools, list):
+        return {}
+    mapped: dict[str, str] = {}
+    for tool in tools:
+        if not isinstance(tool, dict):
+            continue
+        if tool.get("type") == "namespace":
+            namespace = str(tool.get("name") or "")
+            for sub_tool in tool.get("tools") or []:
+                if not isinstance(sub_tool, dict) or sub_tool.get("type") != "function":
+                    continue
+                sub_name = str(sub_tool.get("name") or "")
+                if namespace and sub_name:
+                    mapped[_sanitize_tool_name(namespaced_tool_chat_name(namespace, sub_name))] = "function"
+            continue
+        tool_type = str(tool.get("type") or "").strip().lower()
+        name = _responses_tool_function_name(tool)
+        if name and tool_type:
+            mapped[_sanitize_tool_name(name)] = tool_type
+    return mapped
+
+
+def original_responses_tool_type(name: str, tool_types: dict[str, str] | None = None) -> str:
+    clean = _sanitize_tool_name(str(name or ""))
+    if tool_types and clean in tool_types:
+        return str(tool_types[clean] or "").strip().lower()
+    if clean == "apply_patch":
+        return "apply_patch"
+    if clean in {"web_search", "web_search_preview"}:
+        return "web_search"
+    return ""
+
+
+def _web_search_call_item(call_id: str, raw_arguments: Any, status: str = "completed") -> dict[str, Any]:
+    args: dict[str, Any] = {}
+    if isinstance(raw_arguments, str):
+        try:
+            parsed = json.loads(raw_arguments) if raw_arguments.strip() else {}
+        except json.JSONDecodeError:
+            parsed = {"query": raw_arguments}
+        if isinstance(parsed, dict):
+            args = parsed
+    elif isinstance(raw_arguments, dict):
+        args = raw_arguments
+    query = str(args.get("query") or args.get("q") or args.get("search_query") or "")
+    return {
+        "id": call_id,
+        "type": "web_search_call",
+        "status": status,
+        "call_id": call_id,
+        "action": {"type": "search", "query": query},
+    }
 
 SHIM_ENCRYPTED_CONTENT_PREFIX = "anthropic-thinking-v1:"
 _THINKING_MAGIC = SHIM_ENCRYPTED_CONTENT_PREFIX
@@ -448,7 +515,11 @@ def anthropic_to_chat_response(payload: dict[str, Any], requested_model: str) ->
     }
 
 
-def chat_completion_to_response(payload: dict[str, Any], requested_model: str) -> dict[str, Any]:
+def chat_completion_to_response(
+    payload: dict[str, Any],
+    requested_model: str,
+    tool_types: dict[str, str] | None = None,
+) -> dict[str, Any]:
     choice = (payload.get("choices") or [{}])[0]
     message = choice.get("message") or {}
     output: list[dict[str, Any]] = []
@@ -474,7 +545,7 @@ def chat_completion_to_response(payload: dict[str, Any], requested_model: str) -
             }
         )
     for call in message.get("tool_calls") or []:
-        output.append(function_call_item_from_chat_tool(call))
+        output.append(function_call_item_from_chat_tool(call, tool_types))
     return {
         "id": payload.get("id", "resp_chat"),
         "object": "response",
@@ -486,8 +557,16 @@ def chat_completion_to_response(payload: dict[str, Any], requested_model: str) -
     }
 
 
-def anthropic_to_response(payload: dict[str, Any], requested_model: str) -> dict[str, Any]:
-    response = chat_completion_to_response(anthropic_to_chat_response(payload, requested_model), requested_model)
+def anthropic_to_response(
+    payload: dict[str, Any],
+    requested_model: str,
+    tool_types: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    response = chat_completion_to_response(
+        anthropic_to_chat_response(payload, requested_model),
+        requested_model,
+        tool_types,
+    )
     response["usage"] = normalize_responses_usage(payload.get("usage"))
     return response
 
@@ -753,8 +832,17 @@ def _chat_image_part(part: dict[str, Any]) -> dict[str, Any] | None:
     image_url: dict[str, Any] = {"url": url}
     detail = part.get("detail") or part.get("image_detail")
     if detail:
-        image_url["detail"] = detail
+        image_url["detail"] = _normalize_chat_image_detail(str(detail))
     return {"type": "image_url", "image_url": image_url}
+
+
+def _normalize_chat_image_detail(detail: str) -> str:
+    normalized = detail.strip().lower()
+    if normalized in {"low", "auto", "high"}:
+        return normalized
+    if normalized == "original":
+        return "high"
+    return "auto"
 
 
 def _image_url_from_part(part: dict[str, Any]) -> str:

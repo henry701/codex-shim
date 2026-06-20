@@ -57,6 +57,8 @@ from .translate import (
     prepare_codex_byok_responses_body,
     responses_to_anthropic,
     responses_to_chat,
+    responses_tool_type_map,
+    original_responses_tool_type,
     split_namespaced_tool_chat_name,
     _chat_finish_to_anthropic_stop,
     _responses_usage_to_anthropic_usage,
@@ -444,15 +446,20 @@ class ShimServer:
         if self._needs_image_gen(body) or self._needs_image_followup(body):
             return await self._chatgpt_passthrough(request, body, response_model_override=model)
         route = await self._route(body)
+        tool_types = responses_tool_type_map(body.get("tools"))
         body = prepare_codex_byok_responses_body(body, request.headers)
         if route.is_openai_responses:
             return await self._post_openai_responses(request, route, body)
         if route.is_openai_chat:
             forwarded = responses_to_chat(body, route.model)
-            return await self._post_openai_chat(request, route, forwarded, as_responses=True)
+            return await self._post_openai_chat(
+                request, route, forwarded, as_responses=True, tool_types=tool_types
+            )
         if route.is_anthropic:
             forwarded = responses_to_anthropic(body, route.model, route.max_output_tokens)
-            return await self._post_anthropic(request, route, forwarded, as_responses=True)
+            return await self._post_anthropic(
+                request, route, forwarded, as_responses=True, tool_types=tool_types
+            )
         raise web.HTTPBadGateway(text=f"Unsupported model provider: {route.provider}")
 
     async def responses_compact(self, request: web.Request) -> web.StreamResponse:
@@ -478,6 +485,7 @@ class ShimServer:
                 force_non_stream=True,
             )
         route = await self._route(body)
+        tool_types = responses_tool_type_map(body.get("tools"))
         compact_body = _compact_request_body(body, route.model)
         compact_body = prepare_codex_byok_responses_body(compact_body, request.headers)
         if route.is_openai_responses:
@@ -486,13 +494,15 @@ class ShimServer:
         if route.is_openai_chat:
             forwarded = responses_to_chat(compact_body, route.model)
             forwarded["stream"] = False
-            response = await self._post_openai_chat(request, route, forwarded, as_responses=True)
+            response = await self._post_openai_chat(
+                request, route, forwarded, as_responses=True, tool_types=tool_types
+            )
             return await _as_compact_response(response, route.slug)
         if route.is_anthropic:
             forwarded = responses_to_anthropic(compact_body, route.model, route.max_output_tokens)
             forwarded["stream"] = False
             response = await self._post_anthropic(
-                request, route, forwarded, as_responses=True
+                request, route, forwarded, as_responses=True, tool_types=tool_types
             )
             return await _as_compact_response(response, route.slug)
         raise web.HTTPBadGateway(text=f"Unsupported model provider: {route.provider}")
@@ -1048,18 +1058,19 @@ class ShimServer:
     ) -> web.StreamResponse:
         route = await self._route(body)
         client_slug = response_slug or route.slug
+        tool_types = responses_tool_type_map(body.get("tools"))
         body = prepare_codex_byok_responses_body(body, request.headers)
         if route.is_openai_responses:
             return await self._post_openai_responses(request, route, body)
         if route.is_openai_chat:
             forwarded = responses_to_chat(body, route.model)
             return await self._post_openai_chat(
-                request, route, forwarded, as_responses=True, response_slug=client_slug
+                request, route, forwarded, as_responses=True, response_slug=client_slug, tool_types=tool_types
             )
         if route.is_anthropic:
             forwarded = responses_to_anthropic(body, route.model, route.max_output_tokens)
             return await self._post_anthropic(
-                request, route, forwarded, as_responses=True, response_slug=client_slug
+                request, route, forwarded, as_responses=True, response_slug=client_slug, tool_types=tool_types
             )
         raise web.HTTPBadGateway(text=f"Unsupported model provider: {route.provider}")
 
@@ -1072,6 +1083,7 @@ class ShimServer:
     ) -> web.StreamResponse:
         route = await self._route(body)
         client_slug = response_slug or route.slug
+        tool_types = responses_tool_type_map(body.get("tools"))
         compact_body = _compact_request_body(body, route.model)
         compact_body = prepare_codex_byok_responses_body(compact_body, request.headers)
         if route.is_openai_responses:
@@ -1081,14 +1093,14 @@ class ShimServer:
             forwarded = responses_to_chat(compact_body, route.model)
             forwarded["stream"] = False
             response = await self._post_openai_chat(
-                request, route, forwarded, as_responses=True, response_slug=client_slug
+                request, route, forwarded, as_responses=True, response_slug=client_slug, tool_types=tool_types
             )
             return await _as_compact_response(response, client_slug)
         if route.is_anthropic:
             forwarded = responses_to_anthropic(compact_body, route.model, route.max_output_tokens)
             forwarded["stream"] = False
             response = await self._post_anthropic(
-                request, route, forwarded, as_responses=True, response_slug=client_slug
+                request, route, forwarded, as_responses=True, response_slug=client_slug, tool_types=tool_types
             )
             return await _as_compact_response(response, client_slug)
         raise web.HTTPBadGateway(text=f"Unsupported model provider: {route.provider}")
@@ -1173,14 +1185,14 @@ class ShimServer:
 
     async def _post_openai_chat(
         self, request: web.Request, route: ShimModel, body: dict[str, Any], as_responses: bool,
-        *, response_slug: str | None = None,
+        *, response_slug: str | None = None, tool_types: dict[str, str] | None = None,
     ) -> web.StreamResponse:
         client_slug = response_slug or route.slug
         url = _join_url(route.base_url, "/chat/completions")
         _dump_debug_request(route.slug, url, body)
         if body.get("stream"):
             return await self._stream_chat_loop(
-                request, route, body, as_responses, response_slug=client_slug
+                request, route, body, as_responses, response_slug=client_slug, tool_types=tool_types
             )
         async with ClientSession(timeout=self.timeout) as session:
             upstream = await session.post(url, json=body, headers=_openai_headers(route))
@@ -1200,7 +1212,7 @@ class ShimServer:
                 )
             payload = await upstream.json(content_type=None)
         if as_responses:
-            response_payload = chat_completion_to_response(payload, client_slug)
+            response_payload = chat_completion_to_response(payload, client_slug, tool_types)
             response_payload = await mcp_search.augment_response_with_tool_search(response_payload)
             return web.json_response(response_payload)
         return web.json_response(payload)
@@ -1213,12 +1225,13 @@ class ShimServer:
         as_responses: bool,
         *,
         response_slug: str | None = None,
+        tool_types: dict[str, str] | None = None,
         max_turns: int = 6,
     ) -> web.StreamResponse:
         client_slug = response_slug or route.slug
         response = _sse_response()
         await response.prepare(request)
-        state = ResponsesStreamState(client_slug) if as_responses else None
+        state = ResponsesStreamState(client_slug, tool_types=tool_types) if as_responses else None
         if as_responses and state is not None:
             await state.start(response)
         messages = list(body.get("messages", []))
@@ -1332,7 +1345,7 @@ class ShimServer:
 
     async def _post_anthropic(
         self, request: web.Request, route: ShimModel, body: dict[str, Any], as_responses: bool,
-        *, response_slug: str | None = None,
+        *, response_slug: str | None = None, tool_types: dict[str, str] | None = None,
     ) -> web.StreamResponse:
         client_slug = response_slug or route.slug
         url = _join_url(route.base_url, "/messages")
@@ -1350,11 +1363,11 @@ class ShimServer:
                 return await _error_response(upstream, slug=route.slug)
             if body.get("stream"):
                 return await self._stream_anthropic(
-                    request, upstream, route, as_responses, response_slug=client_slug
+                    request, upstream, route, as_responses, response_slug=client_slug, tool_types=tool_types
                 )
             payload = await upstream.json(content_type=None)
         if as_responses:
-            return web.json_response(anthropic_to_response(payload, client_slug))
+            return web.json_response(anthropic_to_response(payload, client_slug, tool_types))
         return web.json_response(anthropic_to_chat_response(payload, client_slug))
 
     async def _stream_openai_chat_as_anthropic(
@@ -1392,12 +1405,13 @@ class ShimServer:
         as_responses: bool,
         *,
         response_slug: str | None = None,
+        tool_types: dict[str, str] | None = None,
     ) -> web.StreamResponse:
         client_slug = response_slug or route.slug
         response = _sse_response()
         await response.prepare(request)
         if as_responses:
-            state = ResponsesStreamState(client_slug)
+            state = ResponsesStreamState(client_slug, tool_types=tool_types)
         upstream_saw_done = False
         try:
             if as_responses:
@@ -1553,11 +1567,66 @@ def _tool_call_arguments_complete(tc: dict[str, Any]) -> bool:
     args = tc.get("arguments") or ""
     if not isinstance(args, str) or not args.strip():
         return False
+    if tc.get("output_type") == "custom_tool_call":
+        return True
     try:
         json.loads(args)
     except json.JSONDecodeError:
         return False
     return True
+
+
+def _responses_output_type_for_tool(name: str, tool_types: dict[str, str] | None = None) -> str:
+    original_type = original_responses_tool_type(name, tool_types)
+    if original_type == "apply_patch":
+        return "custom_tool_call"
+    if original_type.startswith("web_search"):
+        return "web_search_call"
+    return "function_call"
+
+
+def _stream_tool_added_item(state: dict[str, Any], status: str = "in_progress") -> dict[str, Any]:
+    output_type = state.get("output_type", "function_call")
+    if output_type == "custom_tool_call":
+        return {
+            "id": state["id"],
+            "type": "custom_tool_call",
+            "status": status,
+            "call_id": state["call_id"],
+            "name": state["name"],
+            "input": "" if status == "in_progress" else state.get("arguments", ""),
+        }
+    if output_type == "web_search_call":
+        return _web_search_stream_item(state, status)
+    item: dict[str, Any] = {
+        "id": state["id"],
+        "type": "function_call",
+        "status": status,
+        "call_id": state["call_id"],
+        "name": state["name"],
+        "arguments": "" if status == "in_progress" else state.get("arguments", ""),
+    }
+    if state.get("namespace"):
+        item["namespace"] = state["namespace"]
+    return item
+
+
+def _web_search_stream_item(state: dict[str, Any], status: str) -> dict[str, Any]:
+    query = ""
+    raw_arguments = state.get("arguments") or ""
+    try:
+        parsed = json.loads(raw_arguments) if raw_arguments else {}
+    except json.JSONDecodeError:
+        parsed = {"query": raw_arguments}
+    if isinstance(parsed, dict):
+        query = str(parsed.get("query") or parsed.get("q") or parsed.get("search_query") or "")
+    return {
+        "id": state["id"],
+        "type": "web_search_call",
+        "status": status,
+        "call_id": state["call_id"],
+        "action": {"type": "search", "query": query},
+    }
 
 
 def _should_defer_tool_name(name: str) -> bool:
@@ -1794,7 +1863,7 @@ class ResponsesStreamState:
     and client ``[DONE]`` only when upstream sent ``[DONE]`` and every open item
     was fully received."""
 
-    def __init__(self, model: str):
+    def __init__(self, model: str, tool_types: dict[str, str] | None = None):
         self.response_id = f"resp_{int(time.time() * 1000)}"
         self.message_item_id = f"msg_{int(time.time() * 1000)}"
         self.model = model
@@ -1812,6 +1881,7 @@ class ResponsesStreamState:
         self.next_output_index = 0
         self.completed_turns: list[dict[str, Any]] = []
         self.upstream_finish_reason: str | None = None
+        self.tool_types = tool_types or {}
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -2073,6 +2143,7 @@ class ResponsesStreamState:
                     "call_id": call_id,
                     "name": name,
                     "arguments": fn.get("arguments") or "",
+                    "output_type": _responses_output_type_for_tool(name, self.tool_types),
                     "closed": False,
                     "emitted": False,
                 }
@@ -2161,17 +2232,14 @@ class ResponsesStreamState:
             state["namespace"] = namespace
             state["name"] = tool_name
             name = tool_name
-        state.update({"output_index": output_index, "emitted": True})
-        item: dict[str, Any] = {
-            "id": state["call_id"],
-            "type": "function_call",
-            "status": "in_progress",
-            "call_id": state["call_id"],
-            "name": name,
-            "arguments": "",
-        }
-        if namespace is not None:
-            item["namespace"] = namespace
+        state.update(
+            {
+                "output_index": output_index,
+                "emitted": True,
+                "output_type": _responses_output_type_for_tool(name, self.tool_types),
+            }
+        )
+        item = _stream_tool_added_item(state)
         await _write_sse(
             response,
             {
@@ -2599,19 +2667,11 @@ class ResponsesStreamState:
             "namespace": namespace,
             "arguments": "",
             "output_index": output_index,
+            "output_type": _responses_output_type_for_tool(name, self.tool_types),
             "closed": False,
         }
         self.tool_calls[key] = state
-        item: dict[str, Any] = {
-            "id": call_id,
-            "type": "function_call",
-            "status": "in_progress",
-            "call_id": call_id,
-            "name": name,
-            "arguments": "",
-        }
-        if namespace:
-            item["namespace"] = namespace
+        item = _stream_tool_added_item(state)
         await _write_sse(
             response,
             {
@@ -2626,15 +2686,16 @@ class ResponsesStreamState:
         if state.get("closed") or not _tool_call_arguments_complete(state):
             return
         state["closed"] = True
-        await _write_sse(
-            response,
-            {
-                "type": "response.function_call_arguments.done",
-                "item_id": state["id"],
-                "output_index": state["output_index"],
-                "arguments": state["arguments"],
-            },
-        )
+        if state.get("output_type", "function_call") == "function_call":
+            await _write_sse(
+                response,
+                {
+                    "type": "response.function_call_arguments.done",
+                    "item_id": state["id"],
+                    "output_index": state["output_index"],
+                    "arguments": state["arguments"],
+                },
+            )
         await _write_sse(
             response,
             {
@@ -2766,6 +2827,9 @@ class ResponsesStreamState:
         )
 
     def _tool_item(self, state: dict[str, Any], status: str) -> dict[str, Any]:
+        output_type = state.get("output_type", "function_call")
+        if output_type in {"custom_tool_call", "web_search_call"}:
+            return _stream_tool_added_item(state, status)
         item: dict[str, Any] = {
             "id": state["id"],
             "type": "function_call",

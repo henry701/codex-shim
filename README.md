@@ -1004,6 +1004,7 @@ codex-shim run               run shim in foreground (systemd / debugging)
 codex-shim install-service   fork: install+enable user systemd unit
 codex-shim enable            start daemon; write managed ~/.codex/config.toml (model, provider, feature flags)
 codex-shim status            health check + model count
+codex-shim doctor            read-only diagnostics for settings, daemon, passthrough, and Codex config
 codex-shim stop              stop daemon
 codex-shim disable           remove managed config block and stop daemon
 codex-shim restart           stop, regenerate, and start daemon
@@ -1098,6 +1099,7 @@ server is reachable.
 
 ```bash
 codex-shim status
+codex-shim doctor
 tail -n 80 .codex-shim/shim.log
 ```
 
@@ -1111,6 +1113,20 @@ Common causes:
 codex-shim --port 8766 restart
 codex-shim --port 8766 app .
 ```
+
+### Diagnose local wiring
+
+Run:
+
+```bash
+codex-shim doctor
+```
+
+The doctor is read-only. For this fork, the expected enabled config is
+`model_provider = "openai"` plus
+`openai_base_url = "http://127.0.0.1:<port>/v1"`. A legacy
+`[model_providers.codex_shim]` block is reported because Desktop sessions should
+stay under Codex's built-in OpenAI provider namespace.
 
 ### `~/.codex-shim/models.json` is missing
 

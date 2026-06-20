@@ -9,6 +9,9 @@ and this project does not yet follow semantic versioning (pre-1.0).
 
 ### Changed
 
+- Responses `input_image.detail` values are normalized before OpenAI-chat
+  forwarding: Codex's `original` becomes `high`, and unknown values become
+  `auto`.
 - Shim routing again uses Codex's built-in `openai` provider with
   `openai_base_url` pointed at the local shim, so Desktop recent threads stay in
   the same provider namespace across reboots. `enable` / `model use` migrate
@@ -33,6 +36,9 @@ and this project does not yet follow semantic versioning (pre-1.0).
 
 ### Added
 
+- `codex-shim doctor`: read-only diagnostics for Python/Codex CLI availability,
+  settings, generated runtime files, daemon health, ChatGPT/Cursor passthrough,
+  loopback proxy variables, and this fork's managed `openai_base_url` routing.
 - `openai-responses` provider (`ShimModel.is_openai_responses`): passthrough to
   upstream `/v1/responses` without chat-completions translation (raw SSE/JSON).
 - `parse_mcp_tool_reference()` accepts MCP chat names in both `mcp__srv__tool`
@@ -117,6 +123,11 @@ and this project does not yet follow semantic versioning (pre-1.0).
   exports.
 
 ### Fixed
+
+- BYOK response translation now preserves native Responses tool item types where
+  Codex expects them: `apply_patch` returns `custom_tool_call`, and
+  `web_search*` returns `web_search_call`. MCP and `tool_search_call` handling
+  remains client-executed; no server-side web-search fallback was added.
 
 - Protected the state-changing picker `/api/switch` endpoint with a
   per-process picker token so third-party pages cannot trigger model switches

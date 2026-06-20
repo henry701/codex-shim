@@ -327,6 +327,34 @@ def test_computer_call_output_screenshot_reaches_openai_chat_vision():
     ]
 
 
+def test_input_image_detail_original_normalizes_to_openai_chat_high():
+    body = {
+        "model": "slug",
+        "input": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": "Inspect."},
+                    {"type": "input_image", "image_url": "data:image/png;base64,AAA", "detail": "original"},
+                    {"type": "input_image", "image_url": "data:image/png;base64,BBB", "detail": "weird"},
+                ],
+            }
+        ],
+    }
+
+    out = responses_to_chat(body, "vision-model")
+
+    images = [
+        part["image_url"]
+        for part in out["messages"][0]["content"]
+        if part.get("type") == "image_url"
+    ]
+    assert images == [
+        {"url": "data:image/png;base64,AAA", "detail": "high"},
+        {"url": "data:image/png;base64,BBB", "detail": "auto"},
+    ]
+
+
 def test_function_call_output_visual_feedback_adds_followup_image_message():
     body = {
         "model": "slug",
