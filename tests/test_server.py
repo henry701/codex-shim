@@ -98,6 +98,27 @@ def test_sanitize_chatgpt_passthrough_body_removes_nested_shim_encrypted_content
     assert "encrypted_content" in body["input"][0]["content"][0]
 
 
+def test_sanitize_chatgpt_passthrough_body_removes_previous_response_id_top_level_only():
+    body = {
+        "model": "codex-gpt-5-5",
+        "previous_response_id": "resp_previous",
+        "metadata": {"previous_response_id": "metadata-value"},
+        "input": [
+            {
+                "type": "message",
+                "role": "user",
+                "content": "hi",
+            }
+        ],
+    }
+
+    sanitized = _sanitize_chatgpt_passthrough_body(body)
+
+    assert "previous_response_id" not in sanitized
+    assert sanitized["metadata"]["previous_response_id"] == "metadata-value"
+    assert body["previous_response_id"] == "resp_previous"
+
+
 def test_rewrite_response_model_only_rewrites_chatgpt_metadata():
     payload = {
         "model": "gpt-5.5",
@@ -221,6 +242,99 @@ async def test_chatgpt_passthrough_requests_advertise_zstd_encoding(monkeypatch,
     assert resp.status == 200
     assert captured["url"] == "https://chatgpt.com/backend-api/codex/responses"
     assert captured["headers"]["Accept-Encoding"] == "zstd, gzip, deflate"
+
+    await shim_client.close()
+
+
+async def test_chatgpt_passthrough_drops_previous_response_id(monkeypatch, tmp_path, auth_present):
+    captured = {}
+
+    class FakeUpstream:
+        status = 200
+        content_type = "application/json"
+
+        async def json(self, content_type=None):
+            return {"id": "resp_1", "model": "gpt-5.5", "output": []}
+
+        def release(self):
+            pass
+
+    async def fake_post(self, url, json=None, headers=None):
+        captured["url"] = str(url)
+        captured["body"] = json
+        return FakeUpstream()
+
+    monkeypatch.setattr("codex_shim.server.ClientSession.post", fake_post)
+    settings = tmp_path / "settings.json"
+    settings.write_text("{}")
+    shim_client = TestClient(TestServer(ShimServer(settings).app()))
+    await shim_client.start_server()
+
+    resp = await shim_client.post(
+        "/v1/responses",
+        json={"model": "codex-gpt-5-5", "previous_response_id": "resp_previous", "input": "hi"},
+    )
+
+    assert resp.status == 200
+    assert captured["url"] == "https://chatgpt.com/backend-api/codex/responses"
+    assert captured["body"]["model"] == "gpt-5.5"
+    assert "previous_response_id" not in captured["body"]
+
+    await shim_client.close()
+
+
+async def test_chatgpt_passthrough_expands_previous_response_id(monkeypatch, tmp_path, auth_present):
+    captured = []
+    first_input = [{"type": "message", "role": "user", "content": "run a command"}]
+    tool_call = {
+        "type": "function_call",
+        "id": "fc_1",
+        "call_id": "call_1",
+        "name": "exec_command",
+        "arguments": "{\"cmd\":\"printf ok\"}",
+    }
+    tool_output = {"type": "function_call_output", "call_id": "call_1", "output": "ok"}
+
+    class FakeUpstream:
+        status = 200
+        content_type = "application/json"
+
+        def __init__(self, payload):
+            self.payload = payload
+
+        async def json(self, content_type=None):
+            return self.payload
+
+        def release(self):
+            pass
+
+    async def fake_post(self, url, json=None, headers=None):
+        captured.append(json)
+        if len(captured) == 1:
+            return FakeUpstream({"id": "resp_previous", "model": "gpt-5.5", "output": [tool_call]})
+        return FakeUpstream({"id": "resp_next", "model": "gpt-5.5", "output": []})
+
+    monkeypatch.setattr("codex_shim.server.ClientSession.post", fake_post)
+    settings = tmp_path / "settings.json"
+    settings.write_text("{}")
+    shim_client = TestClient(TestServer(ShimServer(settings).app()))
+    await shim_client.start_server()
+
+    first = await shim_client.post("/v1/responses", json={"model": "codex-gpt-5-5", "input": first_input})
+    assert first.status == 200
+
+    second = await shim_client.post(
+        "/v1/responses",
+        json={
+            "model": "codex-gpt-5-5",
+            "previous_response_id": "resp_previous",
+            "input": [tool_output],
+        },
+    )
+    assert second.status == 200
+
+    assert "previous_response_id" not in captured[1]
+    assert captured[1]["input"] == [*first_input, tool_call, tool_output]
 
     await shim_client.close()
 
@@ -356,6 +470,7 @@ async def test_chatgpt_passthrough_websocket_relays_sse_events(monkeypatch, tmp_
             "tools": [],
             "tool_choice": "auto",
             "parallel_tool_calls": True,
+            "previous_response_id": "resp_previous",
             "store": False,
             "stream": True,
             "include": [],
@@ -378,10 +493,81 @@ async def test_chatgpt_passthrough_websocket_relays_sse_events(monkeypatch, tmp_
     assert captured["url"] == "https://chatgpt.com/backend-api/codex/responses"
     assert captured["body"]["model"] == "gpt-5.5"
     assert captured["body"]["stream"] is True
+    assert "previous_response_id" not in captured["body"]
     assert "type" not in captured["body"]
     assert captured["headers"]["Authorization"] == "Bearer stub"
 
     await ws.close()
+    await shim_client.close()
+
+
+async def test_chatgpt_passthrough_websocket_expands_previous_response_id(monkeypatch, tmp_path, auth_present):
+    captured = []
+    first_input = [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "run"}]}]
+    tool_call = {
+        "type": "function_call",
+        "id": "fc_1",
+        "call_id": "call_1",
+        "name": "exec_command",
+        "arguments": "{\"cmd\":\"printf ok\"}",
+    }
+    tool_output = {"type": "function_call_output", "call_id": "call_1", "output": "ok"}
+
+    class FakeUpstream:
+        status = 200
+        content_type = "text/event-stream"
+
+        def __init__(self, chunks):
+            self.content = _FakeSseContent(chunks)
+
+        def release(self):
+            pass
+
+    async def fake_post(self, url, json=None, headers=None):
+        captured.append(json)
+        if len(captured) == 1:
+            return FakeUpstream(
+                [
+                    b'data: {"type":"response.created","response":{"id":"resp_previous","model":"gpt-5.5"}}\n\n',
+                    b'data: {"type":"response.output_item.done","response":{"id":"resp_previous","model":"gpt-5.5","output":[]},"item":{"type":"function_call","id":"fc_1","call_id":"call_1","name":"exec_command","arguments":"{\\\"cmd\\\":\\\"printf ok\\\"}"}}\n\n',
+                    b'data: {"type":"response.completed","response":{"id":"resp_previous","model":"gpt-5.5","status":"completed","output":[]}}\n\n',
+                ]
+            )
+        return FakeUpstream(
+            [
+                b'data: {"type":"response.created","response":{"id":"resp_next","model":"gpt-5.5"}}\n\n',
+                b'data: {"type":"response.completed","response":{"id":"resp_next","model":"gpt-5.5","status":"completed"}}\n\n',
+            ]
+        )
+
+    monkeypatch.setattr("codex_shim.server.ClientSession.post", fake_post)
+    settings = tmp_path / "settings.json"
+    settings.write_text("{}")
+    shim_client = TestClient(TestServer(ShimServer(settings).app()))
+    await shim_client.start_server()
+
+    ws = await shim_client.ws_connect("/v1/responses")
+    await ws.send_json({"type": "response.create", "model": "codex-gpt-5-5", "input": first_input, "stream": True})
+    for _ in range(3):
+        msg = await ws.receive(timeout=2)
+        assert msg.type == WSMsgType.TEXT
+
+    await ws.send_json(
+        {
+            "type": "response.create",
+            "model": "codex-gpt-5-5",
+            "previous_response_id": "resp_previous",
+            "input": [tool_output],
+            "stream": True,
+        }
+    )
+    for _ in range(2):
+        msg = await ws.receive(timeout=2)
+        assert msg.type == WSMsgType.TEXT
+
+    assert "previous_response_id" not in captured[1]
+    assert captured[1]["input"] == [*first_input, tool_call, tool_output]
+
     await shim_client.close()
 
 

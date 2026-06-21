@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import copy
 import json
 import os
 import re
@@ -70,6 +71,7 @@ PICKER_TOKEN_HEADER = "X-Codex-Shim-Picker-Token"
 CHATGPT_ACCEPT_ENCODING = "zstd, gzip, deflate"
 _MODELS_CACHE_TTL_SEC = 30.0
 _STARTUP_REFRESH_TIMEOUT_SEC = 120.0
+_CHATGPT_PASSTHROUGH_MAX_CACHED_RESPONSES = 128
 
 
 class ShimServer:
@@ -85,6 +87,8 @@ class ShimServer:
             "cursor_passthrough": False,
             "auto_router": False,
         }
+        self._chatgpt_passthrough_conversations: dict[str, list[Any]] = {}
+        self._chatgpt_passthrough_conversation_order: list[str] = []
         self.picker_token = secrets.token_urlsafe(32)
 
     def app(self) -> web.Application:
@@ -364,7 +368,7 @@ class ShimServer:
 
         upstream_model = chatgpt_upstream_model(requested)
         response_model_override = requested if requested != upstream_model else None
-        forwarded = _sanitize_chatgpt_passthrough_body({k: v for k, v in payload.items() if k != "type"})
+        forwarded = self._prepare_chatgpt_passthrough_body({k: v for k, v in payload.items() if k != "type"})
         forwarded["model"] = upstream_model
         forwarded["stream"] = True
         headers = {
@@ -386,14 +390,18 @@ class ShimServer:
                 upstream.release()
                 await _write_ws_error(ws, upstream.status, code, message)
                 return
+            collector = ChatgptPassthroughResponseCollector(forwarded)
             try:
                 await _relay_sse_response_to_ws(
                     upstream,
                     request,
                     ws,
                     response_model_override=response_model_override,
+                    collector=collector,
+                    cache_collected=self._store_chatgpt_passthrough_conversation,
                 )
             finally:
+                self._store_chatgpt_passthrough_conversation(collector.response_id, collector.conversation_items())
                 await _close_upstream(upstream)
 
     async def _handle_local_response_create_websocket(
@@ -418,7 +426,11 @@ class ShimServer:
                 await _write_ws_error(ws, upstream.status, code, message)
                 return
             try:
-                await _relay_sse_response_to_ws(upstream, request, ws)
+                await _relay_sse_response_to_ws(
+                    upstream,
+                    request,
+                    ws,
+                )
             finally:
                 await _close_upstream(upstream)
 
@@ -664,6 +676,44 @@ class ShimServer:
             return str(content.get("text") or content.get("content") or "")
         return str(content)
 
+    def _prepare_chatgpt_passthrough_body(self, body: dict[str, Any]) -> dict[str, Any]:
+        previous_response_id = body.get("previous_response_id")
+        forwarded = _sanitize_chatgpt_passthrough_body(body)
+        if isinstance(previous_response_id, str) and previous_response_id:
+            cached = self._chatgpt_passthrough_conversations.get(previous_response_id)
+            if _stream_log_enabled():
+                print(
+                    f"[chatgpt-cache] previous_response_id={previous_response_id} hit={cached is not None}",
+                    flush=True,
+                )
+            if cached:
+                forwarded["input"] = [*copy.deepcopy(cached), *_chatgpt_input_items(forwarded.get("input"))]
+        return forwarded
+
+    def _record_chatgpt_passthrough_response(
+        self,
+        forwarded: dict[str, Any],
+        payload: dict[str, Any],
+    ) -> None:
+        response_id = payload.get("id")
+        output = payload.get("output")
+        if not isinstance(response_id, str) or not isinstance(output, list):
+            return
+        self._store_chatgpt_passthrough_conversation(
+            response_id,
+            [*_chatgpt_input_items(forwarded.get("input")), *copy.deepcopy(output)],
+        )
+
+    def _store_chatgpt_passthrough_conversation(self, response_id: str | None, items: list[Any]) -> None:
+        if not response_id or not items:
+            return
+        if response_id not in self._chatgpt_passthrough_conversations:
+            self._chatgpt_passthrough_conversation_order.append(response_id)
+        self._chatgpt_passthrough_conversations[response_id] = copy.deepcopy(items)
+        while len(self._chatgpt_passthrough_conversation_order) > _CHATGPT_PASSTHROUGH_MAX_CACHED_RESPONSES:
+            evicted = self._chatgpt_passthrough_conversation_order.pop(0)
+            self._chatgpt_passthrough_conversations.pop(evicted, None)
+
     async def _chatgpt_passthrough(
         self,
         request: web.Request,
@@ -707,7 +757,7 @@ class ShimServer:
             if fallback is not None:
                 return fallback
             raise web.HTTPUnauthorized(text="auth.json has no access_token")
-        forwarded = _sanitize_chatgpt_passthrough_body(body)
+        forwarded = self._prepare_chatgpt_passthrough_body(body)
         forwarded["model"] = upstream_model or CHATGPT_MODEL_SLUG
         headers = {
             "Authorization": f"Bearer {access_token}",
@@ -740,36 +790,38 @@ class ShimServer:
                 return web.Response(status=status, text=text, content_type=content_type)
             if not forwarded.get("stream"):
                 payload = await upstream.json(content_type=None)
+                self._record_chatgpt_passthrough_response(forwarded, payload)
                 _rewrite_response_model(payload, response_model_override)
                 return web.json_response(payload)
             response = _sse_response()
             await response.prepare(request)
+            collector = ChatgptPassthroughResponseCollector(forwarded)
             try:
-                if response_model_override:
-                    async for line in _sse_lines(upstream, request):
-                        if line == "[DONE]":
-                            await _safe_write(response, b"data: [DONE]\n\n")
-                            break
-                        try:
-                            payload = json.loads(line)
-                        except json.JSONDecodeError:
-                            await _safe_write(response, f"data: {line}\n\n".encode())
-                            continue
-                        _rewrite_response_model(payload, response_model_override)
-                        await _write_sse(response, payload)
-                else:
+                async for line in _sse_lines(upstream, request):
+                    if line == "[DONE]":
+                        await _safe_write(response, b"data: [DONE]\n\n")
+                        break
                     try:
-                        async for chunk in _iter_upstream_chunks(upstream.content, request):
-                            await _safe_write(response, chunk)
-                    except asyncio.CancelledError:
-                        await _close_upstream(upstream)
-                        raise
+                        payload = json.loads(line)
+                    except json.JSONDecodeError:
+                        await _safe_write(response, f"data: {line}\n\n".encode())
+                        continue
+                    collector.record(payload)
+                    if _should_cache_chatgpt_passthrough_event(payload):
+                        self._store_chatgpt_passthrough_conversation(
+                            collector.response_id,
+                            collector.conversation_items(),
+                        )
+                    if response_model_override:
+                        _rewrite_response_model(payload, response_model_override)
+                    await _write_sse(response, payload)
             except asyncio.CancelledError:
                 print("[cancel] client disconnected during ChatGPT passthrough stream", flush=True)
                 raise
             except ClientDisconnected:
                 print("[cancel] client disconnected during ChatGPT passthrough stream", flush=True)
             finally:
+                self._store_chatgpt_passthrough_conversation(collector.response_id, collector.conversation_items())
                 await _close_upstream(upstream)
             try:
                 await response.write_eof()
@@ -1494,11 +1546,59 @@ class ShimServer:
 
 
 _DROP_ITEM = object()
+_CHATGPT_PASSTHROUGH_UNSUPPORTED_TOP_LEVEL_KEYS = frozenset({"previous_response_id"})
+
+
+def _chatgpt_input_items(input_value: Any) -> list[Any]:
+    if isinstance(input_value, list):
+        return copy.deepcopy(input_value)
+    if input_value is None:
+        return []
+    return [{"type": "message", "role": "user", "content": copy.deepcopy(input_value)}]
+
+
+class ChatgptPassthroughResponseCollector:
+    def __init__(self, forwarded: dict[str, Any]):
+        self._input = _chatgpt_input_items(forwarded.get("input"))
+        self.response_id: str | None = None
+        self._output: list[Any] = []
+
+    def record(self, event: dict[str, Any]) -> None:
+        response = event.get("response")
+        if isinstance(response, dict):
+            response_id = response.get("id")
+            if isinstance(response_id, str):
+                self.response_id = response_id
+            output = response.get("output")
+            if isinstance(output, list) and output:
+                self._output = copy.deepcopy(output)
+                return
+        if event.get("type") == "response.output_item.done":
+            item = event.get("item")
+            if isinstance(item, dict):
+                self._output.append(copy.deepcopy(item))
+
+    def conversation_items(self) -> list[Any]:
+        return [*copy.deepcopy(self._input), *copy.deepcopy(self._output)]
+
+
+def _should_cache_chatgpt_passthrough_event(event: dict[str, Any]) -> bool:
+    if event.get("type") in {"response.output_item.done", "response.completed"}:
+        return True
+    response = event.get("response")
+    return isinstance(response, dict) and bool(response.get("output"))
 
 
 def _sanitize_chatgpt_passthrough_body(body: dict[str, Any]) -> dict[str, Any]:
     sanitized = _sanitize_chatgpt_passthrough_value(body)
-    return sanitized if isinstance(sanitized, dict) else {}
+    if not isinstance(sanitized, dict):
+        return {}
+    # Codex may send normal Responses continuation fields based on provider
+    # metadata, but ChatGPT's Codex OAuth backend rejects this one. Keep the
+    # compatibility shim scoped to the ChatGPT passthrough path.
+    for key in _CHATGPT_PASSTHROUGH_UNSUPPORTED_TOP_LEVEL_KEYS:
+        sanitized.pop(key, None)
+    return sanitized
 
 
 def _sanitize_chatgpt_passthrough_value(value: Any) -> Any:
@@ -3059,6 +3159,8 @@ async def _relay_sse_response_to_ws(
     ws: web.WebSocketResponse,
     *,
     response_model_override: str | None = None,
+    collector: ChatgptPassthroughResponseCollector | None = None,
+    cache_collected: Any = None,
 ) -> None:
     async for line in _sse_lines(upstream, request):
         if line == "[DONE]":
@@ -3068,6 +3170,10 @@ async def _relay_sse_response_to_ws(
         except json.JSONDecodeError:
             await _write_ws_error(ws, 502, "upstream_protocol_error", "upstream emitted non-JSON SSE data")
             continue
+        if collector is not None:
+            collector.record(event)
+            if cache_collected is not None and _should_cache_chatgpt_passthrough_event(event):
+                cache_collected(collector.response_id, collector.conversation_items())
         if response_model_override:
             _rewrite_response_model(event, response_model_override)
         await _write_ws_json(ws, event)
