@@ -2154,6 +2154,67 @@ async def test_health_and_models_hide_cursor_passthrough_when_auth_missing(tmp_p
     await shim_client.close()
 
 
+async def test_cursor_passthrough_stream_shows_tool_activity_without_function_calls(
+    monkeypatch, tmp_path, cursor_present, auth_missing
+):
+    settings = tmp_path / "settings.json"
+    settings.write_text(json.dumps({"customModels": []}))
+
+    async def fake_cursor_events(_prompt, _model):
+        yield {"type": "text_delta", "delta": "Segment one."}
+        yield {
+            "type": "tool_started",
+            "call_id": "tool-1",
+            "tool_call": {"readToolCall": {"args": {"path": "README.md"}}},
+            "markdown": "**cursor-agent · read**\n\n> `README.md`\n",
+        }
+        yield {
+            "type": "tool_completed",
+            "call_id": "tool-1",
+            "tool_call": {},
+            "markdown": "\n**Result**\n\n```\nok\n```\n",
+        }
+        yield {"type": "text_delta", "delta": "Segment two."}
+        yield {"type": "completed", "text": "Segment one.Segment two."}
+
+    monkeypatch.setattr(server_module, "iter_cursor_agent_events", fake_cursor_events)
+
+    shim_client = TestClient(TestServer(ShimServer(settings).app()))
+    await shim_client.start_server()
+    try:
+        resp = await shim_client.post(
+            "/v1/responses",
+            json={
+                "model": "cursor-composer-2-5",
+                "input": [{"role": "user", "content": "hello"}],
+                "stream": True,
+            },
+        )
+        assert resp.status == 200
+        events = _sse_events(await resp.text())
+        added = [event for event in events if event.get("type") == "response.output_item.added"]
+        item_types = [(event.get("item") or {}).get("type") for event in added]
+        assert item_types.count("message") == 2
+        assert item_types.count("reasoning") == 1
+        assert not any((event.get("item") or {}).get("type") == "function_call" for event in added)
+        reasoning_added = next(event for event in added if (event.get("item") or {}).get("type") == "reasoning")
+        reasoning_done = [
+            event
+            for event in events
+            if event.get("type") == "response.output_item.done"
+            and (event.get("item") or {}).get("type") == "reasoning"
+        ][-1]
+        summary = (reasoning_done.get("item") or {}).get("summary") or []
+        assert summary and "README.md" in summary[0]["text"]
+        assert reasoning_added is not None
+        completed = [event for event in events if event.get("type") == "response.completed"][-1]
+        output_types = [item.get("type") for item in completed["response"]["output"]]
+        assert output_types.count("message") == 2
+        assert output_types.count("reasoning") == 1
+    finally:
+        await shim_client.close()
+
+
 async def test_chat_routes_to_openai_normalizes_developer_role(tmp_path):
     captured = {}
 

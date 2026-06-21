@@ -18,6 +18,7 @@ from aiohttp import ClientError, ClientSession, ClientTimeout, WSMsgType, web
 
 from .cursor_passthrough import (
     CURSOR_MODEL_SLUG,
+    CursorResponseCollector,
     build_cursor_prompt,
     cursor_passthrough_available,
     cursor_passthrough_display_names,
@@ -930,29 +931,25 @@ class ShimServer:
         stream = bool(body.get("stream")) and not force_non_stream
 
         if not stream:
-            text = ""
+            collector = CursorResponseCollector()
             usage: dict[str, Any] | None = None
+            fallback_text = ""
             async for event in iter_cursor_agent_events(prompt, upstream):
                 if event["type"] == "completed":
-                    text = str(event.get("text") or text)
+                    fallback_text = str(event.get("text") or fallback_text)
                 elif event["type"] == "usage":
                     usage = event.get("usage") if isinstance(event.get("usage"), dict) else None
                 elif event["type"] == "error":
                     raise web.HTTPBadGateway(text=str(event.get("message") or "cursor-agent failed"))
+                else:
+                    collector.consume(event)
+            output = collector.build_output(fallback_text=fallback_text)
             payload: dict[str, Any] = {
                 "id": f"resp_{int(time.time() * 1000)}",
                 "object": "response",
                 "model": slug,
                 "status": "completed",
-                "output": [
-                    {
-                        "id": "msg_0",
-                        "type": "message",
-                        "status": "completed",
-                        "role": "assistant",
-                        "content": [{"type": "output_text", "text": text, "annotations": []}],
-                    }
-                ],
+                "output": output,
             }
             normalized_usage = normalize_responses_usage(usage)
             if normalized_usage:
@@ -965,22 +962,16 @@ class ShimServer:
         try:
             await state.start(response)
             async for event in iter_cursor_agent_events(prompt, upstream):
-                if event["type"] == "text_delta":
-                    await state.write_chat_delta(
-                        response,
-                        {"choices": [{"delta": {"content": event["delta"]}}]},
-                    )
-                elif event["type"] == "usage":
+                if event["type"] == "usage":
                     normalized_usage = normalize_responses_usage(event.get("usage"))
                     if normalized_usage:
                         state.usage = normalized_usage
                 elif event["type"] == "error":
                     message = str(event.get("message") or "cursor-agent failed")
-                    await state.write_chat_delta(
-                        response,
-                        {"choices": [{"delta": {"content": message}}]},
-                    )
+                    await state.fail(response, message, code="upstream_error")
                     break
+                else:
+                    await _apply_cursor_stream_event(state, response, event)
             await state.finish(response, upstream_saw_done=True)
         except ClientDisconnected:
             pass
@@ -2075,6 +2066,7 @@ class ResponsesStreamState:
         self.tool_search_calls: dict[int, dict[str, Any]] = {}
         # Reasoning (extended thinking) blocks, keyed by upstream index.
         self.reasoning_blocks: dict[Any, dict[str, Any]] = {}
+        self.finished_messages: list[tuple[int, dict[str, Any]]] = []
         self.next_output_index = 0
         self.completed_turns: list[dict[str, Any]] = []
         self.upstream_finish_reason: str | None = None
@@ -2210,6 +2202,7 @@ class ResponsesStreamState:
         self.mcp_tool_calls = {}
         self.tool_search_calls = {}
         self.reasoning_blocks = {}
+        self.finished_messages = []
 
     def _current_turn_dict(self) -> dict[str, Any]:
         return {
@@ -2827,11 +2820,103 @@ class ResponsesStreamState:
                 "item": self._message_item("completed"),
             },
         )
+        if self.message_index is not None:
+            self.finished_messages.append((self.message_index, self._message_item("completed")))
+
+    async def close_message_segment(self, response: web.StreamResponse) -> None:
+        if self.message_opened and not self.message_closed and self.message_text:
+            await self._close_message(response)
+
+    async def reopen_message_segment(self, response: web.StreamResponse) -> None:
+        self.message_item_id = f"msg_{int(time.time() * 1000)}_{self.next_output_index}"
+        self.message_text = ""
+        self.message_closed = False
+        self.message_opened = False
+        self.message_index = None
+        await self._open_message(response)
+
+    async def open_cursor_tool_activity(
+        self,
+        response: web.StreamResponse,
+        call_id: str,
+        markdown: str,
+    ) -> None:
+        key = ("cursor_tool", call_id)
+        await self._open_reasoning(response, key=key, initial_text=markdown)
+
+    async def append_cursor_tool_activity(
+        self,
+        response: web.StreamResponse,
+        call_id: str,
+        markdown: str,
+    ) -> None:
+        if not markdown:
+            return
+        key = ("cursor_tool", call_id)
+        state = self.reasoning_blocks.get(key)
+        if state is None:
+            await self.open_cursor_tool_activity(response, call_id, markdown)
+            return
+        state["text"] = str(state.get("text") or "") + markdown
+        await self._emit_reasoning_summary_deltas(response, state, markdown)
+
+    async def close_cursor_tool_activity(
+        self,
+        response: web.StreamResponse,
+        call_id: str,
+    ) -> None:
+        key = ("cursor_tool", call_id)
+        state = self.reasoning_blocks.get(key)
+        if state is not None and not state.get("closed"):
+            await self._close_reasoning(response, state)
+
+    async def append_cursor_thinking_activity(
+        self,
+        response: web.StreamResponse,
+        delta: str,
+    ) -> None:
+        if not delta:
+            return
+        key = ("cursor_thinking",)
+        state = self.reasoning_blocks.get(key)
+        if state is None:
+            await self._open_reasoning(
+                response,
+                key=key,
+                initial_text=f"**cursor-agent · thinking**\n\n{delta}",
+            )
+            return
+        if state.get("closed"):
+            return
+        state["text"] = str(state.get("text") or "") + delta
+        await self._emit_reasoning_summary_deltas(response, state, delta)
+
+    async def close_cursor_thinking_activity(self, response: web.StreamResponse) -> None:
+        key = ("cursor_thinking",)
+        state = self.reasoning_blocks.get(key)
+        if state is not None and not state.get("closed"):
+            await self._close_reasoning(response, state)
+
+    async def interrupt_cursor_tool_activities(
+        self,
+        response: web.StreamResponse,
+        message: str,
+    ) -> None:
+        for key, state in list(self.reasoning_blocks.items()):
+            if not isinstance(key, tuple) or key[0] != "cursor_tool":
+                continue
+            if state.get("closed"):
+                continue
+            state["text"] = str(state.get("text") or "") + message
+            await self._emit_reasoning_summary_deltas(response, state, message)
+            await self._close_reasoning(response, state)
 
     async def _text_delta(self, response: web.StreamResponse, text: str) -> None:
         if not text:
             return
-        if not self.message_opened:
+        if self.message_closed:
+            await self.reopen_message_segment(response)
+        elif not self.message_opened:
             await self._open_message(response)
         self.message_text += text
         await _write_sse(
@@ -3051,6 +3136,7 @@ class ResponsesStreamState:
                     turn["message_opened"]
                     and turn["message_text"]
                     and turn["message_index"] is not None
+                    and not turn["message_closed"]
                 ):
                     collected.append((turn["message_index"], self._message_item_for_turn(turn, "completed")))
                 for state in turn["tool_calls"].values():
@@ -3063,6 +3149,8 @@ class ResponsesStreamState:
                     collected.append((state["output_index"], self._mcp_tool_item(state)))
                 for state in turn.get("tool_search_calls", {}).values():
                     collected.append((state["output_index"], self._tool_search_item(state)))
+            for output_index, item in self.finished_messages:
+                collected.append((output_index, item))
             collected.sort(key=lambda pair: pair[0])
             output = [item for _, item in collected]
         payload = {
@@ -3089,6 +3177,57 @@ class ResponsesStreamState:
                 {"type": "output_text", "text": turn["message_text"], "annotations": []}
             ] if turn["message_text"] else [],
         }
+
+
+async def _apply_cursor_stream_event(
+    state: ResponsesStreamState,
+    response: web.StreamResponse,
+    event: dict[str, Any],
+) -> None:
+    event_type = event.get("type")
+    if event_type == "text_delta":
+        await state.close_cursor_thinking_activity(response)
+        await state.write_chat_delta(
+            response,
+            {"choices": [{"delta": {"content": event.get("delta") or ""}}]},
+        )
+        return
+    if event_type == "segment_boundary":
+        await state.close_cursor_thinking_activity(response)
+        await state.close_message_segment(response)
+        return
+    if event_type == "tool_started":
+        await state.close_cursor_thinking_activity(response)
+        await state.close_message_segment(response)
+        await state.open_cursor_tool_activity(
+            response,
+            str(event.get("call_id") or ""),
+            str(event.get("markdown") or ""),
+        )
+        return
+    if event_type == "tool_completed":
+        call_id = str(event.get("call_id") or "")
+        await state.append_cursor_tool_activity(
+            response,
+            call_id,
+            str(event.get("markdown") or ""),
+        )
+        await state.close_cursor_tool_activity(response, call_id)
+        return
+    if event_type == "thinking_delta":
+        await state.append_cursor_thinking_activity(response, str(event.get("delta") or ""))
+        return
+    if event_type == "thinking_completed":
+        await state.close_cursor_thinking_activity(response)
+        return
+    if event_type == "connection_interrupted":
+        await state.interrupt_cursor_tool_activities(
+            response,
+            str(event.get("message") or ""),
+        )
+        return
+    if event_type == "completed":
+        await state.close_message_segment(response)
 
 
 _THINKING_MAGIC = "anthropic-thinking-v1:"

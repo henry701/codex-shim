@@ -33,6 +33,17 @@ and this project does not yet follow semantic versioning (pre-1.0).
 - Model catalog responses (`GET /api/models`, `GET /v1/models`, and
   `write_catalog` JSON) are sorted alphabetically by slug for deterministic
   ordering across harnesses.
+- Cursor passthrough (`cursor-agent` stream-json) filters duplicate assistant
+  flushes per Cursor CLI rules (`timestamp_ms` / `model_call_id`), surfaces
+  tool activity as non-executable reasoning blocks with blockquote markdown,
+  supports multi-segment assistant messages per turn, merges thinking deltas,
+  and handles both incremental and cumulative assistant text fragments.
+- `editToolCall` / `writeToolCall` tool markdown includes path and content preview.
+- `codex_shim.cursor_stream_visualizer` replays captured NDJSON with colored
+  terminal output; `scripts/cursor-passthrough-smoke-tmux.sh` splits agent vs
+  visualizer in tmux for manual smoke runs.
+- Fixture-backed smoke tests in `tests/test_cursor_passthrough_smoke.py` cover
+  sleep/shell/read and write/edit/patch captures (`tests/fixtures/cursor_stream/`).
 - `sync-desktop` and the systemd/`run` path refresh `~/.codex/custom_model_catalog.json`
   only; they no longer write `~/.codex/config.toml`. Use `codex-shim enable` (or `app` /
   `model use`) to install the managed OpenAI-provider shim routing while the

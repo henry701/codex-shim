@@ -215,9 +215,9 @@ def cursor_catalog_entry(model: CursorCatalogModel, *, priority: int = 11_000) -
             {"effort": "medium", "description": "Balanced speed and reasoning"},
             {"effort": "high", "description": "Deeper reasoning"},
         ],
-        "default_reasoning_summary": "none",
-        "reasoning_summary_format": "none",
-        "supports_reasoning_summaries": False,
+        "default_reasoning_summary": "auto",
+        "reasoning_summary_format": "auto",
+        "supports_reasoning_summaries": True,
         "default_verbosity": "low",
         "support_verbosity": False,
         "apply_patch_tool_type": "freeform",
@@ -317,34 +317,241 @@ def _extract_cursor_assistant_text(message: Any) -> str:
     return "".join(parts)
 
 
+def _extract_cursor_thinking_text(obj: dict[str, Any]) -> str:
+    message = obj.get("message")
+    if isinstance(message, dict):
+        text = _extract_cursor_assistant_text(message)
+        if text:
+            return text
+    for key in ("text", "thinking", "content"):
+        value = obj.get(key)
+        if isinstance(value, str) and value.strip():
+            return value
+    return ""
+
+
+def _assistant_is_streaming_delta(obj: dict[str, Any]) -> bool:
+    if obj.get("model_call_id"):
+        return False
+    return "timestamp_ms" in obj
+
+
+def _assistant_is_segment_boundary(obj: dict[str, Any]) -> bool:
+    if obj.get("type") != "assistant":
+        return False
+    if obj.get("model_call_id"):
+        return True
+    return "timestamp_ms" not in obj
+
+
+CURSOR_TOOL_RESULT_MAX_CHARS = 4096
+
+
+def _truncate_cursor_text(text: str, *, limit: int = CURSOR_TOOL_RESULT_MAX_CHARS) -> str:
+    if len(text) <= limit:
+        return text
+    return f"{text[:limit]}\n… ({len(text)} chars truncated)"
+
+
+def _cursor_tool_body(tool_call: dict[str, Any]) -> dict[str, Any]:
+    body = tool_call.get("tool_call")
+    return body if isinstance(body, dict) else tool_call
+
+
+def _cursor_tool_kind_and_detail(tool_body: dict[str, Any]) -> tuple[str, str]:
+    if "readToolCall" in tool_body:
+        args = (tool_body["readToolCall"] or {}).get("args") or {}
+        path = str(args.get("path") or "?")
+        return "read", f"`{path}`"
+    if "writeToolCall" in tool_body:
+        args = (tool_body["writeToolCall"] or {}).get("args") or {}
+        path = str(args.get("path") or "?")
+        preview = str(args.get("fileText") or "")
+        if preview:
+            preview = _truncate_cursor_text(preview, limit=240).replace("\n", " ")
+            return "write", f"`{path}` — {preview}"
+        return "write", f"`{path}`"
+    if "editToolCall" in tool_body:
+        args = (tool_body["editToolCall"] or {}).get("args") or {}
+        path = str(args.get("path") or "?")
+        preview = str(args.get("streamContent") or args.get("patch") or "")
+        if preview:
+            preview = _truncate_cursor_text(preview, limit=240).replace("\n", " ")
+            return "edit", f"`{path}` — {preview}"
+        return "edit", f"`{path}`"
+    for shell_key in ("shellToolCall", "runTerminalCommand", "bashToolCall", "terminalToolCall"):
+        if shell_key in tool_body:
+            args = (tool_body[shell_key] or {}).get("args") or {}
+            command = str(args.get("command") or args.get("cmd") or args.get("script") or "")
+            if command:
+                return "shell", f"`{_truncate_cursor_text(command, limit=240)}`"
+            return "shell", "`(command)`"
+    if "function" in tool_body:
+        fn = tool_body["function"] or {}
+        name = str(fn.get("name") or "tool")
+        args = str(fn.get("arguments") or "")
+        return name, f"`{_truncate_cursor_text(args, limit=240)}`"
+    if tool_body:
+        key = next(iter(tool_body))
+        label = re.sub(r"ToolCall$", "", key, flags=re.IGNORECASE).lower() or "tool"
+        return label, f"`{key}`"
+    return "tool", "`(unknown)`"
+
+
+def _cursor_tool_result_text(tool_body: dict[str, Any]) -> str:
+    def _walk(value: Any) -> str:
+        if isinstance(value, str) and value.strip():
+            return value
+        if isinstance(value, dict):
+            for key in ("content", "output", "stdout", "stderr", "result", "message", "text"):
+                if key in value:
+                    nested = _walk(value[key])
+                    if nested:
+                        return nested
+            if "success" in value:
+                nested = _walk(value["success"])
+                if nested:
+                    return nested
+            parts: list[str] = []
+            for nested_value in value.values():
+                nested = _walk(nested_value)
+                if nested:
+                    parts.append(nested)
+            return "\n".join(parts)
+        if isinstance(value, list):
+            parts = [_walk(item) for item in value]
+            return "\n".join(part for part in parts if part)
+        return ""
+
+    for key in tool_body:
+        payload = tool_body.get(key)
+        if not isinstance(payload, dict):
+            continue
+        result = payload.get("result")
+        if result is not None:
+            text = _walk(result)
+            if text:
+                return _truncate_cursor_text(text)
+    return ""
+
+
+def format_cursor_tool_started_markdown(tool_call: dict[str, Any]) -> str:
+    kind, detail = _cursor_tool_kind_and_detail(_cursor_tool_body(tool_call))
+    return f"**cursor-agent · {kind}**\n\n> {detail}\n"
+
+
+def format_cursor_tool_completed_markdown(tool_call: dict[str, Any]) -> str:
+    result = _cursor_tool_result_text(_cursor_tool_body(tool_call))
+    if not result:
+        return "\n**Result**\n\n_(completed)_\n"
+    return f"\n**Result**\n\n```\n{result}\n```\n"
+
+
+def format_cursor_thinking_markdown(text: str) -> str:
+    body = text.strip()
+    if not body:
+        return ""
+    return f"**cursor-agent · thinking**\n\n{body}\n"
+
+
 class CursorStreamParser:
-    """Parse cursor-agent ``stream-json`` lines into text deltas and usage."""
+    """Parse cursor-agent ``stream-json`` lines into normalized shim events."""
 
     def __init__(self) -> None:
-        self.text_so_far = ""
+        self.segment_text = ""
         self.final_text = ""
         self.usage: dict[str, Any] | None = None
         self.error: str | None = None
+        self._open_tool_calls: set[str] = set()
 
-    def feed_line(self, line: str) -> str | None:
+    def feed_events(self, line: str) -> list[dict[str, Any]]:
         line = line.strip()
         if not line:
-            return None
+            return []
         try:
             obj = json.loads(line)
         except json.JSONDecodeError:
-            return None
+            return []
         if not isinstance(obj, dict):
-            return None
+            return []
 
         obj_type = obj.get("type")
+        events: list[dict[str, Any]] = []
+
         if obj_type == "assistant" and obj.get("message"):
+            if _assistant_is_segment_boundary(obj):
+                events.append({"type": "segment_boundary"})
+                self.segment_text = ""
+                return events
+            if not _assistant_is_streaming_delta(obj):
+                return []
             text = _extract_cursor_assistant_text(obj.get("message"))
             if not text:
-                return None
-            delta = self._delta_for_text(text)
-            self.final_text = text
-            return delta
+                return []
+            delta = self._delta_for_segment(text)
+            if delta:
+                events.append({"type": "text_delta", "delta": delta})
+            return events
+
+        if obj_type == "tool_call":
+            subtype = str(obj.get("subtype") or "")
+            call_id = str(obj.get("call_id") or "")
+            tool_call = obj.get("tool_call")
+            if not isinstance(tool_call, dict):
+                tool_call = {}
+            if subtype == "started":
+                events.append({"type": "segment_boundary"})
+                self.segment_text = ""
+                if call_id:
+                    self._open_tool_calls.add(call_id)
+                events.append(
+                    {
+                        "type": "tool_started",
+                        "call_id": call_id or f"tool_{len(self._open_tool_calls)}",
+                        "tool_call": tool_call,
+                        "markdown": format_cursor_tool_started_markdown({"tool_call": tool_call}),
+                    }
+                )
+                return events
+            if subtype == "completed":
+                if call_id:
+                    self._open_tool_calls.discard(call_id)
+                events.append(
+                    {
+                        "type": "tool_completed",
+                        "call_id": call_id,
+                        "tool_call": tool_call,
+                        "markdown": format_cursor_tool_completed_markdown({"tool_call": tool_call}),
+                    }
+                )
+                return events
+            return []
+
+        if obj_type == "thinking":
+            subtype = str(obj.get("subtype") or "")
+            if subtype == "delta":
+                text = str(obj.get("text") or _extract_cursor_thinking_text(obj) or "")
+                if text:
+                    events.append({"type": "thinking_delta", "delta": text})
+                return events
+            if subtype == "completed":
+                events.append({"type": "thinking_completed"})
+                return events
+            text = _extract_cursor_thinking_text(obj)
+            if text:
+                events.append({"type": "thinking_delta", "delta": text})
+            return events
+
+        if obj_type == "connection" and str(obj.get("subtype") or "") == "reconnecting":
+            events.append(
+                {
+                    "type": "connection_interrupted",
+                    "message": "> _(interrupted — connection reconnecting)_\n",
+                }
+            )
+            self._open_tool_calls.clear()
+            return events
+
         if obj_type == "result":
             if obj.get("subtype") == "error" or obj.get("is_error"):
                 self.error = str(obj.get("result") or obj.get("error") or "cursor-agent failed")
@@ -358,23 +565,137 @@ class CursorStreamParser:
                     "cache_read_input_tokens": usage.get("cacheReadTokens"),
                     "cache_creation_input_tokens": usage.get("cacheWriteTokens"),
                 }
-            return None
+            return []
+
         if obj_type == "error":
             self.error = str(obj.get("message") or obj.get("error") or "cursor-agent error")
+        return []
+
+    def feed_line(self, line: str) -> str | None:
+        for event in self.feed_events(line):
+            if event.get("type") == "text_delta":
+                return str(event.get("delta") or "")
         return None
 
-    def _delta_for_text(self, text: str) -> str | None:
-        if not self.text_so_far:
-            self.text_so_far = text
-            return text
-        if text == self.text_so_far:
+    def _delta_for_segment(self, text: str) -> str | None:
+        if not text:
             return None
-        if text.startswith(self.text_so_far):
-            delta = text[len(self.text_so_far) :]
-            self.text_so_far = text
+        if self.segment_text and text.startswith(self.segment_text):
+            delta = text[len(self.segment_text) :]
+            self.segment_text = text
             return delta or None
-        self.text_so_far += text
+        self.segment_text += text
         return text
+
+
+class CursorResponseCollector:
+    """Accumulate normalized cursor events into Responses ``output`` items."""
+
+    def __init__(self) -> None:
+        self.output: list[dict[str, Any]] = []
+        self._current_message = ""
+        self._tool_reasoning: dict[str, str] = {}
+        self._thinking_buffer = ""
+        self._next_id = 0
+
+    def consume(self, event: dict[str, Any]) -> None:
+        event_type = event.get("type")
+        if event_type == "text_delta":
+            self._flush_thinking()
+            self._current_message += str(event.get("delta") or "")
+            return
+        if event_type == "segment_boundary":
+            self._flush_thinking()
+            self._flush_message()
+            return
+        if event_type == "tool_started":
+            self._flush_thinking()
+            self._flush_message()
+            call_id = str(event.get("call_id") or "")
+            self._tool_reasoning[call_id] = str(event.get("markdown") or "")
+            return
+        if event_type == "tool_completed":
+            call_id = str(event.get("call_id") or "")
+            text = self._tool_reasoning.pop(call_id, "")
+            text += str(event.get("markdown") or "")
+            if text.strip():
+                self._append_reasoning(text)
+            return
+        if event_type == "thinking_delta":
+            self._thinking_buffer += str(event.get("delta") or "")
+            return
+        if event_type == "thinking_completed":
+            self._flush_thinking()
+            return
+        if event_type == "connection_interrupted":
+            message = str(event.get("message") or "")
+            for call_id in list(self._tool_reasoning):
+                self._tool_reasoning[call_id] += f"\n{message}"
+            return
+
+    def _flush_thinking(self) -> None:
+        if not self._thinking_buffer.strip():
+            self._thinking_buffer = ""
+            return
+        self._append_reasoning(format_cursor_thinking_markdown(self._thinking_buffer))
+        self._thinking_buffer = ""
+
+    def build_output(self, *, fallback_text: str = "") -> list[dict[str, Any]]:
+        self._flush_message()
+        for call_id, text in list(self._tool_reasoning.items()):
+            if text.strip():
+                self._append_reasoning(text + "\n> _(interrupted — connection reconnecting)_\n")
+            self._tool_reasoning.pop(call_id, None)
+        if not self.output and fallback_text:
+            self.output.append(self._message_item(fallback_text))
+        return self.output
+
+    def _flush_message(self) -> None:
+        if not self._current_message:
+            return
+        self.output.append(self._message_item(self._current_message))
+        self._current_message = ""
+
+    def _append_reasoning(self, text: str) -> None:
+        item_id = f"rs_{self._next_id}"
+        self._next_id += 1
+        self.output.append(
+            {
+                "id": item_id,
+                "type": "reasoning",
+                "status": "completed",
+                "summary": [{"type": "summary_text", "text": text}],
+            }
+        )
+
+    def _message_item(self, text: str) -> dict[str, Any]:
+        item_id = f"msg_{self._next_id}"
+        self._next_id += 1
+        return {
+            "id": item_id,
+            "type": "message",
+            "status": "completed",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": text, "annotations": []}],
+        }
+
+
+def replay_cursor_ndjson(
+    lines: list[str] | str,
+    *,
+    collect_output: bool = False,
+) -> tuple[list[dict[str, Any]], CursorStreamParser, CursorResponseCollector | None]:
+    """Replay captured cursor-agent NDJSON through the parser (and optional collector)."""
+    parser = CursorStreamParser()
+    collector = CursorResponseCollector() if collect_output else None
+    events: list[dict[str, Any]] = []
+    raw_lines = lines.splitlines() if isinstance(lines, str) else lines
+    for line in raw_lines:
+        for event in parser.feed_events(line):
+            events.append(event)
+            if collector is not None:
+                collector.consume(event)
+    return events, parser, collector
 
 
 async def iter_cursor_agent_events(prompt: str, model: str) -> AsyncIterator[dict[str, Any]]:
@@ -428,13 +749,11 @@ async def iter_cursor_agent_events(prompt: str, model: str) -> AsyncIterator[dic
             buffer += chunk.decode("utf-8", errors="replace")
             while "\n" in buffer:
                 line, buffer = buffer.split("\n", 1)
-                delta = parser.feed_line(line)
-                if delta:
-                    yield {"type": "text_delta", "delta": delta}
+                for event in parser.feed_events(line):
+                    yield event
         if buffer.strip():
-            delta = parser.feed_line(buffer)
-            if delta:
-                yield {"type": "text_delta", "delta": delta}
+            for event in parser.feed_events(buffer):
+                yield event
         stdout_complete = True
     finally:
         if not stdout_complete and proc.returncode is None:
