@@ -1078,7 +1078,7 @@ async def test_chat_tool_delta_streams_exec_command_to_client():
     assert tool_items[0]["name"] == "exec_command"
 
 
-async def test_chat_tool_delta_streams_namespaced_tool_with_dot_notation():
+async def test_chat_tool_delta_streams_namespaced_tool_with_sanitized_name():
     class FakeResponse:
         def __init__(self):
             self.chunks: list[bytes] = []
@@ -1087,7 +1087,8 @@ async def test_chat_tool_delta_streams_namespaced_tool_with_dot_notation():
             self.chunks.append(data)
 
     downstream = FakeResponse()
-    state = ResponsesStreamState("local-llama")
+    tool_resolve = {"multi_agent_v1_spawn_agent": ("multi_agent_v1", "spawn_agent")}
+    state = ResponsesStreamState("local-llama", tool_resolve=tool_resolve)
     await state.start(downstream)
     await state.write_chat_delta(
         downstream,
@@ -1100,7 +1101,7 @@ async def test_chat_tool_delta_streams_namespaced_tool_with_dot_notation():
                                 "index": 0,
                                 "id": "call_ns",
                                 "function": {
-                                    "name": "multi_agent_v1.spawn_agent",
+                                    "name": "multi_agent_v1_spawn_agent",
                                     "arguments": '{"task":"review"}',
                                 },
                             }

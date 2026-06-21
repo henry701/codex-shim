@@ -7,6 +7,8 @@ from codex_shim.translate import (
     chat_completion_to_response,
     responses_to_anthropic,
     responses_to_chat,
+    responses_tool_resolve_map,
+    upstream_chat_tool_name,
 )
 
 
@@ -544,7 +546,13 @@ def test_responses_to_chat_after_prepare_omits_web_search_for_byok():
     assert [tool["function"]["name"] for tool in out["tools"]] == ["tool_search"]
 
 
-def test_responses_to_chat_expands_namespace_tools_with_dot_notation():
+def test_upstream_chat_tool_name_sanitizes_namespace_dots():
+    assert upstream_chat_tool_name("codex_app", "load_workspace_dependencies") == (
+        "codex_app_load_workspace_dependencies"
+    )
+
+
+def test_responses_to_chat_expands_namespace_tools_with_sanitized_names():
     body = {
         "model": "slug",
         "input": [{"role": "user", "content": "hi"}],
@@ -569,13 +577,29 @@ def test_responses_to_chat_expands_namespace_tools_with_dot_notation():
     }
     out = responses_to_chat(body, "upstream")
     names = [t["function"]["name"] for t in out["tools"]]
-    assert names == ["multi_agent_v1.spawn_agent"]
+    assert names == ["multi_agent_v1_spawn_agent"]
 
 
-def test_function_call_round_trip_preserves_namespace_with_dots():
+def test_function_call_round_trip_preserves_namespace_with_sanitized_names():
     from codex_shim.translate import function_call_item_from_chat_tool
 
+    namespace_tools = [
+        {
+            "type": "namespace",
+            "name": "multi_agent_v1",
+            "description": "Multi-agent tools",
+            "tools": [
+                {
+                    "type": "function",
+                    "name": "spawn_agent",
+                    "description": "Spawn a sub-agent",
+                    "parameters": {"type": "object", "properties": {"task": {"type": "string"}}},
+                }
+            ],
+        }
+    ]
     body = {
+        "tools": namespace_tools,
         "input": [
             {
                 "type": "function_call",
@@ -587,8 +611,9 @@ def test_function_call_round_trip_preserves_namespace_with_dots():
         ],
     }
     chat = responses_to_chat(body, "upstream")
-    assert chat["messages"][0]["tool_calls"][0]["function"]["name"] == "multi_agent_v1.spawn_agent"
+    assert chat["messages"][0]["tool_calls"][0]["function"]["name"] == "multi_agent_v1_spawn_agent"
 
+    tool_resolve = responses_tool_resolve_map(namespace_tools)
     completion = {
         "id": "chatcmpl-1",
         "choices": [
@@ -599,7 +624,7 @@ def test_function_call_round_trip_preserves_namespace_with_dots():
             }
         ],
     }
-    response = chat_completion_to_response(completion, "slug")
+    response = chat_completion_to_response(completion, "slug", tool_resolve=tool_resolve)
     item = response["output"][0]
     assert item["namespace"] == "multi_agent_v1"
     assert item["name"] == "spawn_agent"

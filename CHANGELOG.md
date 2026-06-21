@@ -26,6 +26,10 @@ and this project does not yet follow semantic versioning (pre-1.0).
   `~/.codex-shim/upstream-compat.json`. Models that reject `parallel_tool_calls`
   (e.g. OpenCode Zen North Mini Code) trigger one transparent retry with the
   field stripped; later requests and catalog metadata omit it proactively.
+- Namespace tools forwarded to strict OpenAI-compatible upstreams use
+  underscore-separated chat tool ids (e.g. `codex_app_load_workspace_dependencies`
+  instead of `codex_app.load_workspace_dependencies`). A per-request resolve map
+  restores `namespace` + short `name` in Responses output.
 - `sync-desktop` and the systemd/`run` path refresh `~/.codex/custom_model_catalog.json`
   only; they no longer write `~/.codex/config.toml`. Use `codex-shim enable` (or `app` /
   `model use`) to install the managed OpenAI-provider shim routing while the

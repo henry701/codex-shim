@@ -18,6 +18,43 @@ def namespaced_tool_chat_name(namespace: str, name: str) -> str:
     return name
 
 
+def upstream_chat_tool_name(namespace: str, name: str) -> str:
+    """OpenAI-compatible chat tool id (strict upstreams reject dots in names)."""
+    return _sanitize_tool_name(namespaced_tool_chat_name(namespace, name))
+
+
+def responses_tool_resolve_map(tools: Any) -> dict[str, tuple[str | None, str]]:
+    if not isinstance(tools, list):
+        return {}
+    resolved: dict[str, tuple[str | None, str]] = {}
+    for tool in tools:
+        if not isinstance(tool, dict):
+            continue
+        if tool.get("type") == "namespace":
+            namespace = str(tool.get("name") or "")
+            for sub_tool in tool.get("tools") or []:
+                if not isinstance(sub_tool, dict) or sub_tool.get("type") != "function":
+                    continue
+                sub_name = str(sub_tool.get("name") or "")
+                if not namespace or not sub_name:
+                    continue
+                resolved[upstream_chat_tool_name(namespace, sub_name)] = (namespace, sub_name)
+            continue
+        name = _responses_tool_function_name(tool)
+        if name:
+            resolved[name] = (None, name)
+    return resolved
+
+
+def resolve_namespaced_tool_name(
+    raw_name: str,
+    tool_resolve: dict[str, tuple[str | None, str]] | None = None,
+) -> tuple[str | None, str]:
+    if tool_resolve and raw_name in tool_resolve:
+        return tool_resolve[raw_name]
+    return split_namespaced_tool_chat_name(raw_name)
+
+
 def split_namespaced_tool_chat_name(raw_name: str) -> tuple[str | None, str]:
     if mcp_search.parse_mcp_tool_reference(raw_name):
         return None, raw_name
@@ -27,7 +64,11 @@ def split_namespaced_tool_chat_name(raw_name: str) -> tuple[str | None, str]:
     return None, raw_name
 
 
-def function_call_item_from_chat_tool(call: dict[str, Any], tool_types: dict[str, str] | None = None) -> dict[str, Any]:
+def function_call_item_from_chat_tool(
+    call: dict[str, Any],
+    tool_types: dict[str, str] | None = None,
+    tool_resolve: dict[str, tuple[str | None, str]] | None = None,
+) -> dict[str, Any]:
     fn = call.get("function") or {}
     raw_name = fn.get("name", "")
     call_id = call.get("id", "call_0")
@@ -56,7 +97,7 @@ def function_call_item_from_chat_tool(call: dict[str, Any], tool_types: dict[str
         item["namespace"] = mcp_namespace(server)
         item["name"] = tool
         return item
-    namespace, tool_name = split_namespaced_tool_chat_name(raw_name)
+    namespace, tool_name = resolve_namespaced_tool_name(raw_name, tool_resolve)
     if namespace is not None:
         item["namespace"] = namespace
         item["name"] = tool_name
@@ -79,7 +120,7 @@ def responses_tool_type_map(tools: Any) -> dict[str, str]:
                     continue
                 sub_name = str(sub_tool.get("name") or "")
                 if namespace and sub_name:
-                    mapped[_sanitize_tool_name(namespaced_tool_chat_name(namespace, sub_name))] = "function"
+                    mapped[upstream_chat_tool_name(namespace, sub_name)] = "function"
             continue
         tool_type = str(tool.get("type") or "").strip().lower()
         name = _responses_tool_function_name(tool)
@@ -519,6 +560,7 @@ def chat_completion_to_response(
     payload: dict[str, Any],
     requested_model: str,
     tool_types: dict[str, str] | None = None,
+    tool_resolve: dict[str, tuple[str | None, str]] | None = None,
 ) -> dict[str, Any]:
     choice = (payload.get("choices") or [{}])[0]
     message = choice.get("message") or {}
@@ -545,7 +587,7 @@ def chat_completion_to_response(
             }
         )
     for call in message.get("tool_calls") or []:
-        output.append(function_call_item_from_chat_tool(call, tool_types))
+        output.append(function_call_item_from_chat_tool(call, tool_types, tool_resolve))
     return {
         "id": payload.get("id", "resp_chat"),
         "object": "response",
@@ -561,11 +603,13 @@ def anthropic_to_response(
     payload: dict[str, Any],
     requested_model: str,
     tool_types: dict[str, str] | None = None,
+    tool_resolve: dict[str, tuple[str | None, str]] | None = None,
 ) -> dict[str, Any]:
     response = chat_completion_to_response(
         anthropic_to_chat_response(payload, requested_model),
         requested_model,
         tool_types,
+        tool_resolve,
     )
     response["usage"] = normalize_responses_usage(payload.get("usage"))
     return response
@@ -685,7 +729,7 @@ def _responses_input_to_messages(value: Any) -> list[dict[str, Any]]:
             fn_name = item.get("name") or ""
             namespace = item.get("namespace") or ""
             if namespace and fn_name:
-                fn_name = namespaced_tool_chat_name(namespace, fn_name)
+                fn_name = upstream_chat_tool_name(namespace, fn_name)
             pending_tool_calls.append(
                 {
                     "id": call_id,
@@ -1081,7 +1125,7 @@ def _responses_tools_to_chat_tools(tools: Any) -> list[dict[str, Any]]:
                     {
                         "type": "function",
                         "function": {
-                            "name": namespaced_tool_chat_name(namespace, sub_name),
+                            "name": upstream_chat_tool_name(namespace, sub_name),
                             "description": sub_tool.get("description") or desc,
                             "parameters": sub_tool.get("parameters")
                             or {"type": "object", "properties": {}},

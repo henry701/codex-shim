@@ -59,8 +59,9 @@ from .translate import (
     responses_to_anthropic,
     responses_to_chat,
     responses_tool_type_map,
+    responses_tool_resolve_map,
     original_responses_tool_type,
-    split_namespaced_tool_chat_name,
+    resolve_namespaced_tool_name,
     _chat_finish_to_anthropic_stop,
     _responses_usage_to_anthropic_usage,
 )
@@ -460,18 +461,19 @@ class ShimServer:
             return await self._chatgpt_passthrough(request, body, response_model_override=model)
         route = await self._route(body)
         tool_types = responses_tool_type_map(body.get("tools"))
+        tool_resolve = responses_tool_resolve_map(body.get("tools"))
         body = prepare_codex_byok_responses_body(body, request.headers)
         if route.is_openai_responses:
             return await self._post_openai_responses(request, route, body)
         if route.is_openai_chat:
             forwarded = responses_to_chat(body, route.model)
             return await self._post_openai_chat(
-                request, route, forwarded, as_responses=True, tool_types=tool_types
+                request, route, forwarded, as_responses=True, tool_types=tool_types, tool_resolve=tool_resolve
             )
         if route.is_anthropic:
             forwarded = responses_to_anthropic(body, route.model, route.max_output_tokens)
             return await self._post_anthropic(
-                request, route, forwarded, as_responses=True, tool_types=tool_types
+                request, route, forwarded, as_responses=True, tool_types=tool_types, tool_resolve=tool_resolve
             )
         raise web.HTTPBadGateway(text=f"Unsupported model provider: {route.provider}")
 
@@ -499,6 +501,7 @@ class ShimServer:
             )
         route = await self._route(body)
         tool_types = responses_tool_type_map(body.get("tools"))
+        tool_resolve = responses_tool_resolve_map(body.get("tools"))
         compact_body = _compact_request_body(body, route.model)
         compact_body = prepare_codex_byok_responses_body(compact_body, request.headers)
         if route.is_openai_responses:
@@ -508,14 +511,14 @@ class ShimServer:
             forwarded = responses_to_chat(compact_body, route.model)
             forwarded["stream"] = False
             response = await self._post_openai_chat(
-                request, route, forwarded, as_responses=True, tool_types=tool_types
+                request, route, forwarded, as_responses=True, tool_types=tool_types, tool_resolve=tool_resolve
             )
             return await _as_compact_response(response, route.slug)
         if route.is_anthropic:
             forwarded = responses_to_anthropic(compact_body, route.model, route.max_output_tokens)
             forwarded["stream"] = False
             response = await self._post_anthropic(
-                request, route, forwarded, as_responses=True, tool_types=tool_types
+                request, route, forwarded, as_responses=True, tool_types=tool_types, tool_resolve=tool_resolve
             )
             return await _as_compact_response(response, route.slug)
         raise web.HTTPBadGateway(text=f"Unsupported model provider: {route.provider}")
@@ -1112,18 +1115,31 @@ class ShimServer:
         route = await self._route(body)
         client_slug = response_slug or route.slug
         tool_types = responses_tool_type_map(body.get("tools"))
+        tool_resolve = responses_tool_resolve_map(body.get("tools"))
         body = prepare_codex_byok_responses_body(body, request.headers)
         if route.is_openai_responses:
             return await self._post_openai_responses(request, route, body)
         if route.is_openai_chat:
             forwarded = responses_to_chat(body, route.model)
             return await self._post_openai_chat(
-                request, route, forwarded, as_responses=True, response_slug=client_slug, tool_types=tool_types
+                request,
+                route,
+                forwarded,
+                as_responses=True,
+                response_slug=client_slug,
+                tool_types=tool_types,
+                tool_resolve=tool_resolve,
             )
         if route.is_anthropic:
             forwarded = responses_to_anthropic(body, route.model, route.max_output_tokens)
             return await self._post_anthropic(
-                request, route, forwarded, as_responses=True, response_slug=client_slug, tool_types=tool_types
+                request,
+                route,
+                forwarded,
+                as_responses=True,
+                response_slug=client_slug,
+                tool_types=tool_types,
+                tool_resolve=tool_resolve,
             )
         raise web.HTTPBadGateway(text=f"Unsupported model provider: {route.provider}")
 
@@ -1137,6 +1153,7 @@ class ShimServer:
         route = await self._route(body)
         client_slug = response_slug or route.slug
         tool_types = responses_tool_type_map(body.get("tools"))
+        tool_resolve = responses_tool_resolve_map(body.get("tools"))
         compact_body = _compact_request_body(body, route.model)
         compact_body = prepare_codex_byok_responses_body(compact_body, request.headers)
         if route.is_openai_responses:
@@ -1146,14 +1163,26 @@ class ShimServer:
             forwarded = responses_to_chat(compact_body, route.model)
             forwarded["stream"] = False
             response = await self._post_openai_chat(
-                request, route, forwarded, as_responses=True, response_slug=client_slug, tool_types=tool_types
+                request,
+                route,
+                forwarded,
+                as_responses=True,
+                response_slug=client_slug,
+                tool_types=tool_types,
+                tool_resolve=tool_resolve,
             )
             return await _as_compact_response(response, client_slug)
         if route.is_anthropic:
             forwarded = responses_to_anthropic(compact_body, route.model, route.max_output_tokens)
             forwarded["stream"] = False
             response = await self._post_anthropic(
-                request, route, forwarded, as_responses=True, response_slug=client_slug, tool_types=tool_types
+                request,
+                route,
+                forwarded,
+                as_responses=True,
+                response_slug=client_slug,
+                tool_types=tool_types,
+                tool_resolve=tool_resolve,
             )
             return await _as_compact_response(response, client_slug)
         raise web.HTTPBadGateway(text=f"Unsupported model provider: {route.provider}")
@@ -1267,14 +1296,23 @@ class ShimServer:
 
     async def _post_openai_chat(
         self, request: web.Request, route: ShimModel, body: dict[str, Any], as_responses: bool,
-        *, response_slug: str | None = None, tool_types: dict[str, str] | None = None,
+        *,
+        response_slug: str | None = None,
+        tool_types: dict[str, str] | None = None,
+        tool_resolve: dict[str, tuple[str | None, str]] | None = None,
     ) -> web.StreamResponse:
         client_slug = response_slug or route.slug
         url = _join_url(route.base_url, "/chat/completions")
         _dump_debug_request(route.slug, url, prepare_openai_chat_body(route, body))
         if body.get("stream"):
             return await self._stream_chat_loop(
-                request, route, body, as_responses, response_slug=client_slug, tool_types=tool_types
+                request,
+                route,
+                body,
+                as_responses,
+                response_slug=client_slug,
+                tool_types=tool_types,
+                tool_resolve=tool_resolve,
             )
         async with ClientSession(timeout=self.timeout) as session:
             upstream, err = await self._post_openai_chat_completions(session, route, body)
@@ -1295,7 +1333,9 @@ class ShimServer:
             finally:
                 upstream.release()
         if as_responses:
-            response_payload = chat_completion_to_response(payload, client_slug, tool_types)
+            response_payload = chat_completion_to_response(
+                payload, client_slug, tool_types, tool_resolve
+            )
             response_payload = await mcp_search.augment_response_with_tool_search(response_payload)
             return web.json_response(response_payload)
         return web.json_response(payload)
@@ -1309,12 +1349,17 @@ class ShimServer:
         *,
         response_slug: str | None = None,
         tool_types: dict[str, str] | None = None,
+        tool_resolve: dict[str, tuple[str | None, str]] | None = None,
         max_turns: int = 6,
     ) -> web.StreamResponse:
         client_slug = response_slug or route.slug
         response = _sse_response()
         await response.prepare(request)
-        state = ResponsesStreamState(client_slug, tool_types=tool_types) if as_responses else None
+        state = (
+            ResponsesStreamState(client_slug, tool_types=tool_types, tool_resolve=tool_resolve)
+            if as_responses
+            else None
+        )
         state_started = False
         messages = list(body.get("messages", []))
         chat_body = {k: v for k, v in body.items() if k != "stream"}
@@ -1429,7 +1474,10 @@ class ShimServer:
 
     async def _post_anthropic(
         self, request: web.Request, route: ShimModel, body: dict[str, Any], as_responses: bool,
-        *, response_slug: str | None = None, tool_types: dict[str, str] | None = None,
+        *,
+        response_slug: str | None = None,
+        tool_types: dict[str, str] | None = None,
+        tool_resolve: dict[str, tuple[str | None, str]] | None = None,
     ) -> web.StreamResponse:
         client_slug = response_slug or route.slug
         url = _join_url(route.base_url, "/messages")
@@ -1447,11 +1495,19 @@ class ShimServer:
                 return await _error_response(upstream, slug=route.slug)
             if body.get("stream"):
                 return await self._stream_anthropic(
-                    request, upstream, route, as_responses, response_slug=client_slug, tool_types=tool_types
+                    request,
+                    upstream,
+                    route,
+                    as_responses,
+                    response_slug=client_slug,
+                    tool_types=tool_types,
+                    tool_resolve=tool_resolve,
                 )
             payload = await upstream.json(content_type=None)
         if as_responses:
-            return web.json_response(anthropic_to_response(payload, client_slug, tool_types))
+            return web.json_response(
+                anthropic_to_response(payload, client_slug, tool_types, tool_resolve)
+            )
         return web.json_response(anthropic_to_chat_response(payload, client_slug))
 
     async def _stream_openai_chat_as_anthropic(
@@ -1490,12 +1546,15 @@ class ShimServer:
         *,
         response_slug: str | None = None,
         tool_types: dict[str, str] | None = None,
+        tool_resolve: dict[str, tuple[str | None, str]] | None = None,
     ) -> web.StreamResponse:
         client_slug = response_slug or route.slug
         response = _sse_response()
         await response.prepare(request)
         if as_responses:
-            state = ResponsesStreamState(client_slug, tool_types=tool_types)
+            state = ResponsesStreamState(
+                client_slug, tool_types=tool_types, tool_resolve=tool_resolve
+            )
         upstream_saw_done = False
         try:
             if as_responses:
@@ -1995,7 +2054,12 @@ class ResponsesStreamState:
     and client ``[DONE]`` only when upstream sent ``[DONE]`` and every open item
     was fully received."""
 
-    def __init__(self, model: str, tool_types: dict[str, str] | None = None):
+    def __init__(
+        self,
+        model: str,
+        tool_types: dict[str, str] | None = None,
+        tool_resolve: dict[str, tuple[str | None, str]] | None = None,
+    ):
         self.response_id = f"resp_{int(time.time() * 1000)}"
         self.message_item_id = f"msg_{int(time.time() * 1000)}"
         self.model = model
@@ -2014,6 +2078,7 @@ class ResponsesStreamState:
         self.completed_turns: list[dict[str, Any]] = []
         self.upstream_finish_reason: str | None = None
         self.tool_types = tool_types or {}
+        self.tool_resolve = tool_resolve or {}
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -2281,7 +2346,7 @@ class ResponsesStreamState:
                 }
                 await self._finalize_pending_tool(response, index)
                 return
-            namespace, tool_name = split_namespaced_tool_chat_name(name)
+            namespace, tool_name = resolve_namespaced_tool_name(name, self.tool_resolve)
             state = await self._open_tool(
                 response,
                 key=index,
@@ -2359,7 +2424,7 @@ class ResponsesStreamState:
             await self._close_message(response)
         output_index = self.next_output_index
         self.next_output_index += 1
-        namespace, tool_name = split_namespaced_tool_chat_name(name)
+        namespace, tool_name = resolve_namespaced_tool_name(name, self.tool_resolve)
         if namespace is not None:
             state["namespace"] = namespace
             state["name"] = tool_name
@@ -2621,7 +2686,7 @@ class ResponsesStreamState:
                     await self._text_delta(response, seed)
             elif btype == "tool_use":
                 raw_name = block.get("name") or ""
-                namespace, tool_name = split_namespaced_tool_chat_name(raw_name)
+                namespace, tool_name = resolve_namespaced_tool_name(raw_name, self.tool_resolve)
                 await self._open_tool(
                     response,
                     key=("anthropic", idx),
