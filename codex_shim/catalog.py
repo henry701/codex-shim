@@ -22,6 +22,14 @@ from .cursor_passthrough import cursor_passthrough_available, cursor_passthrough
 PLAN_TIERS = ["free", "plus", "pro", "team", "business", "enterprise"]
 
 
+def sort_catalog_entries(
+    entries: list[dict[str, Any]],
+    *,
+    slug_key: str = "slug",
+) -> list[dict[str, Any]]:
+    return sorted(entries, key=lambda entry: str(entry.get(slug_key) or ""))
+
+
 def _reasoning_catalog_fields(model: ShimModel) -> dict[str, Any]:
     if model.supports_reasoning_summaries:
         return {
@@ -123,7 +131,7 @@ def write_catalog(models: list[ShimModel], path: Path, router_config=None) -> Pa
             cursor_entries[0]["isDefault"] = True
         entries.extend(cursor_entries)
     entries.extend(catalog_entry(model) for model in usable_byok_models(models))
-    payload = {"models": entries}
+    payload = {"models": sort_catalog_entries(entries)}
     path.write_text(json.dumps(payload, indent=2, sort_keys=False) + "\n")
     return path
 

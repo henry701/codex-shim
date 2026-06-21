@@ -451,5 +451,7 @@ def test_write_catalog_includes_auto_entry(tmp_path, auth_missing):
     write_catalog(models, catalog_path, router_config=config)
     data = json.loads(catalog_path.read_text())
     slugs = [m["slug"] for m in data["models"]]
-    assert slugs[0] == "codex-auto"
-    assert not data["models"][0].get("use_responses_lite")
+    assert "codex-auto" in slugs
+    assert slugs == sorted(slugs)
+    auto_entry = next(m for m in data["models"] if m["slug"] == "codex-auto")
+    assert not auto_entry.get("use_responses_lite")

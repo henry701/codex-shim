@@ -2762,7 +2762,7 @@ async def test_api_models_lists_configured_models_with_active_flag(
         assert resp.status == 200
         data = await resp.json()
         slugs = [m["slug"] for m in data]
-        assert slugs == ["kimi-k26", "deepseek-v4-pro"]
+        assert slugs == ["deepseek-v4-pro", "kimi-k26"]
         active = {m["slug"]: m["active"] for m in data}
         assert active == {"kimi-k26": False, "deepseek-v4-pro": True}
     finally:
@@ -2780,8 +2780,9 @@ async def test_api_models_includes_chatgpt_when_auth_present(
         resp = await shim_client.get("/api/models")
         data = await resp.json()
         slugs = [m["slug"] for m in data]
-        assert slugs[0] == "codex-gpt-5-5"
-        assert data[0]["active"] is True
+        assert slugs == sorted(slugs)
+        active = next(m for m in data if m["slug"] == "codex-gpt-5-5")
+        assert active["active"] is True
     finally:
         await shim_client.close()
 

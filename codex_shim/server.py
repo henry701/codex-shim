@@ -25,6 +25,7 @@ from .cursor_passthrough import (
     is_cursor_passthrough_slug,
     iter_cursor_agent_events,
 )
+from .catalog import sort_catalog_entries
 from . import router as router_module
 from . import mcp_search
 from . import tool_translate
@@ -205,7 +206,7 @@ class ShimServer:
                     "active": current == m.slug,
                 }
             )
-        return web.json_response(data)
+        return web.json_response(sort_catalog_entries(data))
 
     def _valid_picker_token(self, request: web.Request) -> bool:
         token = request.headers.get(PICKER_TOKEN_HEADER, "")
@@ -265,7 +266,7 @@ class ShimServer:
         if chatgpt_passthrough_available():
             data.extend(
                 {"id": slug, "object": "model", "created": now, "owned_by": "chatgpt"}
-                for slug in sorted(chatgpt_passthrough_slugs())
+                for slug in chatgpt_passthrough_slugs()
             )
         if cursor_passthrough_available():
             data.extend(
@@ -275,7 +276,7 @@ class ShimServer:
                     "created": now,
                     "owned_by": "cursor",
                 }
-                for slug in sorted(cursor_passthrough_display_names())
+                for slug in cursor_passthrough_display_names()
             )
         data.extend(
             {
@@ -286,7 +287,7 @@ class ShimServer:
             }
             for model in usable_byok_models(await self._load_models())
         )
-        return web.json_response({"object": "list", "data": data})
+        return web.json_response({"object": "list", "data": sort_catalog_entries(data, slug_key="id")})
 
     async def chat_completions(self, request: web.Request) -> web.StreamResponse:
         body = await request.json()

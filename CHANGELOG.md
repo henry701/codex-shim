@@ -30,6 +30,9 @@ and this project does not yet follow semantic versioning (pre-1.0).
   underscore-separated chat tool ids (e.g. `codex_app_load_workspace_dependencies`
   instead of `codex_app.load_workspace_dependencies`). A per-request resolve map
   restores `namespace` + short `name` in Responses output.
+- Model catalog responses (`GET /api/models`, `GET /v1/models`, and
+  `write_catalog` JSON) are sorted alphabetically by slug for deterministic
+  ordering across harnesses.
 - `sync-desktop` and the systemd/`run` path refresh `~/.codex/custom_model_catalog.json`
   only; they no longer write `~/.codex/config.toml`. Use `codex-shim enable` (or `app` /
   `model use`) to install the managed OpenAI-provider shim routing while the

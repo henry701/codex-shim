@@ -10,7 +10,7 @@ from pathlib import Path
 import pytest
 
 from codex_shim import cli
-from codex_shim.catalog import catalog_entry, write_catalog
+from codex_shim.catalog import catalog_entry, sort_catalog_entries, write_catalog
 from codex_shim.catalog_slugs import codex_catalog_slug
 from codex_shim.opencode_go import opencode_go_model_row, write_opencode_go_models
 from codex_shim.settings import (
@@ -296,6 +296,46 @@ def test_ollama_launch_models_schema_loads(tmp_path):
     ]
 
 
+def test_sort_catalog_entries_orders_by_slug():
+    entries = [
+        {"slug": "zebra-model"},
+        {"slug": "alpha-model"},
+        {"slug": "middle-model"},
+    ]
+    assert [entry["slug"] for entry in sort_catalog_entries(entries)] == [
+        "alpha-model",
+        "middle-model",
+        "zebra-model",
+    ]
+
+
+def test_write_catalog_orders_models_by_slug(tmp_path, auth_missing):
+    from codex_shim.settings import ShimModel
+
+    models = [
+        ShimModel(
+            slug="zulu",
+            model="zulu",
+            display_name="Zulu",
+            provider="openai",
+            base_url="http://example.invalid/v1",
+            api_key="k",
+        ),
+        ShimModel(
+            slug="alpha",
+            model="alpha",
+            display_name="Alpha",
+            provider="openai",
+            base_url="http://example.invalid/v1",
+            api_key="k",
+        ),
+    ]
+    catalog_path = tmp_path / "catalog.json"
+    write_catalog(models, catalog_path)
+    slugs = [entry["slug"] for entry in json.loads(catalog_path.read_text())["models"]]
+    assert slugs == ["alpha", "zulu"]
+
+
 def test_catalog_preserves_context_and_visibility():
     model = ModelSettingsFixture.one()
     entry = catalog_entry(model)
@@ -392,7 +432,7 @@ def test_write_catalog_includes_gpt_models_when_auth_present(tmp_path, auth_pres
     catalog_path = tmp_path / "catalog.json"
     write_catalog([], catalog_path)
     data = json.loads(catalog_path.read_text())
-    expected = [codex_catalog_slug(slug) for slug in FALLBACK_CHATGPT_PASSTHROUGH_SLUGS]
+    expected = sorted(codex_catalog_slug(slug) for slug in FALLBACK_CHATGPT_PASSTHROUGH_SLUGS)
     assert [model["slug"] for model in data["models"]] == expected
     for entry in data["models"]:
         assert not entry.get("use_responses_lite"), (
