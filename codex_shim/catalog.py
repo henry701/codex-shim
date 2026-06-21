@@ -6,6 +6,7 @@ from typing import Any
 
 from . import router as router_module
 from .catalog_slugs import CHATGPT_CATALOG_SLUG
+from .upstream_compat import supports_parallel_tool_calls_in_catalog
 from .settings import (
     OPENAI_PROVIDER_ID,
     ShimModel,
@@ -60,7 +61,7 @@ def catalog_entry(model: ShimModel) -> dict:
         "apply_patch_tool_type": "freeform",
         "web_search_tool_type": "text_and_image",
         "supports_search_tool": True,
-        "supports_parallel_tool_calls": True,
+        "supports_parallel_tool_calls": supports_parallel_tool_calls_in_catalog(model),
         "experimental_supported_tools": [],
         "input_modalities": ["text"] if model.no_image_support else ["text", "image"],
         "supports_image_detail_original": not model.no_image_support,

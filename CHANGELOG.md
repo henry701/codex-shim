@@ -22,6 +22,10 @@ and this project does not yet follow semantic versioning (pre-1.0).
 - Managed-config backup metadata stores displaced top-level values as TOML RHS
   fragments (not full `key = value` lines), with backward-compatible restore for
   older installs.
+- BYOK chat routes learn and persist upstream quirks in
+  `~/.codex-shim/upstream-compat.json`. Models that reject `parallel_tool_calls`
+  (e.g. OpenCode Zen North Mini Code) trigger one transparent retry with the
+  field stripped; later requests and catalog metadata omit it proactively.
 - `sync-desktop` and the systemd/`run` path refresh `~/.codex/custom_model_catalog.json`
   only; they no longer write `~/.codex/config.toml`. Use `codex-shim enable` (or `app` /
   `model use`) to install the managed OpenAI-provider shim routing while the

@@ -64,6 +64,7 @@ from .translate import (
     _chat_finish_to_anthropic_stop,
     _responses_usage_to_anthropic_usage,
 )
+from .upstream_compat import learn_parallel_tool_calls_compat_if_needed, prepare_openai_chat_body
 
 DEBUG_DIR = Path(__file__).resolve().parents[1] / ".codex-shim"
 CODEX_CONFIG_PATH = Path.home() / ".codex" / "config.toml"
@@ -1235,34 +1236,64 @@ class ShimServer:
                 pass
             return response
 
+    async def _post_openai_chat_completions(
+        self,
+        session: ClientSession,
+        route: ShimModel,
+        body: dict[str, Any],
+    ) -> tuple[Any, tuple[int, str, str, str] | None]:
+        url = _join_url(route.base_url, "/chat/completions")
+        headers = _openai_headers(route)
+        last_error: tuple[int, str, str, str] | None = None
+        for attempt in range(2):
+            prepared = prepare_openai_chat_body(route, body)
+            upstream = await session.post(url, json=prepared, headers=headers)
+            if upstream.status < 400:
+                return upstream, None
+            status = upstream.status
+            text = await upstream.text()
+            code, message = parse_upstream_error(text, status)
+            upstream.release()
+            last_error = (status, text, code, message)
+            if attempt == 0 and learn_parallel_tool_calls_compat_if_needed(route, status, message):
+                print(
+                    f"[compat] model={route.slug} retrying without parallel_tool_calls after upstream "
+                    f"{status}: {message[:200]}",
+                    flush=True,
+                )
+                continue
+            break
+        return None, last_error
+
     async def _post_openai_chat(
         self, request: web.Request, route: ShimModel, body: dict[str, Any], as_responses: bool,
         *, response_slug: str | None = None, tool_types: dict[str, str] | None = None,
     ) -> web.StreamResponse:
         client_slug = response_slug or route.slug
         url = _join_url(route.base_url, "/chat/completions")
-        _dump_debug_request(route.slug, url, body)
+        _dump_debug_request(route.slug, url, prepare_openai_chat_body(route, body))
         if body.get("stream"):
             return await self._stream_chat_loop(
                 request, route, body, as_responses, response_slug=client_slug, tool_types=tool_types
             )
         async with ClientSession(timeout=self.timeout) as session:
-            upstream = await session.post(url, json=body, headers=_openai_headers(route))
-            if upstream.status >= 400:
-                text = await upstream.text()
+            upstream, err = await self._post_openai_chat_completions(session, route, body)
+            if err is not None:
+                status, text, code, message = err
                 if as_responses:
-                    code, message = parse_upstream_error(text, upstream.status)
                     return web.json_response(
                         _responses_error_payload(client_slug, code, message),
-                        status=upstream.status,
+                        status=status,
                     )
-                upstream.release()
                 return web.Response(
-                    status=upstream.status,
+                    status=status,
                     text=text,
-                    content_type=upstream.content_type or "text/plain",
+                    content_type="text/plain",
                 )
-            payload = await upstream.json(content_type=None)
+            try:
+                payload = await upstream.json(content_type=None)
+            finally:
+                upstream.release()
         if as_responses:
             response_payload = chat_completion_to_response(payload, client_slug, tool_types)
             response_payload = await mcp_search.augment_response_with_tool_search(response_payload)
@@ -1284,36 +1315,37 @@ class ShimServer:
         response = _sse_response()
         await response.prepare(request)
         state = ResponsesStreamState(client_slug, tool_types=tool_types) if as_responses else None
-        if as_responses and state is not None:
-            await state.start(response)
+        state_started = False
         messages = list(body.get("messages", []))
         chat_body = {k: v for k, v in body.items() if k != "stream"}
         chat_body["stream"] = True
-        url = _join_url(route.base_url, "/chat/completions")
-        headers = _openai_headers(route)
         upstream_saw_done = False
         try:
             async with ClientSession(timeout=self.timeout) as session:
                 for _ in range(max_turns):
                     turn_body = {**chat_body, "messages": messages}
-                    upstream = await session.post(url, json=turn_body, headers=headers)
-                    if upstream.status >= 400:
-                        text = await upstream.text()
-                        code, message = parse_upstream_error(text, upstream.status)
+                    upstream, err = await self._post_openai_chat_completions(session, route, turn_body)
+                    if err is not None:
+                        status, _text, code, message = err
                         print(
-                            f"[stream] model={route.slug} upstream HTTP {upstream.status}: {message[:500]}",
+                            f"[stream] model={route.slug} upstream HTTP {status}: {message[:500]}",
                             flush=True,
                         )
                         if as_responses and state is not None:
+                            if not state_started:
+                                await state.start(response)
+                                state_started = True
                             await state.fail(response, message, code=code)
                         else:
                             await _safe_write(
                                 response,
-                                json.dumps({"error": f"upstream {upstream.status}: {message[:200]}"}).encode()
+                                json.dumps({"error": f"upstream {status}: {message[:200]}"}).encode()
                                 + b"\n",
                             )
-                        upstream.release()
                         break
+                    if as_responses and state is not None and not state_started:
+                        await state.start(response)
+                        state_started = True
                     try:
                         async for line in _sse_lines(upstream, request):
                             if line == "[DONE]":
