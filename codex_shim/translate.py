@@ -6,6 +6,7 @@ from collections.abc import Mapping
 from typing import Any
 
 from . import mcp_search
+from .compaction import decode_shim_compaction_summary
 from .tool_translate import mcp_namespace
 
 
@@ -159,6 +160,97 @@ def _web_search_call_item(call_id: str, raw_arguments: Any, status: str = "compl
         "call_id": call_id,
         "action": {"type": "search", "query": query},
     }
+
+
+HOSTED_WEB_SEARCH_UNAVAILABLE_MESSAGE = (
+    "The Codex hosted web_search tool returned no results and is unavailable at this time. "
+    "Other search tools may still be available (for example MCP web_search_exa). "
+    "Do not retry web_search; use an alternative search tool instead."
+)
+
+
+def _is_hosted_web_search_name(name: str) -> bool:
+    clean = str(name or "").strip().lower()
+    return clean in {"web_search", "web_search_preview"}
+
+
+def _function_call_name_map(input_items: list[Any]) -> dict[str, str]:
+    names: dict[str, str] = {}
+    for item in input_items:
+        if not isinstance(item, dict) or item.get("type") != "function_call":
+            continue
+        call_id = str(item.get("call_id") or item.get("id") or "")
+        if call_id:
+            names[call_id] = str(item.get("name") or "")
+    return names
+
+
+def _format_web_search_result_entries(entries: Any) -> list[str]:
+    parts: list[str] = []
+    if not isinstance(entries, list):
+        return parts
+    for entry in entries:
+        if isinstance(entry, str):
+            text = entry.strip()
+            if text:
+                parts.append(text)
+            continue
+        if not isinstance(entry, dict):
+            continue
+        snippet = str(
+            entry.get("snippet")
+            or entry.get("text")
+            or entry.get("content")
+            or entry.get("description")
+            or ""
+        ).strip()
+        title = str(entry.get("title") or entry.get("name") or "").strip()
+        url = str(entry.get("url") or "").strip()
+        if snippet and title:
+            parts.append(f"{title}\n{snippet}")
+        elif snippet:
+            parts.append(snippet)
+        elif title and url:
+            parts.append(f"{title}\n{url}")
+        elif title:
+            parts.append(title)
+        elif url:
+            parts.append(url)
+    return parts
+
+
+def _web_search_call_result_text(item: dict[str, Any]) -> str:
+    parts: list[str] = []
+    action = item.get("action")
+    if isinstance(action, dict):
+        parts.extend(_format_web_search_result_entries(action.get("sources")))
+        parts.extend(_format_web_search_result_entries(action.get("results")))
+    parts.extend(_format_web_search_result_entries(item.get("results")))
+    output = item.get("output")
+    if output not in (None, "", [], {}):
+        text = _content_to_text(output).strip()
+        if text:
+            parts.append(text)
+    return "\n\n".join(parts)
+
+
+def _is_absolutely_empty_web_search_output(output: Any) -> bool:
+    if output in (None, "", [], {}):
+        return True
+    if isinstance(output, list):
+        return not any(not _is_absolutely_empty_web_search_output(entry) for entry in output)
+    if isinstance(output, dict):
+        if output.get("type") in {"input_text", "output_text", "text"}:
+            return not str(output.get("text") or "").strip()
+        meaningful = {
+            key: value
+            for key, value in output.items()
+            if key not in {"type", "status", "call_id", "id"}
+        }
+        if not meaningful:
+            return True
+        return not any(not _is_absolutely_empty_web_search_output(value) for value in meaningful.values())
+    return not str(output).strip()
 
 SHIM_ENCRYPTED_CONTENT_PREFIX = "anthropic-thinking-v1:"
 _THINKING_MAGIC = SHIM_ENCRYPTED_CONTENT_PREFIX
@@ -695,10 +787,19 @@ def _responses_input_to_messages(value: Any) -> list[dict[str, Any]]:
         return [{"role": "user", "content": _responses_content_to_chat_content(value)}]
     messages: list[dict[str, Any]] = []
     pending_tool_calls: list[dict[str, Any]] = []
+    deferred_tool_outputs: dict[str, list[dict[str, Any]]] = {}
+    emitted_tool_call_ids: set[str] = set()
+    function_call_names = _function_call_name_map(value) if isinstance(value, list) else {}
 
     def flush_pending_assistant_tool_calls():
         if pending_tool_calls:
             messages.append({"role": "assistant", "content": None, "tool_calls": list(pending_tool_calls)})
+            for tool_call in pending_tool_calls:
+                call_id = str(tool_call.get("id") or "")
+                if call_id:
+                    emitted_tool_call_ids.add(call_id)
+                    for deferred in deferred_tool_outputs.pop(call_id, []):
+                        messages.append(deferred)
             pending_tool_calls.clear()
 
     for item in value:
@@ -741,14 +842,52 @@ def _responses_input_to_messages(value: Any) -> list[dict[str, Any]]:
                 }
             )
         elif item_type == "function_call_output":
-            flush_pending_assistant_tool_calls()
             output = item.get("output", "")
-            messages.append({"role": "tool", "tool_call_id": item.get("call_id"), "content": _content_to_text(output)})
+            call_id = str(item.get("call_id") or "")
+            tool_name = function_call_names.get(call_id, "")
+            if _is_hosted_web_search_name(tool_name) and _is_absolutely_empty_web_search_output(output):
+                content = HOSTED_WEB_SEARCH_UNAVAILABLE_MESSAGE
+            else:
+                content = _content_to_text(output)
+            tool_messages = [
+                {"role": "tool", "tool_call_id": call_id or item.get("call_id"), "content": content}
+            ]
             if _has_visual_content(output):
-                messages.append({"role": "user", "content": _visual_feedback_chat_content(output, item.get("call_id"))})
+                tool_messages.append(
+                    {"role": "user", "content": _visual_feedback_chat_content(output, item.get("call_id"))}
+                )
+            pending_ids = {str(tool_call.get("id") or "") for tool_call in pending_tool_calls}
+            if call_id and call_id in pending_ids:
+                flush_pending_assistant_tool_calls()
+                messages.extend(tool_messages)
+            elif call_id and call_id in emitted_tool_call_ids:
+                messages.extend(tool_messages)
+            elif call_id:
+                deferred_tool_outputs.setdefault(call_id, []).extend(tool_messages)
+            else:
+                flush_pending_assistant_tool_calls()
+                messages.extend(tool_messages)
         elif item_type == "web_search_call":
             flush_pending_assistant_tool_calls()
-            continue
+            call_id = str(item.get("call_id") or item.get("id") or "call_0")
+            action = item.get("action") if isinstance(item.get("action"), dict) else {}
+            query = str(action.get("query") or "")
+            arguments = json.dumps({"query": query}) if query else "{}"
+            pending_tool_calls.append(
+                {
+                    "id": call_id,
+                    "type": "function",
+                    "function": {
+                        "name": "web_search",
+                        "arguments": arguments,
+                    },
+                }
+            )
+            flush_pending_assistant_tool_calls()
+            result_text = _web_search_call_result_text(item)
+            if not result_text.strip():
+                result_text = HOSTED_WEB_SEARCH_UNAVAILABLE_MESSAGE
+            messages.append({"role": "tool", "tool_call_id": call_id, "content": result_text})
         elif item_type == "tool_search_call":
             flush_pending_assistant_tool_calls()
             call_id = item.get("call_id") or item.get("id") or "call_0"
@@ -796,6 +935,18 @@ def _responses_input_to_messages(value: Any) -> list[dict[str, Any]]:
                     "content": f"MCP tool {server}/{tool} result:\n{content}",
                 }
             )
+        elif item_type == "compaction":
+            flush_pending_assistant_tool_calls()
+            summary = decode_shim_compaction_summary(item.get("encrypted_content"))
+            if summary:
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": f"Compacted conversation state:\n{summary}",
+                    }
+                )
+        elif item_type == "compaction_trigger":
+            continue
         elif item_type == "reasoning":
             # For Chat-Completions upstreams reasoning is informational only.
             # We keep it as a marker so the Anthropic translator can reattach
@@ -811,6 +962,8 @@ def _responses_input_to_messages(value: Any) -> list[dict[str, Any]]:
                 }
             )
     flush_pending_assistant_tool_calls()
+    for deferred in deferred_tool_outputs.values():
+        messages.extend(deferred)
     return messages
 
 

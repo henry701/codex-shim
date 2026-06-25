@@ -79,6 +79,54 @@ def _normalize_slug_body(body: str) -> str:
 
 _CATALOG_ROUTE_PREFIXES = ("cursor-", "codex-", "oc-free-")
 
+_ROUTE_SLUG_PREFIXES = ("oc-free", "zen", "or", "nvidia", "local", "ocgo", "cursor", "codex")
+
+ROUTE_LABEL_PREFIXES = {
+    "zen": "OpenCode Zen",
+    "oc-free": "OpenCode Zen (free)",
+    "or": "OpenRouter",
+    "nvidia": "NVIDIA",
+    "local": "Local",
+    "ocgo": "OpenCode Go",
+}
+
+CURSOR_DISPLAY_PREFIX = "Cursor - "
+OPENCODE_ZEN_BASE_URL = "https://opencode.ai/zen/v1"
+
+
+def _strip_route_slug_prefix(slug_body: str) -> str:
+    for prefix in _ROUTE_SLUG_PREFIXES:
+        if slug_body.startswith(f"{prefix}-"):
+            return slug_body[len(prefix) + 1 :]
+    return slug_body
+
+
+def format_cursor_display_name(name: str) -> str:
+    normalized = name.strip()
+    if not normalized:
+        return CURSOR_DISPLAY_PREFIX.strip()
+    for prefix in (CURSOR_DISPLAY_PREFIX, "Cursor — ", "Cursor - "):
+        if normalized.startswith(prefix):
+            return normalized
+    return f"{CURSOR_DISPLAY_PREFIX}{normalized}"
+
+
+def catalog_display_name(model) -> str:
+    """Normalize picker labels for routed shim models."""
+    base_url = str(getattr(model, "base_url", "") or "").rstrip("/")
+    if base_url.endswith("opencode.ai/zen/v1"):
+        from .discover import is_zen_public_model
+
+        slug = str(getattr(model, "slug", "") or "")
+        model_id = str(getattr(model, "model", "") or "")
+        label_prefix = (
+            "oc-free"
+            if slug.startswith("oc-free-") or slug.endswith("-free") or is_zen_public_model(model_id)
+            else "zen"
+        )
+        return display_name_from_slug(slug, label_prefix=label_prefix)
+    return str(getattr(model, "display_name", "") or getattr(model, "slug", "") or "Model")
+
 
 def display_name_from_slug(slug: str, *, label_prefix: str | None = None) -> str:
     """Turn a catalog slug into a human-readable display name."""
@@ -86,8 +134,8 @@ def display_name_from_slug(slug: str, *, label_prefix: str | None = None) -> str
     if not raw:
         return "Model"
     body = raw
-    if label_prefix and body.startswith(f"{label_prefix}-"):
-        body = body[len(label_prefix) + 1 :]
+    if label_prefix:
+        body = _strip_route_slug_prefix(body)
     elif not label_prefix:
         for prefix in _CATALOG_ROUTE_PREFIXES:
             if body.startswith(prefix):
@@ -97,7 +145,10 @@ def display_name_from_slug(slug: str, *, label_prefix: str | None = None) -> str
     parts = re.split(r"[-_/]+", body)
     rendered = " ".join(_format_token(part) for part in parts if part)
     if label_prefix:
-        prefix_display = _TOKEN_OVERRIDES.get(label_prefix.lower(), label_prefix.title())
+        prefix_display = ROUTE_LABEL_PREFIXES.get(
+            label_prefix.lower(),
+            _TOKEN_OVERRIDES.get(label_prefix.lower(), label_prefix.title()),
+        )
         return f"{prefix_display} — {rendered}"
     return rendered
 

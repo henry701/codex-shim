@@ -67,7 +67,7 @@ Discovery can be tuned in `~/.codex-shim/models.json`:
     "nvidia_integrate": true,
     "local": true
   },
-  "models": [ /* explicit BYOK entries */ ]
+  "models": [ /* local or niche routes only; cloud catalogs are auto-discovered */ ]
 }
 ```
 

@@ -640,3 +640,117 @@ def test_function_call_round_trip_preserves_namespace_with_sanitized_names():
     )
     assert direct["namespace"] == "mcp__exa"
     assert direct["name"] == "web_search_exa"
+
+
+def test_web_search_call_empty_results_emits_unavailable_tool_message():
+    body = {
+        "model": "slug",
+        "input": [
+            {
+                "type": "web_search_call",
+                "id": "ws_empty",
+                "call_id": "ws_empty",
+                "status": "completed",
+                "action": {"type": "search", "query": "linux caffeinate"},
+            }
+        ],
+    }
+    out = responses_to_chat(body, "upstream")
+    assert out["messages"] == [
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "ws_empty",
+                    "type": "function",
+                    "function": {
+                        "name": "web_search",
+                        "arguments": '{"query": "linux caffeinate"}',
+                    },
+                }
+            ],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "ws_empty",
+            "content": (
+                "The Codex hosted web_search tool returned no results and is unavailable at this time. "
+                "Other search tools may still be available (for example MCP web_search_exa). "
+                "Do not retry web_search; use an alternative search tool instead."
+            ),
+        },
+    ]
+
+
+def test_web_search_call_with_sources_preserves_results():
+    body = {
+        "model": "slug",
+        "input": [
+            {
+                "type": "web_search_call",
+                "id": "ws_hit",
+                "call_id": "ws_hit",
+                "status": "completed",
+                "action": {
+                    "type": "search",
+                    "query": "linux caffeinate",
+                    "sources": [
+                        {"type": "url", "url": "https://example.com/caffeine"},
+                    ],
+                },
+            }
+        ],
+    }
+    out = responses_to_chat(body, "upstream")
+    tool_message = out["messages"][-1]
+    assert tool_message["role"] == "tool"
+    assert "https://example.com/caffeine" in tool_message["content"]
+    assert "unavailable" not in tool_message["content"].lower()
+
+
+def test_web_search_function_call_output_empty_substitutes_unavailable_message():
+    body = {
+        "model": "slug",
+        "input": [
+            {
+                "type": "function_call",
+                "name": "web_search",
+                "call_id": "call_ws",
+                "arguments": '{"query":"linux caffeinate"}',
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "call_ws",
+                "output": "",
+            },
+        ],
+    }
+    out = responses_to_chat(body, "upstream")
+    tool_message = out["messages"][-1]
+    assert tool_message["role"] == "tool"
+    assert tool_message["tool_call_id"] == "call_ws"
+    assert "unavailable at this time" in tool_message["content"]
+
+
+def test_empty_function_call_output_for_mcp_search_is_not_substituted():
+    body = {
+        "model": "slug",
+        "input": [
+            {
+                "type": "function_call",
+                "name": "web_search_exa",
+                "namespace": "mcp__exa",
+                "call_id": "call_exa",
+                "arguments": '{"query":"linux caffeinate"}',
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "call_exa",
+                "output": "",
+            },
+        ],
+    }
+    out = responses_to_chat(body, "upstream")
+    tool_message = out["messages"][-1]
+    assert tool_message["content"] == ""

@@ -271,6 +271,19 @@ def _publish_catalog(models, router_config) -> Path:
     return DESKTOP_CATALOG_PATH
 
 
+def _refresh_published_catalog(settings_path: Path, port: int) -> Path | None:
+    """Regenerate runtime + Desktop catalogs after settings change."""
+    try:
+        models = _load_models(settings_path)
+        default_model_slug(models)
+    except ValueError:
+        return None
+    router_config = router_module.load_router_config(Path(settings_path).expanduser())
+    desktop_catalog = _publish_catalog(models, router_config)
+    write_config(models, CONFIG_PATH, CATALOG_PATH, port)
+    return desktop_catalog
+
+
 def generate(settings_path: Path, port: int) -> None:
     models = _load_models(settings_path)
     try:
@@ -669,6 +682,11 @@ def discover_models(settings_path: Path, *, refresh: bool = False) -> int:
             flush=True,
         )
     print(f"\n{len(rows)} discoverable models.")
+    if refresh:
+        catalog = _refresh_published_catalog(settings_path, DEFAULT_PORT)
+        if catalog is not None:
+            catalog_models = len(json.loads(catalog.read_text()).get("models", []))
+            print(f"Refreshed Desktop catalog ({catalog_models} entries): {catalog}")
     return 0
 
 
@@ -692,6 +710,10 @@ def refresh_opencode_go(settings_path: Path, api_key_env: str, base_url: str, pr
             print(f"  {model_id}: chat={chat_status}, messages={messages_status}")
     for row in result.models:
         print(f"  {row['slug']}  ->  {row['model']} ({row['provider']}, {row['opencode_go_endpoint']})")
+    catalog = _refresh_published_catalog(settings_path, DEFAULT_PORT)
+    if catalog is not None:
+        catalog_models = len(json.loads(catalog.read_text()).get("models", []))
+        print(f"Refreshed Desktop catalog ({catalog_models} entries): {catalog}")
     return 0
 
 
@@ -778,7 +800,7 @@ def list_models(settings_path: Path) -> int:
         )
         return 1
     width = max(len(row[0]) for row in rows)
-    for slug, display_name, model, provider in rows:
+    for slug, display_name, model, provider in sorted(rows, key=lambda row: row[0].lower()):
         print(f"{slug:<{width}}  {display_name}  ->  {model} ({provider})", flush=True)
     return 0
 

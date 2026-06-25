@@ -7,8 +7,39 @@ and this project does not yet follow semantic versioning (pre-1.0).
 
 ## Unreleased
 
+### Fixed
+
+- Remote compaction v2 for BYOK/OpenCode models: when Codex appends a terminal
+  `compaction_trigger` to `POST /v1/responses`, the shim now runs a compact
+  summarization request and streams exactly one `compaction` output item instead
+  of forwarding reasoning/message pairs that Codex rejects.
+- BYOK `/v1/responses/compact` now returns a canonical `compaction` output item
+  (with shim-encoded `encrypted_content`) instead of a plain assistant message.
+- BYOK translation now feeds hosted `web_search` round-trips back to the upstream
+  model. When Codex's hosted web search returns absolutely empty results, the shim
+  substitutes a clear unavailable message so the model can fall back to MCP search
+  tools instead of ending the turn with no feedback.
+
 ### Changed
 
+- Desktop catalog picker order now matches alphabetical slug order: `write_catalog`
+  assigns ascending `priority` values per tier (BYOK, ChatGPT passthrough, Cursor,
+  router) because Codex sorts by `priority`, not JSON array order. Both
+  `~/.codex-shim/.codex-shim/custom_model_catalog.json` and
+  `~/.codex/custom_model_catalog.json` are updated.
+- `opencode-go refresh` and `discover --refresh` regenerate the Desktop catalog
+  after refreshing model listings.
+- `~/.codex-shim/models.json` is intended for local/niche routes plus shim
+  config (`discover`, `passthrough_error_fallback`, router); cloud providers are
+  auto-discovered at catalog sync time instead of being duplicated manually.
+- Merged BYOK model lists and shim API model endpoints (`GET /api/models`,
+  `GET /v1/models`) return routes sorted alphabetically by slug.
+- OpenCode Zen picker labels are normalized at catalog time: free routes use
+  `OpenCode Zen (free) — …`, paid routes use `OpenCode Zen — …`, regardless of
+  whether the model came from explicit `models.json` entries or auto-discovery
+  (`oc-free-*` vs `zen-*` slug prefixes).
+- Cursor subscription models from `cursor-agent --list-models` are prefixed with
+  `Cursor - ` in the picker.
 - Responses `input_image.detail` values are normalized before OpenAI-chat
   forwarding: Codex's `original` becomes `high`, and unknown values become
   `auto`.

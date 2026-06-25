@@ -16,6 +16,15 @@ from urllib.parse import urljoin
 
 from aiohttp import ClientError, ClientSession, ClientTimeout, WSMsgType, web
 
+from .compaction import (
+    CompactionTriggerError,
+    compact_response_payload,
+    compaction_item_from_response_payload,
+    compaction_output_item,
+    compaction_summary_from_output,
+    decode_shim_compaction_summary,
+    strip_terminal_compaction_trigger,
+)
 from .cursor_passthrough import (
     CURSOR_MODEL_SLUG,
     CursorResponseCollector,
@@ -465,6 +474,22 @@ class ShimServer:
         tool_types = responses_tool_type_map(body.get("tools"))
         tool_resolve = responses_tool_resolve_map(body.get("tools"))
         body = prepare_codex_byok_responses_body(body, request.headers)
+        try:
+            stripped_input = strip_terminal_compaction_trigger(body.get("input"))
+        except CompactionTriggerError as exc:
+            return web.json_response(
+                _responses_error_payload(route.slug, "invalid_request_error", str(exc)),
+                status=400,
+            )
+        if stripped_input is not None:
+            return await self._responses_compaction_v2(
+                request,
+                body,
+                stripped_input,
+                route=route,
+                tool_types=tool_types,
+                tool_resolve=tool_resolve,
+            )
         if route.is_openai_responses:
             return await self._post_openai_responses(request, route, body)
         if route.is_openai_chat:
@@ -478,6 +503,144 @@ class ShimServer:
                 request, route, forwarded, as_responses=True, tool_types=tool_types, tool_resolve=tool_resolve
             )
         raise web.HTTPBadGateway(text=f"Unsupported model provider: {route.provider}")
+
+    def _summary_from_compact_upstream_payload(self, payload: dict[str, Any]) -> str:
+        item = compaction_item_from_response_payload(payload)
+        if item is not None:
+            return decode_shim_compaction_summary(item.get("encrypted_content")) or ""
+        return compaction_summary_from_output(payload.get("output"))
+
+    async def _responses_compaction_v2(
+        self,
+        request: web.Request,
+        body: dict[str, Any],
+        stripped_input: list[Any],
+        *,
+        route: ShimModel,
+        tool_types: dict[str, str] | None,
+        tool_resolve: dict[str, tuple[str | None, str]] | None,
+    ) -> web.StreamResponse:
+        compact_body = _compact_request_body({**body, "input": stripped_input}, route.model)
+        summary, usage, error_response = await self._fetch_byok_compact_summary(
+            request,
+            route,
+            compact_body,
+            tool_types=tool_types,
+            tool_resolve=tool_resolve,
+        )
+        if error_response is not None:
+            return error_response
+        compaction_item = compaction_output_item(summary)
+        response = _sse_response()
+        await response.prepare(request)
+        response_id = f"resp_compact_{int(time.time() * 1000)}"
+        completed_response: dict[str, Any] = {
+            "id": response_id,
+            "object": "response",
+            "status": "completed",
+            "model": route.slug,
+            "output": [compaction_item],
+        }
+        if usage is not None:
+            completed_response["usage"] = usage
+        try:
+            await _write_sse(
+                response,
+                {
+                    "type": "response.output_item.done",
+                    "output_index": 0,
+                    "item": compaction_item,
+                },
+            )
+            await _write_sse(
+                response,
+                {
+                    "type": "response.completed",
+                    "response": completed_response,
+                },
+            )
+            await response.write(b"data: [DONE]\n\n")
+        except ClientDisconnected:
+            pass
+        try:
+            await response.write_eof()
+        except Exception:
+            pass
+        return response
+
+    async def _fetch_byok_compact_summary(
+        self,
+        request: web.Request,
+        route: ShimModel,
+        compact_body: dict[str, Any],
+        *,
+        tool_types: dict[str, str] | None,
+        tool_resolve: dict[str, tuple[str | None, str]] | None,
+    ) -> tuple[str, dict[str, Any] | None, web.StreamResponse | web.Response | None]:
+        compact_body = prepare_codex_byok_responses_body(compact_body, request.headers)
+        compact_body["stream"] = False
+        if route.is_openai_responses:
+            upstream_response = await self._post_openai_responses(request, route, compact_body)
+            if not isinstance(upstream_response, web.Response) or upstream_response.status >= 400:
+                return "", None, upstream_response
+            try:
+                payload = json.loads(upstream_response.text or "{}")
+            except json.JSONDecodeError:
+                return "", None, upstream_response
+            if not isinstance(payload, dict):
+                return "", None, upstream_response
+            summary = self._summary_from_compact_upstream_payload(payload)
+            usage = payload.get("usage") if isinstance(payload.get("usage"), dict) else None
+            return summary, usage, None
+        if route.is_openai_chat:
+            forwarded = responses_to_chat(compact_body, route.model)
+            forwarded["stream"] = False
+            upstream_response = await self._post_openai_chat(
+                request,
+                route,
+                forwarded,
+                as_responses=True,
+                tool_types=tool_types,
+                tool_resolve=tool_resolve,
+            )
+            if not isinstance(upstream_response, web.Response) or upstream_response.status >= 400:
+                return "", None, upstream_response
+            try:
+                payload = json.loads(upstream_response.text or "{}")
+            except json.JSONDecodeError:
+                return "", None, upstream_response
+            if not isinstance(payload, dict):
+                return "", None, upstream_response
+            summary = self._summary_from_compact_upstream_payload(payload)
+            usage = payload.get("usage") if isinstance(payload.get("usage"), dict) else None
+            return summary, usage, None
+        if route.is_anthropic:
+            forwarded = responses_to_anthropic(compact_body, route.model, route.max_output_tokens)
+            forwarded["stream"] = False
+            upstream_response = await self._post_anthropic(
+                request,
+                route,
+                forwarded,
+                as_responses=True,
+                tool_types=tool_types,
+                tool_resolve=tool_resolve,
+            )
+            if not isinstance(upstream_response, web.Response) or upstream_response.status >= 400:
+                return "", None, upstream_response
+            try:
+                payload = json.loads(upstream_response.text or "{}")
+            except json.JSONDecodeError:
+                return "", None, upstream_response
+            if not isinstance(payload, dict):
+                return "", None, upstream_response
+            summary = self._summary_from_compact_upstream_payload(payload)
+            usage = payload.get("usage") if isinstance(payload.get("usage"), dict) else None
+            return summary, usage, None
+        error = web.HTTPBadGateway(text=f"Unsupported model provider: {route.provider}")
+        return "", None, web.json_response(
+            _responses_error_payload(route.slug, "upstream_error", error.text),
+            status=502,
+        )
 
     async def responses_compact(self, request: web.Request) -> web.StreamResponse:
         body = await request.json()
@@ -3571,51 +3734,9 @@ async def _as_compact_response(response: web.StreamResponse, model: str) -> web.
     except json.JSONDecodeError:
         return response
     output = payload.get("output") if isinstance(payload, dict) else None
-    summary = _compact_summary_from_output(output)
-    compacted = _compact_response_payload(model, summary, payload.get("usage") if isinstance(payload, dict) else None)
+    summary = compaction_summary_from_output(output)
+    compacted = compact_response_payload(model, summary, payload.get("usage") if isinstance(payload, dict) else None)
     return web.json_response(compacted)
-
-
-def _compact_summary_from_output(output: Any) -> str:
-    parts: list[str] = []
-    if isinstance(output, list):
-        for item in output:
-            if not isinstance(item, dict):
-                continue
-            if item.get("type") == "message":
-                content = item.get("content") or []
-                if isinstance(content, list):
-                    for part in content:
-                        if isinstance(part, dict) and part.get("text"):
-                            parts.append(str(part["text"]))
-            elif item.get("type") == "output_text" and item.get("text"):
-                parts.append(str(item["text"]))
-    return "\n".join(part for part in parts if part).strip()
-
-
-def _compact_response_payload(model: str, summary: str, usage: Any = None) -> dict[str, Any]:
-    now = int(time.time())
-    response_id = f"resp_compact_{now}"
-    text = summary or "No prior conversation state was available to compact."
-    payload = {
-        "id": response_id,
-        "object": "response",
-        "created_at": now,
-        "status": "completed",
-        "model": model,
-        "output": [
-            {
-                "id": f"msg_compact_{now}",
-                "type": "message",
-                "status": "completed",
-                "role": "assistant",
-                "content": [{"type": "output_text", "text": text, "annotations": []}],
-            }
-        ],
-    }
-    if usage is not None:
-        payload["usage"] = usage
-    return payload
 
 
 def parse_upstream_error(body: str, http_status: int) -> tuple[str, str]:

@@ -59,8 +59,8 @@ def test_discover_openrouter_alias_respects_openrouter_key(monkeypatch):
     )
     enabled = discover_byok_models([], settings_data={"discover": {"openrouter": True}})
     disabled = discover_byok_models([], settings_data={"discover": {"openrouter": False}})
-    assert any(model.slug == "or-openrouter-free" for model in enabled)
-    assert not any(model.slug == "or-openrouter-free" for model in disabled)
+    assert any(model.slug == "or-free-router" for model in enabled)
+    assert not any(model.slug == "or-free-router" for model in disabled)
 
 
 def test_paid_zen_not_discovered_without_api_key(monkeypatch):

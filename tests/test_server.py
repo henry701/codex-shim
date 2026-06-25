@@ -9,6 +9,7 @@ import pytest
 from aiohttp import ClientSession, WSMsgType, web
 from aiohttp.test_utils import TestClient, TestServer
 
+from codex_shim.compaction import decode_shim_compaction_summary
 from codex_shim import mcp_search
 from codex_shim import server as server_module
 from codex_shim.server import (
@@ -1939,12 +1940,92 @@ async def test_responses_compact_routes_to_openai_chat_and_returns_compacted_win
     payload = await resp.json()
     assert payload["status"] == "completed"
     assert payload["model"] == "real-openai"
-    assert payload["output"][0]["content"][0]["text"] == "Task: keep implementing compact support."
+    assert payload["output"][0]["type"] == "compaction"
+    assert decode_shim_compaction_summary(payload["output"][0]["encrypted_content"]) == (
+        "Task: keep implementing compact support."
+    )
     assert payload["usage"] == {"input_tokens": 9, "output_tokens": 2, "total_tokens": 11}
     assert captured["body"]["model"] == "real-openai"
     assert captured["body"]["stream"] is False
     assert "service_tier" not in captured["body"]
     assert "Compact the conversation" in captured["body"]["messages"][0]["content"]
+
+    await shim_client.close()
+    await upstream_client.close()
+
+
+async def test_responses_compaction_v2_emits_single_compaction_stream_item(tmp_path):
+    captured = {}
+
+    async def chat(request):
+        captured["body"] = await request.json()
+        return web.json_response(
+            {
+                "id": "chatcmpl_compact_v2",
+                "choices": [
+                    {
+                        "message": {
+                            "role": "assistant",
+                            "content": "Compacted task state for DeepSeek.",
+                            "reasoning_content": "thinking that must not become output items",
+                        }
+                    }
+                ],
+                "usage": {"prompt_tokens": 12, "completion_tokens": 4, "total_tokens": 16},
+            }
+        )
+
+    upstream = web.Application()
+    upstream.router.add_post("/v1/chat/completions", chat)
+    upstream_client = TestClient(TestServer(upstream))
+    await upstream_client.start_server()
+
+    settings = tmp_path / "settings.json"
+    settings.write_text(
+        json.dumps(
+            {
+                "customModels": [
+                    {
+                        "model": "deepseek-v4-pro",
+                        "displayName": "DeepSeek V4 Pro",
+                        "provider": "openai",
+                        "baseUrl": str(upstream_client.make_url("/v1")),
+                        "apiKey": "secret",
+                    }
+                ]
+            }
+        )
+    )
+    shim_client = TestClient(TestServer(ShimServer(settings).app()))
+    await shim_client.start_server()
+
+    resp = await shim_client.post(
+        "/v1/responses",
+        json={
+            "model": "deepseek-v4-pro",
+            "stream": True,
+            "input": [
+                {"role": "user", "content": "long thread"},
+                {"type": "compaction_trigger"},
+            ],
+        },
+        headers={"User-Agent": "codex-cli/0.138.0"},
+    )
+    assert resp.status == 200
+    text = await resp.text()
+    assert "response.output_item.done" in text
+    assert '"type":"compaction"' in text.replace(" ", "")
+    assert "response.completed" in text
+    assert "reasoning" not in text
+    assert captured["body"]["stream"] is False
+    assert captured["body"]["messages"]
+
+    done_lines = [line for line in text.splitlines() if line.startswith("data: ") and "response.output_item.done" in line]
+    assert len(done_lines) == 1
+    payload = json.loads(done_lines[0].removeprefix("data: "))
+    item = payload["item"]
+    assert item["type"] == "compaction"
+    assert decode_shim_compaction_summary(item["encrypted_content"]) == "Compacted task state for DeepSeek."
 
     await shim_client.close()
     await upstream_client.close()

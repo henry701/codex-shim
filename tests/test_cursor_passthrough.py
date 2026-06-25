@@ -20,7 +20,7 @@ def test_parse_cursor_list_models_output():
         "auto - Auto\ncomposer-2.5 - Composer 2.5\ngpt-5.3-codex - Codex 5.3\n"
     )
     assert models["cursor-composer-2-5"].upstream_id == "composer-2.5"
-    assert models["cursor-composer-2-5"].display_name == "Composer 2.5"
+    assert models["cursor-composer-2-5"].display_name == "Cursor - Composer 2.5"
     assert models["cursor-gpt-5-3-codex"].upstream_id == "gpt-5.3-codex"
 
 

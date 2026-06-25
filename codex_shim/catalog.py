@@ -17,9 +17,23 @@ from .settings import (
     usable_byok_models,
 )
 from .cursor_passthrough import cursor_passthrough_available, cursor_passthrough_entries
+from .naming import catalog_display_name
 
 
 PLAN_TIERS = ["free", "plus", "pro", "team", "business", "enterprise"]
+
+CATALOG_TIER_ROUTER = "router"
+CATALOG_TIER_CHATGPT = "chatgpt"
+CATALOG_TIER_CURSOR = "cursor"
+CATALOG_TIER_BYOK = "byok"
+
+# Codex Desktop sorts picker entries by ascending priority, not JSON array order.
+CATALOG_PRIORITY_BASE = {
+    CATALOG_TIER_BYOK: 100,
+    CATALOG_TIER_CHATGPT: 5_000,
+    CATALOG_TIER_CURSOR: 10_000,
+    CATALOG_TIER_ROUTER: 20_000,
+}
 
 
 def sort_catalog_entries(
@@ -28,6 +42,36 @@ def sort_catalog_entries(
     slug_key: str = "slug",
 ) -> list[dict[str, Any]]:
     return sorted(entries, key=lambda entry: str(entry.get(slug_key) or ""))
+
+
+def assign_catalog_display_priorities(
+    tiered_entries: list[tuple[str, dict[str, Any]]],
+) -> list[dict[str, Any]]:
+    """Assign ascending priorities within each catalog tier, sorted by slug."""
+    by_tier: dict[str, list[dict[str, Any]]] = {
+        CATALOG_TIER_BYOK: [],
+        CATALOG_TIER_CHATGPT: [],
+        CATALOG_TIER_CURSOR: [],
+        CATALOG_TIER_ROUTER: [],
+    }
+    for tier, entry in tiered_entries:
+        bucket = by_tier.get(tier)
+        if bucket is None:
+            raise ValueError(f"unknown catalog tier: {tier}")
+        bucket.append(entry)
+
+    ordered: list[dict[str, Any]] = []
+    for tier in (
+        CATALOG_TIER_BYOK,
+        CATALOG_TIER_CHATGPT,
+        CATALOG_TIER_CURSOR,
+        CATALOG_TIER_ROUTER,
+    ):
+        base = CATALOG_PRIORITY_BASE[tier]
+        for rank, entry in enumerate(sort_catalog_entries(by_tier[tier])):
+            entry["priority"] = base + rank
+            ordered.append(entry)
+    return ordered
 
 
 def _reasoning_catalog_fields(model: ShimModel) -> dict[str, Any]:
@@ -48,10 +92,11 @@ def catalog_entry(model: ShimModel) -> dict:
     compact = max(8_000, int(context * 0.8))
     truncation = min(64_000, max(8_000, int(context * 0.32)))
     reasoning = _reasoning_effort(model)
+    display_name = catalog_display_name(model)
     return {
         "slug": model.slug,
-        "display_name": model.display_name,
-        "description": f"{model.display_name} via local Codex shim.",
+        "display_name": display_name,
+        "description": f"{display_name} via local Codex shim.",
         "context_window": context,
         "max_context_window": context,
         "auto_compact_token_limit": compact,
@@ -79,7 +124,6 @@ def catalog_entry(model: ShimModel) -> dict:
         "supported_in_api": True,
         "availability_nux": None,
         "upgrade": None,
-        "priority": max(1, 1000 - model.index),
         "prefer_websockets": False,
         "available_in_plans": PLAN_TIERS,
         "base_instructions": "You are a coding agent running in Codex through a local BYOK shim.",
@@ -88,7 +132,7 @@ def catalog_entry(model: ShimModel) -> dict:
                 "You are Codex running on {model_name} through a local all-model shim. "
                 "Be a helpful, direct coding collaborator."
             ),
-            "instructions_variables": {"model_name": model.display_name},
+            "instructions_variables": {"model_name": display_name},
         },
     }
 
@@ -105,7 +149,6 @@ def chatgpt_passthrough_entries() -> list[dict]:
         entry["prefer_websockets"] = True
         if entry.get("slug") == CHATGPT_CATALOG_SLUG:
             entry["isDefault"] = True
-            entry["priority"] = max(int(entry.get("priority") or 0), 10000)
         entries.append(entry)
     return entries
 
@@ -120,17 +163,22 @@ def chatgpt_passthrough_entry() -> dict:
 
 def write_catalog(models: list[ShimModel], path: Path, router_config=None) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
-    entries: list[dict] = []
+    tiered_entries: list[tuple[str, dict[str, Any]]] = []
     if router_config is not None and router_module.router_is_active(router_config, available_model_slugs(models)):
-        entries.append(router_module.router_catalog_entry(router_config))
+        tiered_entries.append(
+            (CATALOG_TIER_ROUTER, router_module.router_catalog_entry(router_config)),
+        )
     if chatgpt_passthrough_available():
-        entries.extend(chatgpt_passthrough_entries())
+        tiered_entries.extend((CATALOG_TIER_CHATGPT, entry) for entry in chatgpt_passthrough_entries())
     if cursor_passthrough_available():
         cursor_entries = cursor_passthrough_entries()
         if cursor_entries and not chatgpt_passthrough_available():
             cursor_entries[0]["isDefault"] = True
-        entries.extend(cursor_entries)
-    entries.extend(catalog_entry(model) for model in usable_byok_models(models))
+        tiered_entries.extend((CATALOG_TIER_CURSOR, entry) for entry in cursor_entries)
+    tiered_entries.extend(
+        (CATALOG_TIER_BYOK, catalog_entry(model)) for model in usable_byok_models(models)
+    )
+    entries = assign_catalog_display_priorities(tiered_entries)
     payload = {"models": sort_catalog_entries(entries)}
     path.write_text(json.dumps(payload, indent=2, sort_keys=False) + "\n")
     return path

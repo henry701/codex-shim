@@ -187,7 +187,7 @@ def load_chatgpt_passthrough_catalog_models(cache_path: Path | None = None) -> l
                 cache_entry=entry,
             )
     if by_upstream:
-        return list(by_upstream.values())
+        return sorted(by_upstream.values(), key=lambda entry: str(entry.get("slug") or ""))
     return [
         _codex_passthrough_entry(
             upstream,
@@ -202,9 +202,10 @@ def chatgpt_passthrough_slugs(cache_path: Path | None = None) -> set[str]:
 
 
 def chatgpt_passthrough_display_names(cache_path: Path | None = None) -> dict[str, str]:
+    rows = load_chatgpt_passthrough_catalog_models(cache_path)
     return {
         str(model["slug"]): str(model.get("display_name") or model["slug"])
-        for model in load_chatgpt_passthrough_catalog_models(cache_path)
+        for model in sorted(rows, key=lambda entry: str(entry.get("slug") or "").lower())
         if model.get("slug")
     }
 
@@ -494,7 +495,10 @@ def default_model_slug(models: list[ShimModel], include_chatgpt: bool | None = N
 
 
 def usable_byok_models(models: list[ShimModel]) -> list[ShimModel]:
-    return [model for model in models if byok_model_has_credentials(model)]
+    return sorted(
+        (model for model in models if byok_model_has_credentials(model)),
+        key=lambda model: model.slug.lower(),
+    )
 
 
 def available_model_slugs(models: list[ShimModel]) -> set[str]:

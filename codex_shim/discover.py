@@ -274,6 +274,7 @@ def merge_discovered_models(explicit: list[ShimModel], discovered: list[ShimMode
         explicit_models.add(model.model)
         explicit_slugs.add(model.slug)
         next_index += 1
+    merged.sort(key=lambda model: model.slug.lower())
     return merged
 
 
@@ -559,7 +560,7 @@ def _discover_rows_for_template(template: DiscoverTemplate) -> list[str]:
 def _rows_to_shim_models(model_ids: list[str], template: DiscoverTemplate) -> list[ShimModel]:
     models: list[ShimModel] = []
     used_slugs: set[str] = set()
-    for offset, model_id in enumerate(model_ids):
+    for offset, model_id in enumerate(sorted(model_ids, key=str.lower)):
         slug = _catalog_slug_for_model(model_id, template.slug_prefix, used_slugs, offset)
         display_name = display_name_from_slug(slug, label_prefix=template.label_prefix)
         models.append(
@@ -584,6 +585,12 @@ def _catalog_slug_for_model(
     used_slugs: set[str],
     offset: int,
 ) -> str:
+    if model_id == _OPENROUTER_FREE_ROUTER and slug_prefix == "or":
+        slug = "or-free-router"
+        if slug in used_slugs:
+            slug = f"{slug}-{offset}"
+        used_slugs.add(slug)
+        return slug
     body = slugify(model_id.replace("/", "-").replace(":", "-"))
     slug = f"{slug_prefix}-{body}" if slug_prefix else body
     if slug in used_slugs:

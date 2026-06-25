@@ -10,7 +10,8 @@ from pathlib import Path
 import pytest
 
 from codex_shim import cli
-from codex_shim.catalog import catalog_entry, sort_catalog_entries, write_catalog
+from codex_shim.catalog import catalog_entry, assign_catalog_display_priorities, sort_catalog_entries, write_catalog
+from codex_shim.catalog import CATALOG_TIER_BYOK
 from codex_shim.catalog_slugs import codex_catalog_slug
 from codex_shim.opencode_go import opencode_go_model_row, write_opencode_go_models
 from codex_shim.settings import (
@@ -253,6 +254,12 @@ def test_write_opencode_go_models_preserves_legacy_custom_models_key(monkeypatch
 
 def test_refresh_opencode_go_cli_writes_discovered_models(monkeypatch, tmp_path, capsys):
     settings = tmp_path / "models.json"
+    runtime = tmp_path / "runtime"
+    codex_home = tmp_path / "codex"
+    monkeypatch.setattr(cli, "RUNTIME_DIR", runtime)
+    monkeypatch.setattr(cli, "CATALOG_PATH", runtime / "custom_model_catalog.json")
+    monkeypatch.setattr(cli, "CONFIG_PATH", runtime / "config.toml")
+    monkeypatch.setattr(cli, "DESKTOP_CATALOG_PATH", codex_home / "custom_model_catalog.json")
     monkeypatch.setenv("OPENCODE_GO_API_KEY", "ocgo-secret")
     monkeypatch.setattr("codex_shim.opencode_go.fetch_opencode_go_model_ids", lambda *_args, **_kwargs: ["glm-5.1", "qwen3.7-max"])
     monkeypatch.setattr("codex_shim.opencode_go.probe_chat_model", lambda _base, _key, model, **_kwargs: 401 if model == "qwen3.7-max" else 200)
@@ -269,6 +276,9 @@ def test_refresh_opencode_go_cli_writes_discovered_models(monkeypatch, tmp_path,
         ("ocgo-glm-5-1", "generic-chat-completion-api"),
         ("ocgo-qwen3-7-max", "anthropic"),
     ]
+    desktop_catalog = codex_home / "custom_model_catalog.json"
+    assert desktop_catalog.exists()
+    assert "ocgo-glm-5-1" in desktop_catalog.read_text()
 
 
 def test_ollama_launch_models_schema_loads(tmp_path):
@@ -287,12 +297,12 @@ def test_ollama_launch_models_schema_loads(tmp_path):
 
     models = ModelSettings(settings).load()
 
-    assert [model.slug for model in models] == ["llama3-2", "qwen2-5-coder-14b", "deepseek-r1"]
+    assert [model.slug for model in models] == ["deepseek-r1", "llama3-2", "qwen2-5-coder-14b"]
     assert [model.provider for model in models] == ["generic-chat-completion-api"] * 3
     assert [model.base_url for model in models] == [
-        "http://127.0.0.1:11434/v1",
-        "http://127.0.0.1:11434/v1",
         "http://localhost:11434/v1",
+        "http://127.0.0.1:11434/v1",
+        "http://127.0.0.1:11434/v1",
     ]
 
 
@@ -307,6 +317,34 @@ def test_sort_catalog_entries_orders_by_slug():
         "middle-model",
         "zebra-model",
     ]
+
+
+def test_assign_catalog_display_priorities_orders_byok_alphabetically():
+    from codex_shim.settings import ShimModel
+
+    models = [
+        ShimModel(
+            slug="zulu",
+            model="zulu",
+            display_name="Zulu",
+            provider="openai",
+            base_url="http://example.invalid/v1",
+            api_key="k",
+        ),
+        ShimModel(
+            slug="alpha",
+            model="alpha",
+            display_name="Alpha",
+            provider="openai",
+            base_url="http://example.invalid/v1",
+            api_key="k",
+        ),
+    ]
+    tiered = [(CATALOG_TIER_BYOK, catalog_entry(model)) for model in models]
+    entries = assign_catalog_display_priorities(tiered)
+    byok = [entry for entry in entries if entry["slug"] in {"alpha", "zulu"}]
+    assert [entry["slug"] for entry in byok] == ["alpha", "zulu"]
+    assert [entry["priority"] for entry in byok] == [100, 101]
 
 
 def test_write_catalog_orders_models_by_slug(tmp_path, auth_missing):
@@ -332,8 +370,11 @@ def test_write_catalog_orders_models_by_slug(tmp_path, auth_missing):
     ]
     catalog_path = tmp_path / "catalog.json"
     write_catalog(models, catalog_path)
-    slugs = [entry["slug"] for entry in json.loads(catalog_path.read_text())["models"]]
+    payload = json.loads(catalog_path.read_text())
+    slugs = [entry["slug"] for entry in payload["models"]]
     assert slugs == ["alpha", "zulu"]
+    priorities = {entry["slug"]: entry["priority"] for entry in payload["models"]}
+    assert priorities["alpha"] < priorities["zulu"]
 
 
 def test_catalog_preserves_context_and_visibility():

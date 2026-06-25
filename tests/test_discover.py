@@ -6,6 +6,7 @@ import pytest
 
 from codex_shim.discover import (
     LocalModelRecord,
+    _catalog_slug_for_model,
     _parse_models_dev_opencode_free_ids,
     _parse_models_dev_opencode_paid_ids,
     discover_byok_models,
@@ -56,7 +57,7 @@ def test_merge_discovered_models_keeps_explicit_entries():
         ShimModel(
             slug="zen-minimax-m2-5",
             model="minimax-m2.5",
-            display_name="Zen — MiniMax M2.5",
+            display_name="OpenCode Zen — MiniMax M2.5",
             provider="generic-chat-completion-api",
             base_url="https://opencode.ai/zen/v1",
             api_key="public",
@@ -65,6 +66,37 @@ def test_merge_discovered_models_keeps_explicit_entries():
     ]
     merged = merge_discovered_models(explicit, discovered)
     assert [model.slug for model in merged] == ["zen-big-pickle", "zen-minimax-m2-5"]
+
+
+def test_merge_discovered_models_sorts_by_slug():
+    explicit = [
+        ShimModel(
+            slug="zulu",
+            model="zulu",
+            display_name="Zulu",
+            provider="openai",
+            base_url="http://example.invalid/v1",
+            api_key="k",
+        )
+    ]
+    discovered = [
+        ShimModel(
+            slug="alpha",
+            model="alpha",
+            display_name="Alpha",
+            provider="openai",
+            base_url="http://example.invalid/v1",
+            api_key="k",
+            raw={"discovered": True},
+        )
+    ]
+    merged = merge_discovered_models(explicit, discovered)
+    assert [model.slug for model in merged] == ["alpha", "zulu"]
+
+
+def test_openrouter_free_router_uses_stable_slug():
+    slug = _catalog_slug_for_model("openrouter/free", "or", set(), 0)
+    assert slug == "or-free-router"
 
 
 def test_discover_byok_models_adds_zen_public_models(monkeypatch):
@@ -225,7 +257,7 @@ def test_discover_byok_models_adds_openrouter_free_and_nvidia(monkeypatch):
     )
     models = discover_byok_models([])
     slugs = {model.slug for model in models}
-    assert "or-openrouter-free" in slugs
+    assert "or-free-router" in slugs
     assert "or-qwen-qwen3-coder-free" in slugs
     assert "nvidia-meta-llama-3-3-70b-instruct" in slugs
 

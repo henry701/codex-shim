@@ -12,13 +12,13 @@ from dataclasses import dataclass
 from typing import Any
 
 from .catalog_slugs import cursor_catalog_slug
-from .naming import description_for_route, display_name_from_slug
+from .naming import description_for_route, display_name_from_slug, format_cursor_display_name
 from .settings import slugify
 from .translate import responses_to_chat, strip_think
 
 CURSOR_MODEL_SLUG = cursor_catalog_slug("composer-2.5")
 CURSOR_UPSTREAM_MODEL = "composer-2.5"
-CURSOR_DISPLAY_NAME = "Composer 2.5"
+CURSOR_DISPLAY_NAME = format_cursor_display_name("Composer 2.5")
 _LIST_MODELS_RE = re.compile(r"^(\S+)\s+-\s+(.+)$")
 _AUTH_PROBE_TTL_SEC = 30.0
 _MODELS_CACHE_TTL_SEC = 300.0
@@ -129,7 +129,7 @@ def _parse_cursor_list_models_output(output: str) -> dict[str, CursorCatalogMode
         model = CursorCatalogModel(
             catalog_slug=catalog_slug,
             upstream_id=upstream_id,
-            display_name=display_name,
+            display_name=format_cursor_display_name(display_name),
         )
         models[catalog_slug] = model
         models[upstream_id] = model
@@ -196,7 +196,7 @@ def cursor_passthrough_display_names() -> dict[str, str]:
     return {model.catalog_slug: model.display_name for model in cursor_catalog_models()}
 
 
-def cursor_catalog_entry(model: CursorCatalogModel, *, priority: int = 11_000) -> dict[str, Any]:
+def cursor_catalog_entry(model: CursorCatalogModel) -> dict[str, Any]:
     display_name = model.display_name
     return {
         "slug": model.catalog_slug,
@@ -233,7 +233,6 @@ def cursor_catalog_entry(model: CursorCatalogModel, *, priority: int = 11_000) -
         "supported_in_api": True,
         "availability_nux": None,
         "upgrade": None,
-        "priority": priority,
         "prefer_websockets": False,
         "available_in_plans": ["free", "plus", "pro", "team", "business", "enterprise"],
         "base_instructions": f"You are Codex, a coding agent powered by {display_name}.",
@@ -249,8 +248,8 @@ def cursor_passthrough_entries() -> list[dict[str, Any]]:
     if not models:
         return [cursor_catalog_entry(_fallback_cursor_models()[CURSOR_MODEL_SLUG])]
     return [
-        cursor_catalog_entry(model, priority=11_000 + index)
-        for index, model in enumerate(models)
+        cursor_catalog_entry(model)
+        for model in models
     ]
 
 

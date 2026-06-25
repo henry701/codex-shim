@@ -1,0 +1,134 @@
+from __future__ import annotations
+
+import base64
+import json
+import time
+from typing import Any
+
+SHIM_COMPACTION_PREFIX = "codex-shim-compaction-v1:"
+
+
+class CompactionTriggerError(ValueError):
+    def __init__(self, message: str, *, param: str = "input") -> None:
+        super().__init__(message)
+        self.param = param
+
+
+def strip_terminal_compaction_trigger(input_items: Any) -> list[Any] | None:
+    """Return input without a terminal compaction_trigger, or None if absent."""
+    if not isinstance(input_items, list):
+        return None
+    stripped: list[Any] = []
+    trigger_seen = False
+    last_index = len(input_items) - 1
+    for index, item in enumerate(input_items):
+        if isinstance(item, dict) and item.get("type") == "compaction_trigger":
+            if trigger_seen or index != last_index:
+                raise CompactionTriggerError(
+                    "compaction_trigger must appear exactly once as the final top-level input item"
+                )
+            trigger_seen = True
+            continue
+        stripped.append(item)
+    if not trigger_seen:
+        return None
+    return stripped
+
+
+def encode_shim_compaction_summary(summary: str) -> str:
+    blob = base64.urlsafe_b64encode(
+        json.dumps({"summary": summary}, separators=(",", ":")).encode("utf-8")
+    ).decode("ascii")
+    return f"{SHIM_COMPACTION_PREFIX}{blob}"
+
+
+def decode_shim_compaction_summary(encrypted_content: Any) -> str | None:
+    if not isinstance(encrypted_content, str) or not encrypted_content.startswith(SHIM_COMPACTION_PREFIX):
+        return None
+    blob = encrypted_content[len(SHIM_COMPACTION_PREFIX) :]
+    try:
+        data = json.loads(base64.urlsafe_b64decode(blob.encode("ascii")).decode("utf-8"))
+    except Exception:
+        return None
+    if not isinstance(data, dict):
+        return None
+    summary = data.get("summary")
+    if summary is None:
+        return None
+    text = str(summary).strip()
+    return text or None
+
+
+def compaction_summary_from_output(output: Any) -> str:
+    parts: list[str] = []
+    if isinstance(output, list):
+        for item in output:
+            if not isinstance(item, dict):
+                continue
+            if item.get("type") == "message":
+                content = item.get("content") or []
+                if isinstance(content, list):
+                    for part in content:
+                        if isinstance(part, dict) and part.get("text"):
+                            parts.append(str(part["text"]))
+            elif item.get("type") == "output_text" and item.get("text"):
+                parts.append(str(item["text"]))
+            elif item.get("type") in {"compaction", "compaction_summary"}:
+                decoded = decode_shim_compaction_summary(item.get("encrypted_content"))
+                if decoded:
+                    parts.append(decoded)
+    return "\n".join(part for part in parts if part).strip()
+
+
+def compaction_output_item(summary: str, *, item_id: str | None = None) -> dict[str, Any]:
+    now = int(time.time() * 1000)
+    text = summary.strip() or "No prior conversation state was available to compact."
+    return {
+        "id": item_id or f"cmp_{now}",
+        "type": "compaction",
+        "status": "completed",
+        "encrypted_content": encode_shim_compaction_summary(text),
+    }
+
+
+def compaction_item_from_response_payload(payload: dict[str, Any]) -> dict[str, Any] | None:
+    output = payload.get("output")
+    if isinstance(output, list):
+        for raw_item in output:
+            if not isinstance(raw_item, dict):
+                continue
+            item_type = raw_item.get("type")
+            encrypted = raw_item.get("encrypted_content")
+            if item_type in {"compaction", "compaction_summary"} and isinstance(encrypted, str):
+                item = {"type": "compaction", "encrypted_content": encrypted}
+                if raw_item.get("id"):
+                    item["id"] = raw_item["id"]
+                if raw_item.get("status"):
+                    item["status"] = raw_item["status"]
+                return item
+    summary_obj = payload.get("compaction_summary")
+    if isinstance(summary_obj, dict):
+        encrypted = summary_obj.get("encrypted_content")
+        if isinstance(encrypted, str):
+            return {"type": "compaction", "encrypted_content": encrypted}
+    return None
+
+
+def compact_response_payload(model: str, summary: str, usage: Any = None) -> dict[str, Any]:
+    now = int(time.time())
+    response_id = f"resp_compact_{now}"
+    item = compaction_output_item(
+        summary or "No prior conversation state was available to compact.",
+        item_id=f"cmp_{now}",
+    )
+    payload: dict[str, Any] = {
+        "id": response_id,
+        "object": "response",
+        "created_at": now,
+        "status": "completed",
+        "model": model,
+        "output": [item],
+    }
+    if usage is not None:
+        payload["usage"] = usage
+    return payload
