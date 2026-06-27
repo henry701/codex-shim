@@ -9,6 +9,16 @@ and this project does not yet follow semantic versioning (pre-1.0).
 
 ### Fixed
 
+- `codex-shim stop` now terminates orphan listeners when the pid file is stale but
+  `/health` still responds on the default port (uses `ss` when available).
+- `codex-shim doctor` warns when the pid file and port listener disagree.
+- ChatGPT passthrough now forwards Codex client headers (session/thread metadata,
+  `x-codex-*`) to ChatGPT and relays safe upstream response headers back. WebSocket
+  upgrade headers are no longer forwarded to the HTTP upstream. ChatGPT rejects
+  native `previous_response_id`; the shim strips it and replays delta continuations
+  by default (disable with `CODEX_SHIM_CHATGPT_EXPAND_CONTINUATIONS=0`).
+- BYOK routes (`openai-responses`, OpenAI chat, Anthropic) use the same
+  client-header-first forwarding and upstream response header relay.
 - Remote compaction v2 for BYOK/OpenCode models: when Codex appends a terminal
   `compaction_trigger` to `POST /v1/responses`, the shim now runs a compact
   summarization request and streams exactly one `compaction` output item instead
@@ -21,6 +31,11 @@ and this project does not yet follow semantic versioning (pre-1.0).
   tools instead of ending the turn with no feedback.
 
 ### Changed
+
+- Added `scripts/smoke_chatgpt_passthrough.sh` for live validation on an alternate
+  port with trace logging (`CODEX_SHIM_UPSTREAM_HEADER_LOG`,
+  `CODEX_SHIM_PASSTHROUGH_TRACE`).
+- ChatGPT passthrough conversation cache raised from 128 to 1024 responses.
 
 - Desktop catalog picker order now matches alphabetical slug order: `write_catalog`
   assigns ascending `priority` values per tier (BYOK, ChatGPT passthrough, Cursor,

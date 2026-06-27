@@ -648,10 +648,42 @@ picker never shows an option that would 401 on first use. Run `codex login` to
 mint a new token and the entry comes back automatically on the next
 `codex-shim generate`.
 
-The passthrough keeps Codex's native `/v1/responses` payload intact, changes the
-model to `gpt-5.5`, and sends your Codex access token as `Authorization: Bearer
-<access_token>` with the ChatGPT account id from `auth.json` when present. It
-bypasses configured BYOK routes entirely and uses your ChatGPT subscription quota.
+The passthrough forwards Codex request headers wholesale (session/thread metadata,
+`x-codex-*`, etc.), overrides only `Authorization` with your Codex access token,
+rewrites the model slug to the upstream ChatGPT id, and strips
+`previous_response_id` while replaying delta continuations from an in-memory cache
+(ChatGPT's OAuth backend rejects that field). Upstream response headers and usage
+(`cached_tokens` / prefix cache) are logged when
+`CODEX_SHIM_UPSTREAM_HEADER_LOG=1` and relayed back to Codex where applicable.
+
+Debug env knobs:
+
+| Variable | Effect |
+|----------|--------|
+| `CODEX_SHIM_UPSTREAM_HEADER_LOG=1` | Log upstream response headers + usage |
+| `CODEX_SHIM_PASSTHROUGH_TRACE=1` | Log forwarded client headers per ChatGPT request |
+| `CODEX_SHIM_STREAM_LOG=1` | Log SSE/WS event types |
+| `CODEX_SHIM_CHATGPT_EXPAND_CONTINUATIONS=0` | Disable delta replay (ChatGPT 400s on native `previous_response_id`) |
+
+Live smoke test (alternate port, `codex exec` with tool call + cache check):
+
+```bash
+SMOKE_PORT=8766 bash scripts/smoke_chatgpt_passthrough.sh
+```
+
+**Two different caches:** ChatGPT **prefix cache** (`cached_tokens` in upstream usage) is
+server-side and keyed by stable session/thread headers the shim forwards. The shim
+**conversation cache** (1024 responses, in-memory) replays delta continuations because
+ChatGPT's OAuth backend rejects `previous_response_id` (HTTP 400). Expansion is on by
+default and required for multi-turn tool calls; it does not block prefix cache —
+continuation turns often show ~95%+ `cached_tokens` when thread metadata is stable.
+Set `CODEX_SHIM_CHATGPT_EXPAND_CONTINUATIONS=0` only for debugging; continuations
+fail with `Unsupported parameter: previous_response_id`.
+
+It binds stdin closed (`</dev/null`) so `codex exec` does not hang waiting for
+stdin when stdout is captured.
+
+It bypasses configured BYOK routes entirely and uses your ChatGPT subscription quota.
 
 It is already in `.codex-shim/custom_model_catalog.json` after `codex-shim
 generate`. Select `GPT-5.5` in the picker, or run:

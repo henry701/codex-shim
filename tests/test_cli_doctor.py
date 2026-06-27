@@ -93,3 +93,24 @@ def test_doctor_fails_when_enabled_config_uses_legacy_codex_shim_provider(monkey
     assert code == 1
     assert "FAIL" in out
     assert "model_provider is codex_shim" in out
+
+
+def test_doctor_warns_when_health_ok_but_pid_file_is_stale(monkeypatch, tmp_path, capsys):
+    runtime_dir, _codex_home = _patch_cli_paths(monkeypatch, tmp_path)
+    settings = tmp_path / "models.json"
+    settings.write_text(json.dumps({"models": []}))
+    runtime_dir.mkdir(parents=True)
+    monkeypatch.setattr(cli, "_health", lambda port: {"models": 3, "ok": True})
+    monkeypatch.setattr(cli, "_read_pid", lambda: 111)
+    monkeypatch.setattr(cli, "_pid_running", lambda pid: False)
+    monkeypatch.setattr(cli, "_listener_pid", lambda port: 4242)
+    monkeypatch.setattr(cli, "chatgpt_passthrough_available", lambda: False)
+    monkeypatch.setattr(cli, "cursor_passthrough_available", lambda: False)
+
+    code = cli.main(["--settings", str(settings), "doctor"])
+
+    out = capsys.readouterr().out
+    assert code == 0
+    assert "WARN" in out
+    assert "stale pid file" in out
+    assert "4242" in out

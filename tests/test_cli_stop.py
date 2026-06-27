@@ -65,3 +65,21 @@ def test_status_reports_healthy_foreground_service_without_pid(monkeypatch, tmp_
     assert cli.status(8765) == 0
     out = capsys.readouterr().out
     assert "Shim is running on http://127.0.0.1:8765 (12 models)." in out
+
+
+def test_stop_kills_orphan_listener_when_pid_file_is_stale(monkeypatch, tmp_path, capsys):
+    pid_path = tmp_path / "shim.pid"
+    pid_path.write_text("9999")
+    monkeypatch.setattr(cli, "PID_PATH", pid_path)
+    monkeypatch.setattr(cli, "_pid_running", lambda pid: False)
+    monkeypatch.setattr(cli, "_health", lambda port: {"models": 3})
+    monkeypatch.setattr(cli, "_listener_pid", lambda port: 4242)
+    stopped: list[int] = []
+    monkeypatch.setattr(cli, "_stop_pid", lambda pid, port: stopped.append(pid) or True)
+
+    assert cli.stop() == 0
+    assert stopped == [4242]
+    assert not pid_path.exists()
+    err = capsys.readouterr().err
+    assert "Stale pid file" in err
+    assert "4242" in err

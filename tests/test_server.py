@@ -99,7 +99,7 @@ def test_sanitize_chatgpt_passthrough_body_removes_nested_shim_encrypted_content
     assert "encrypted_content" in body["input"][0]["content"][0]
 
 
-def test_sanitize_chatgpt_passthrough_body_removes_previous_response_id_top_level_only():
+def test_sanitize_chatgpt_passthrough_body_keeps_previous_response_id_by_default():
     body = {
         "model": "codex-gpt-5-5",
         "previous_response_id": "resp_previous",
@@ -115,8 +115,20 @@ def test_sanitize_chatgpt_passthrough_body_removes_previous_response_id_top_leve
 
     sanitized = _sanitize_chatgpt_passthrough_body(body)
 
-    assert "previous_response_id" not in sanitized
+    assert sanitized["previous_response_id"] == "resp_previous"
     assert sanitized["metadata"]["previous_response_id"] == "metadata-value"
+
+
+def test_sanitize_chatgpt_passthrough_body_can_strip_previous_response_id_for_legacy_expand():
+    body = {
+        "model": "codex-gpt-5-5",
+        "previous_response_id": "resp_previous",
+        "input": [{"type": "message", "role": "user", "content": "hi"}],
+    }
+
+    sanitized = _sanitize_chatgpt_passthrough_body(body, strip_previous_response_id=True)
+
+    assert "previous_response_id" not in sanitized
     assert body["previous_response_id"] == "resp_previous"
 
 
@@ -242,17 +254,21 @@ async def test_chatgpt_passthrough_requests_advertise_zstd_encoding(monkeypatch,
 
     assert resp.status == 200
     assert captured["url"] == "https://chatgpt.com/backend-api/codex/responses"
-    assert captured["headers"]["Accept-Encoding"] == "zstd, gzip, deflate"
+    assert captured["headers"]["Accept-Encoding"] == "zstd, gzip"
 
     await shim_client.close()
 
 
-async def test_chatgpt_passthrough_drops_previous_response_id(monkeypatch, tmp_path, auth_present):
+async def test_chatgpt_passthrough_strips_previous_response_id_when_expand_disabled(
+    monkeypatch, tmp_path, auth_present
+):
+    monkeypatch.setenv("CODEX_SHIM_CHATGPT_EXPAND_CONTINUATIONS", "0")
     captured = {}
 
     class FakeUpstream:
         status = 200
         content_type = "application/json"
+        headers = {"x-request-id": "req_1"}
 
         async def json(self, content_type=None):
             return {"id": "resp_1", "model": "gpt-5.5", "output": []}
@@ -261,8 +277,9 @@ async def test_chatgpt_passthrough_drops_previous_response_id(monkeypatch, tmp_p
             pass
 
     async def fake_post(self, url, json=None, headers=None):
-        captured["url"] = str(url)
+        captured["url"] = url
         captured["body"] = json
+        captured["headers"] = headers
         return FakeUpstream()
 
     monkeypatch.setattr("codex_shim.server.ClientSession.post", fake_post)
@@ -274,17 +291,21 @@ async def test_chatgpt_passthrough_drops_previous_response_id(monkeypatch, tmp_p
     resp = await shim_client.post(
         "/v1/responses",
         json={"model": "codex-gpt-5-5", "previous_response_id": "resp_previous", "input": "hi"},
+        headers={"session_id": "sess-abc", "x-codex-turn-state": "running"},
     )
 
     assert resp.status == 200
-    assert captured["url"] == "https://chatgpt.com/backend-api/codex/responses"
-    assert captured["body"]["model"] == "gpt-5.5"
-    assert "previous_response_id" not in captured["body"]
+    assert captured["body"]["previous_response_id"] == "resp_previous"
+    assert captured["headers"]["session_id"] == "sess-abc"
+    assert captured["headers"]["x-codex-turn-state"] == "running"
+    assert resp.headers["x-request-id"] == "req_1"
 
     await shim_client.close()
 
 
-async def test_chatgpt_passthrough_expands_previous_response_id(monkeypatch, tmp_path, auth_present):
+async def test_chatgpt_passthrough_expands_previous_response_id_by_default(
+    monkeypatch, tmp_path, auth_present
+):
     captured = []
     first_input = [{"type": "message", "role": "user", "content": "run a command"}]
     tool_call = {
@@ -299,6 +320,7 @@ async def test_chatgpt_passthrough_expands_previous_response_id(monkeypatch, tmp
     class FakeUpstream:
         status = 200
         content_type = "application/json"
+        headers = {}
 
         def __init__(self, payload):
             self.payload = payload
@@ -417,7 +439,7 @@ async def test_chatgpt_compact_passthrough_requests_advertise_zstd_encoding(monk
 
     assert resp.status == 200
     assert captured["url"] == "https://chatgpt.com/backend-api/codex/responses/compact"
-    assert captured["headers"]["Accept-Encoding"] == "zstd, gzip, deflate"
+    assert captured["headers"]["Accept-Encoding"] == "zstd, gzip"
 
     await shim_client.close()
 
@@ -439,6 +461,7 @@ async def test_chatgpt_passthrough_websocket_relays_sse_events(monkeypatch, tmp_
     class FakeUpstream:
         status = 200
         content_type = "text/event-stream"
+        headers = {}
         content = _FakeSseContent(
             [
                 b'data: {"type":"response.created","response":{"id":"resp_1","model":"gpt-5.5"}}\n\n',
@@ -502,6 +525,61 @@ async def test_chatgpt_passthrough_websocket_relays_sse_events(monkeypatch, tmp_
     await shim_client.close()
 
 
+async def test_chatgpt_passthrough_websocket_logs_usage_on_completed(monkeypatch, tmp_path, auth_present):
+    observed = []
+
+    def fake_observe(source, upstream, *, usage=None):
+        observed.append({"source": source, "usage": usage})
+        return {}
+
+    monkeypatch.setattr("codex_shim.server.observe_upstream_response", fake_observe)
+    monkeypatch.setenv("CODEX_SHIM_UPSTREAM_HEADER_LOG", "1")
+
+    class FakeUpstream:
+        status = 200
+        content_type = "text/event-stream"
+        headers = {"x-oai-request-id": "req_ws_usage"}
+        content = _FakeSseContent(
+            [
+                b'data: {"type":"response.created","response":{"id":"resp_1","model":"gpt-5.5"}}\n\n',
+                b'data: {"type":"response.completed","response":{"id":"resp_1","model":"gpt-5.5","status":"completed","usage":{"input_tokens":10,"output_tokens":2,"input_tokens_details":{"cached_tokens":6}}}}\n\n',
+            ]
+        )
+
+        def release(self):
+            pass
+
+    async def fake_post(self, url, json=None, headers=None):
+        return FakeUpstream()
+
+    monkeypatch.setattr("codex_shim.server.ClientSession.post", fake_post)
+    settings = tmp_path / "settings.json"
+    settings.write_text("{}")
+    shim_client = TestClient(TestServer(ShimServer(settings).app()))
+    await shim_client.start_server()
+
+    ws = await shim_client.ws_connect("/v1/responses")
+    await ws.send_json(
+        {
+            "type": "response.create",
+            "model": "codex-gpt-5-5",
+            "input": [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]}],
+            "stream": True,
+        }
+    )
+    for _ in range(2):
+        msg = await ws.receive(timeout=2)
+        assert msg.type == WSMsgType.TEXT
+
+    usage_events = [item for item in observed if item.get("usage")]
+    assert len(usage_events) == 1
+    assert usage_events[0]["source"] == "chatgpt-passthrough-ws"
+    assert usage_events[0]["usage"]["input_tokens_details"]["cached_tokens"] == 6
+
+    await ws.close()
+    await shim_client.close()
+
+
 async def test_chatgpt_passthrough_websocket_expands_previous_response_id(monkeypatch, tmp_path, auth_present):
     captured = []
     first_input = [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "run"}]}]
@@ -517,6 +595,7 @@ async def test_chatgpt_passthrough_websocket_expands_previous_response_id(monkey
     class FakeUpstream:
         status = 200
         content_type = "text/event-stream"
+        headers = {}
 
         def __init__(self, chunks):
             self.content = _FakeSseContent(chunks)

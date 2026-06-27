@@ -457,6 +457,26 @@ def _doctor_daemon(port: int) -> list[DoctorCheck]:
     if health is None:
         checks.append(DoctorCheck("Shim daemon", "WARN", "health endpoint unavailable"))
         return checks
+    listener_pid = _listener_pid(port)
+    if listener_pid is not None:
+        if pid is None or not _pid_running(pid):
+            checks.append(
+                DoctorCheck(
+                    "Shim daemon",
+                    "WARN",
+                    f"stale pid file; port {port} listener is pid {listener_pid}",
+                    "Run codex-shim stop to terminate the orphan, then start again.",
+                )
+            )
+        elif listener_pid != pid:
+            checks.append(
+                DoctorCheck(
+                    "Shim daemon",
+                    "WARN",
+                    f"pid file says {pid} but port {port} listener is pid {listener_pid}",
+                    "Run codex-shim stop to reconcile.",
+                )
+            )
     model_count = _health_model_count(health.get("models"))
     checks.append(DoctorCheck("Shim daemon", "OK" if health.get("ok", True) else "WARN", f"health ok: {model_count} models"))
     for key in ("chatgpt_passthrough", "cursor_passthrough", "auto_router"):
@@ -974,18 +994,41 @@ def _wait_for_pid_exit(pid: int, timeout_s: float) -> bool:
 
 
 def stop() -> int:
+    port = DEFAULT_PORT
     pid = _read_pid()
     if not _pid_running(pid):
+        if _health(port) is not None:
+            orphan_pid = _listener_pid(port)
+            if orphan_pid is None:
+                print(
+                    f"Shim is responding on port {port} but the listener pid could not be determined.",
+                    file=sys.stderr,
+                )
+                return 1
+            print(
+                f"Stale pid file; stopping shim listener on port {port} (pid {orphan_pid}).",
+                file=sys.stderr,
+            )
+            if _stop_pid(orphan_pid, port):
+                PID_PATH.unlink(missing_ok=True)
+                print("Shim stopped.")
+                return 0
+            return 1
         print("Shim is not running.")
         PID_PATH.unlink(missing_ok=True)
         return 0
-    port = DEFAULT_PORT
-    _terminate_pid(pid)
-    if _wait_for_pid_exit(pid, _SHUTDOWN_TERM_WAIT_S):
-        _wait_for_port_free(port, _PORT_FREE_WAIT_S)
+    if _stop_pid(pid, port):
         PID_PATH.unlink(missing_ok=True)
         print("Shim stopped.")
         return 0
+    return 1
+
+
+def _stop_pid(pid: int, port: int) -> bool:
+    _terminate_pid(pid)
+    if _wait_for_pid_exit(pid, _SHUTDOWN_TERM_WAIT_S):
+        _wait_for_port_free(port, _PORT_FREE_WAIT_S)
+        return True
     if os.name != "nt":
         print(
             f"Shim pid {pid} did not exit after SIGTERM; sending SIGKILL.",
@@ -1002,11 +1045,9 @@ def stop() -> int:
         _terminate_pid(pid)
     if _wait_for_pid_exit(pid, _SHUTDOWN_KILL_WAIT_S):
         _wait_for_port_free(port, _PORT_FREE_WAIT_S)
-        PID_PATH.unlink(missing_ok=True)
-        print("Shim stopped.")
-        return 0
+        return True
     print(f"Shim pid {pid} did not exit after SIGKILL.", file=sys.stderr)
-    return 1
+    return False
 
 
 def restore_codex_config() -> None:
@@ -1855,6 +1896,27 @@ def _wait_for_port_free(port: int, timeout_s: float) -> bool:
             return True
         time.sleep(_SHUTDOWN_POLL_INTERVAL_S)
     return _port_is_free(port)
+
+
+def _listener_pid(port: int) -> int | None:
+    if os.name == "nt":
+        return None
+    ss = shutil.which("ss")
+    if not ss:
+        return None
+    try:
+        proc = subprocess.run(
+            [ss, "-tlnp", f"sport = :{port}"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except OSError:
+        return None
+    match = re.search(r"pid=(\d+)", proc.stdout)
+    if match:
+        return int(match.group(1))
+    return None
 
 
 def _health(port: int) -> dict | None:
