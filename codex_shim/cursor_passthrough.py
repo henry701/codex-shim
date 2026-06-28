@@ -7,7 +7,7 @@ import re
 import shutil
 import subprocess
 import time
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Callable, Mapping
 from dataclasses import dataclass
 from typing import Any
 
@@ -187,9 +187,76 @@ def cursor_upstream_model(slug: str) -> str:
     return slug.replace("-", ".")
 
 
-def cursor_workspace() -> str:
+_WORKSPACE_PROMPT_PATTERNS = (
+    re.compile(r"workspace [`'\"](/[^\s`'\"]+)[`'\"]", re.IGNORECASE),
+    re.compile(r"working (?:directory|root|folder)(?: is)?:?\s*[`'\"]?(/[^\s`'\"]+)", re.IGNORECASE),
+    re.compile(r"\bcwd:\s*(/\S+)", re.IGNORECASE),
+    re.compile(r"Current working directory:\s*(/\S+)", re.IGNORECASE),
+)
+
+
+def _extract_workspace_from_text(text: str) -> str | None:
+    for pattern in _WORKSPACE_PROMPT_PATTERNS:
+        match = pattern.search(text or "")
+        if match:
+            path = match.group(1).strip().rstrip(".,;")
+            if path.startswith("/"):
+                return path
+    return None
+
+
+def _workspace_from_mapping(data: Any) -> str | None:
+    if not isinstance(data, dict):
+        return None
+    for key in ("cwd", "working_directory", "workspace", "workspace_root", "working_root"):
+        value = data.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
+def resolve_cursor_workspace(
+    body: dict[str, Any] | None = None,
+    *,
+    request_headers: Mapping[str, str] | None = None,
+    prompt: str | None = None,
+) -> str:
     override = os.environ.get("CODEX_SHIM_CURSOR_WORKSPACE", "").strip()
-    return override or os.getcwd()
+    if override:
+        return override
+    if body is not None:
+        resolved = _workspace_from_mapping(body.get("metadata"))
+        if resolved:
+            return resolved
+    if request_headers is not None:
+        raw = request_headers.get("x-codex-turn-metadata") or request_headers.get("X-Codex-Turn-Metadata")
+        if raw:
+            try:
+                parsed = json.loads(raw)
+            except json.JSONDecodeError:
+                parsed = None
+            resolved = _workspace_from_mapping(parsed)
+            if resolved:
+                return resolved
+    if body is not None:
+        instructions = body.get("instructions")
+        if isinstance(instructions, str):
+            resolved = _extract_workspace_from_text(instructions)
+            if resolved:
+                return resolved
+    if prompt:
+        resolved = _extract_workspace_from_text(prompt)
+        if resolved:
+            return resolved
+    if body is not None and prompt is None:
+        resolved = _extract_workspace_from_text(build_cursor_prompt(body))
+        if resolved:
+            return resolved
+    return os.getcwd()
+
+
+def cursor_workspace() -> str:
+    return resolve_cursor_workspace()
 
 
 def cursor_passthrough_display_names() -> dict[str, str]:
@@ -453,8 +520,14 @@ def _format_edit_started(payload: dict[str, Any]) -> str:
 
 
 def _format_shell_started(payload: dict[str, Any]) -> str:
+    from .cursor_bridge import is_bridge_shell_command, parse_bridge_tool_from_shell
+
     args = payload.get("args") or {}
     command = str(args.get("command") or args.get("cmd") or args.get("script") or "")
+    if command and is_bridge_shell_command(command):
+        tool = parse_bridge_tool_from_shell(command)
+        if tool:
+            return f"→ Codex tool: `{tool}`"
     if command:
         return f"`{_preview_text(command)}`"
     return "`(command)`"
@@ -823,12 +896,19 @@ class CursorStreamParser:
 class CursorResponseCollector:
     """Accumulate normalized cursor events into Responses ``output`` items."""
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        tool_types: dict[str, str] | None = None,
+        tool_resolve: dict[str, tuple[str | None, str]] | None = None,
+    ) -> None:
         self.output: list[dict[str, Any]] = []
         self._current_message = ""
         self._tool_reasoning: dict[str, str] = {}
         self._thinking_buffer = ""
         self._next_id = 0
+        self._tool_types = tool_types or {}
+        self._tool_resolve = tool_resolve or {}
 
     def consume(self, event: dict[str, Any]) -> None:
         event_type = event.get("type")
@@ -911,6 +991,37 @@ class CursorResponseCollector:
             "content": [{"type": "output_text", "text": text, "annotations": []}],
         }
 
+    def append_function_call(
+        self,
+        *,
+        name: str,
+        arguments: dict[str, Any],
+        call_id: str,
+        namespace: str | None = None,
+        chat_name: str | None = None,
+        tool_types: dict[str, str] | None = None,
+        tool_resolve: dict[str, tuple[str | None, str]] | None = None,
+    ) -> None:
+        from .translate import function_call_item_from_chat_tool, upstream_chat_tool_name
+
+        self._flush_thinking()
+        self._flush_message()
+        resolved_tool_types = tool_types if tool_types is not None else self._tool_types
+        resolved_tool_resolve = tool_resolve if tool_resolve is not None else self._tool_resolve
+        fn_name = chat_name or (
+            upstream_chat_tool_name(namespace, name) if namespace else name
+        )
+        call = {
+            "id": call_id,
+            "function": {
+                "name": fn_name,
+                "arguments": json.dumps(arguments, separators=(",", ":")),
+            },
+        }
+        self.output.append(
+            function_call_item_from_chat_tool(call, resolved_tool_types, resolved_tool_resolve)
+        )
+
 
 def replay_cursor_ndjson(
     lines: list[str] | str,
@@ -930,8 +1041,14 @@ def replay_cursor_ndjson(
     return events, parser, collector
 
 
-async def iter_cursor_agent_events(prompt: str, model: str) -> AsyncIterator[dict[str, Any]]:
+async def iter_cursor_agent_events(
+    prompt: str,
+    model: str,
+    *,
+    workspace: str | None = None,
+) -> AsyncIterator[dict[str, Any]]:
     """Spawn cursor-agent and yield normalized stream events."""
+    resolved_workspace = workspace or cursor_workspace()
     cmd = [
         _cursor_agent_bin(),
         "--print",
@@ -941,7 +1058,7 @@ async def iter_cursor_agent_events(prompt: str, model: str) -> AsyncIterator[dic
         "--force",
         "--trust",
         "--workspace",
-        cursor_workspace(),
+        resolved_workspace,
         "--model",
         model,
     ]

@@ -19,12 +19,24 @@ from aiohttp import ClientError, ClientSession, ClientTimeout, WSMsgType, web
 
 from .compaction import (
     CompactionTriggerError,
+    SHIM_COMPACTION_PREFIX,
     compact_response_payload,
     compaction_item_from_response_payload,
     compaction_output_item,
     compaction_summary_from_output,
     decode_shim_compaction_summary,
     strip_terminal_compaction_trigger,
+)
+from .cursor_bridge import (
+    BridgeError,
+    BridgeToolNotAllowedError,
+    CursorBridgeSession,
+    build_bridge_suffix,
+    bridge_allowed_tools,
+    cursor_bridge_enabled,
+    cursor_bridge_registry,
+    is_loopback_peer,
+    shim_port_from_request_host,
 )
 from .cursor_passthrough import (
     CURSOR_MODEL_SLUG,
@@ -35,6 +47,7 @@ from .cursor_passthrough import (
     cursor_upstream_model,
     is_cursor_passthrough_slug,
     iter_cursor_agent_events,
+    resolve_cursor_workspace,
 )
 from .catalog import sort_catalog_entries
 from . import router as router_module
@@ -168,6 +181,7 @@ class ShimServer:
         app.router.add_get("/picker", self.picker_page)
         app.router.add_get("/api/models", self.api_models)
         app.router.add_post("/api/switch", self.switch_model)
+        app.router.add_post("/_cursor_bridge/v1/invoke", self.cursor_bridge_invoke)
         return app
 
     async def _on_startup(self, _app: web.Application) -> None:
@@ -1519,61 +1533,169 @@ class ShimServer:
         slug = response_model_override or CURSOR_MODEL_SLUG
         upstream = upstream_model or cursor_upstream_model(slug)
         prompt = build_cursor_prompt(body)
+        cursor_workspace_path = resolve_cursor_workspace(
+            body,
+            request_headers=dict(request.headers),
+            prompt=prompt,
+        )
         stream = bool(body.get("stream")) and not force_non_stream
+        tool_types = responses_tool_type_map(body.get("tools"))
+        tool_resolve = responses_tool_resolve_map(body.get("tools"))
+        bridge_session: CursorBridgeSession | None = None
 
-        if not stream:
-            collector = CursorResponseCollector()
-            usage: dict[str, Any] | None = None
-            fallback_text = ""
-            async for event in iter_cursor_agent_events(prompt, upstream):
-                if event["type"] == "completed":
-                    fallback_text = str(event.get("text") or fallback_text)
-                elif event["type"] == "usage":
-                    usage = event.get("usage") if isinstance(event.get("usage"), dict) else None
-                elif event["type"] == "error":
-                    raise web.HTTPBadGateway(text=str(event.get("message") or "cursor-agent failed"))
-                else:
-                    collector.consume(event)
-            output = collector.build_output(fallback_text=fallback_text)
-            payload: dict[str, Any] = {
-                "id": f"resp_{int(time.time() * 1000)}",
-                "object": "response",
-                "model": slug,
-                "status": "completed",
-                "output": output,
-            }
-            normalized_usage = normalize_responses_usage(usage)
-            if normalized_usage:
-                payload["usage"] = normalized_usage
-            return web.json_response(payload)
+        if cursor_bridge_enabled() and body.get("tools"):
+            allowed = bridge_allowed_tools(body)
+            if allowed:
+                port = shim_port_from_request_host(request.headers.get("Host", ""))
+                bridge_session = CursorBridgeSession.create(
+                    allowed_tools=allowed,
+                    tool_types=tool_types,
+                    tool_resolve=tool_resolve,
+                )
+                await cursor_bridge_registry.register(bridge_session)
+                prompt += "\n\n" + build_bridge_suffix(
+                    bridge_session,
+                    port,
+                    workspace=cursor_workspace_path,
+                )
 
-        response = _sse_response()
-        await response.prepare(request)
-        state = ResponsesStreamState(slug)
         try:
-            await state.start(response)
-            async for event in iter_cursor_agent_events(prompt, upstream):
-                if event["type"] == "usage":
-                    normalized_usage = normalize_responses_usage(event.get("usage"))
-                    if normalized_usage:
-                        state.usage = normalized_usage
-                elif event["type"] == "error":
-                    message = str(event.get("message") or "cursor-agent failed")
-                    await state.fail(response, message, code="upstream_error")
-                    break
-                else:
-                    await _apply_cursor_stream_event(state, response, event)
-            await state.finish(response, upstream_saw_done=True)
-        except ClientDisconnected:
-            pass
-        except Exception as exc:
-            print(f"[err] cursor passthrough {slug}: {exc}", flush=True)
-            raise web.HTTPBadGateway(text=str(exc)) from exc
+            if not stream:
+                collector = CursorResponseCollector(
+                    tool_types=tool_types,
+                    tool_resolve=tool_resolve,
+                )
+                if bridge_session is not None:
+                    bridge_session.attach_collector(collector)
+                usage: dict[str, Any] | None = None
+                fallback_text = ""
+                async for event in iter_cursor_agent_events(
+                    prompt,
+                    upstream,
+                    workspace=cursor_workspace_path,
+                ):
+                    if event["type"] == "completed":
+                        fallback_text = str(event.get("text") or fallback_text)
+                    elif event["type"] == "usage":
+                        usage = event.get("usage") if isinstance(event.get("usage"), dict) else None
+                    elif event["type"] == "error":
+                        raise web.HTTPBadGateway(text=str(event.get("message") or "cursor-agent failed"))
+                    else:
+                        collector.consume(event)
+                output = collector.build_output(fallback_text=fallback_text)
+                payload: dict[str, Any] = {
+                    "id": f"resp_{int(time.time() * 1000)}",
+                    "object": "response",
+                    "model": slug,
+                    "status": "completed",
+                    "output": output,
+                }
+                normalized_usage = normalize_responses_usage(usage)
+                if normalized_usage:
+                    payload["usage"] = normalized_usage
+                return web.json_response(payload)
+
+            response = _sse_response()
+            await response.prepare(request)
+            state = ResponsesStreamState(slug, tool_types=tool_types, tool_resolve=tool_resolve)
+            if bridge_session is not None:
+
+                async def _stream_emit(
+                    *,
+                    name: str,
+                    arguments: dict[str, Any],
+                    call_id: str,
+                    namespace: str | None = None,
+                    chat_name: str | None = None,
+                ) -> None:
+                    await state.emit_synthetic_function_call(
+                        response,
+                        name=name,
+                        arguments=arguments,
+                        call_id=call_id,
+                        namespace=namespace,
+                        chat_name=chat_name,
+                    )
+
+                bridge_session.attach_stream(_stream_emit)
+            try:
+                await state.start(response)
+                async for event in iter_cursor_agent_events(
+                    prompt,
+                    upstream,
+                    workspace=cursor_workspace_path,
+                ):
+                    if event["type"] == "usage":
+                        normalized_usage = normalize_responses_usage(event.get("usage"))
+                        if normalized_usage:
+                            state.usage = normalized_usage
+                    elif event["type"] == "error":
+                        message = str(event.get("message") or "cursor-agent failed")
+                        await state.fail(response, message, code="upstream_error")
+                        break
+                    else:
+                        await _apply_cursor_stream_event(state, response, event)
+                await state.finish(response, upstream_saw_done=True)
+            except ClientDisconnected:
+                pass
+            except Exception as exc:
+                print(f"[err] cursor passthrough {slug}: {exc}", flush=True)
+                raise web.HTTPBadGateway(text=str(exc)) from exc
+            try:
+                await response.write_eof()
+            except Exception:
+                pass
+            return response
+        finally:
+            if bridge_session is not None:
+                cursor_bridge_registry.close(bridge_session.bridge_id)
+
+    async def cursor_bridge_invoke(self, request: web.Request) -> web.Response:
+        if not is_loopback_peer(request.remote):
+            raise web.HTTPForbidden(text="Forbidden: bridge invoke requires loopback peer")
         try:
-            await response.write_eof()
-        except Exception:
-            pass
-        return response
+            payload = await request.json()
+        except json.JSONDecodeError as exc:
+            raise web.HTTPBadRequest(text="Invalid JSON body") from exc
+        if not isinstance(payload, dict):
+            raise web.HTTPBadRequest(text="JSON body must be an object")
+
+        bridge_id = str(payload.get("bridge") or "").strip()
+        tool = str(payload.get("tool") or "").strip()
+        arguments = payload.get("arguments")
+        namespace_raw = payload.get("namespace")
+        namespace = str(namespace_raw).strip() if namespace_raw is not None else None
+        if namespace == "":
+            namespace = None
+
+        if not bridge_id:
+            raise web.HTTPBadRequest(text="bridge is required")
+        if not tool:
+            raise web.HTTPBadRequest(text="tool is required")
+        if not isinstance(arguments, dict):
+            raise web.HTTPBadRequest(text="arguments must be a JSON object")
+
+        session = cursor_bridge_registry.get(bridge_id)
+        if session is None:
+            raise web.HTTPNotFound(text="Unknown or expired bridge session")
+
+        try:
+            result = await session.invoke(
+                tool=tool,
+                arguments=arguments,
+                namespace=namespace,
+            )
+        except BridgeToolNotAllowedError as exc:
+            raise web.HTTPBadRequest(text=str(exc)) from exc
+        except BridgeError as exc:
+            raise web.HTTPBadRequest(text=str(exc)) from exc
+
+        print(
+            f"[cursor-bridge] invoke bridge={bridge_id} tool={tool} namespace={namespace or '-'} "
+            f"call_id={result.get('codex_call_id')}",
+            flush=True,
+        )
+        return web.json_response(result)
 
     # ------------------------------------------------------------------
     # Auto Router
@@ -2352,15 +2474,37 @@ def _sanitize_chatgpt_passthrough_value(value: Any) -> Any:
     if isinstance(value, dict):
         if value.get("type") == "reasoning" and _has_shim_encrypted_content(value):
             return _DROP_ITEM
+        if value.get("type") == "compaction":
+            replaced = _replace_shim_compaction_for_chatgpt(value)
+            if replaced is not None:
+                return replaced
         output = {}
         for key, item in value.items():
-            if key == "encrypted_content" and isinstance(item, str) and item.startswith(SHIM_ENCRYPTED_CONTENT_PREFIX):
+            if key == "encrypted_content" and isinstance(item, str) and _is_shim_opaque_encrypted_content(item):
                 continue
             sanitized = _sanitize_chatgpt_passthrough_value(item)
             if sanitized is not _DROP_ITEM:
                 output[key] = sanitized
         return output
     return value
+
+
+def _is_shim_opaque_encrypted_content(value: str) -> bool:
+    return value.startswith(SHIM_ENCRYPTED_CONTENT_PREFIX) or value.startswith(SHIM_COMPACTION_PREFIX)
+
+
+def _replace_shim_compaction_for_chatgpt(value: dict[str, Any]) -> Any:
+    encrypted = value.get("encrypted_content")
+    if not isinstance(encrypted, str) or not encrypted.startswith(SHIM_COMPACTION_PREFIX):
+        return None
+    summary = decode_shim_compaction_summary(encrypted)
+    if not summary:
+        return _DROP_ITEM
+    return {
+        "type": "message",
+        "role": "developer",
+        "content": [{"type": "input_text", "text": f"Compacted conversation state:\n{summary}"}],
+    }
 
 
 def _has_shim_encrypted_content(value: dict[str, Any]) -> bool:
@@ -3586,6 +3730,30 @@ class ResponsesStreamState:
                 "delta": text,
             },
         )
+
+    async def emit_synthetic_function_call(
+        self,
+        response: web.StreamResponse,
+        *,
+        name: str,
+        arguments: dict[str, Any],
+        call_id: str,
+        namespace: str | None = None,
+        chat_name: str | None = None,
+    ) -> None:
+        await self.close_cursor_thinking_activity(response)
+        await self.close_message_segment(response)
+        lookup_name = chat_name or name
+        state = await self._open_tool(
+            response,
+            key=call_id,
+            call_id=call_id,
+            name=name,
+            namespace=namespace,
+        )
+        state["output_type"] = _responses_output_type_for_tool(lookup_name, self.tool_types)
+        state["arguments"] = json.dumps(arguments, separators=(",", ":"))
+        await self._close_tool(response, state)
 
     async def _open_tool(
         self,

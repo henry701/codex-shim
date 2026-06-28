@@ -732,6 +732,11 @@ Unknown tools are shown as JSON-fenced blocks for transparency. See
 [`docs/cursor-agent-tools.md`](docs/cursor-agent-tools.md) for the tool catalog,
 capture scripts, and how to refresh fixtures.
 
+When Codex sends tools in the request, the shim also appends a **bridge suffix**
+so Composer can forward those tools back as real Codex `function_call` items via
+a loopback curl API (Goals, `update_plan`, etc.). See
+[`docs/cursor-bridge.md`](docs/cursor-bridge.md).
+
 ---
 
 ## How routing works

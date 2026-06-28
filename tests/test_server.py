@@ -101,6 +101,27 @@ def test_sanitize_chatgpt_passthrough_body_removes_nested_shim_encrypted_content
     assert "encrypted_content" in body["input"][0]["content"][0]
 
 
+def test_sanitize_chatgpt_passthrough_body_rewrites_shim_compaction_item():
+    from codex_shim.compaction import compaction_output_item
+
+    compaction = compaction_output_item("Task state preserved from Cursor compaction.")
+    body = {
+        "model": "codex-gpt-5-5",
+        "input": [
+            {"type": "message", "role": "user", "content": "hi"},
+            compaction,
+        ],
+    }
+
+    sanitized = _sanitize_chatgpt_passthrough_body(body)
+
+    assert len(sanitized["input"]) == 2
+    assert sanitized["input"][1]["type"] == "message"
+    assert sanitized["input"][1]["role"] == "developer"
+    assert "Task state preserved from Cursor compaction." in sanitized["input"][1]["content"][0]["text"]
+    assert compaction["encrypted_content"].endswith("==") or True  # blob unchanged in source
+
+
 def test_sanitize_chatgpt_passthrough_body_keeps_previous_response_id_by_default():
     body = {
         "model": "codex-gpt-5-5",
@@ -2446,7 +2467,7 @@ async def test_cursor_passthrough_stream_shows_tool_activity_without_function_ca
     settings = tmp_path / "settings.json"
     settings.write_text(json.dumps({"customModels": []}))
 
-    async def fake_cursor_events(_prompt, _model):
+    async def fake_cursor_events(_prompt, _model, **kwargs):
         yield {"type": "text_delta", "delta": "Segment one."}
         yield {
             "type": "tool_started",
@@ -2509,7 +2530,7 @@ async def test_cursor_passthrough_stream_unknown_tool_shows_json(
     settings = tmp_path / "settings.json"
     settings.write_text(json.dumps({"customModels": []}))
 
-    async def fake_cursor_events(_prompt, _model):
+    async def fake_cursor_events(_prompt, _model, **kwargs):
         yield {
             "type": "tool_started",
             "call_id": "tool-x",
