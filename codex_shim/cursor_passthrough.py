@@ -7,7 +7,7 @@ import re
 import shutil
 import subprocess
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
 from typing import Any
 
@@ -344,6 +344,31 @@ def _assistant_is_segment_boundary(obj: dict[str, Any]) -> bool:
 
 
 CURSOR_TOOL_RESULT_MAX_CHARS = 4096
+CURSOR_TOOL_JSON_MAX_CHARS = 4096
+_CURSOR_TOOL_NOISE_KEYS = frozenset(
+    {
+        "hookAdditionalContexts",
+        "toolCallId",
+        "startedAtMs",
+        "completedAtMs",
+        "parsingResult",
+        "conversationId",
+        "closeStdin",
+        "fileOutputThresholdBytes",
+        "hardTimeout",
+        "hasInputRedirect",
+        "hasOutputRedirect",
+        "isBackground",
+        "skipApproval",
+        "timeoutBehavior",
+        "simpleCommands",
+    }
+)
+
+
+def _cursor_tool_verbose_json() -> bool:
+    env = os.environ.get("CODEX_SHIM_CURSOR_TOOL_VERBOSE", "")
+    return env.lower() in {"1", "true", "yes", "on"}
 
 
 def _truncate_cursor_text(text: str, *, limit: int = CURSOR_TOOL_RESULT_MAX_CHARS) -> str:
@@ -352,52 +377,218 @@ def _truncate_cursor_text(text: str, *, limit: int = CURSOR_TOOL_RESULT_MAX_CHAR
     return f"{text[:limit]}\n… ({len(text)} chars truncated)"
 
 
+def _strip_tool_noise(value: Any, *, verbose: bool) -> Any:
+    if isinstance(value, dict):
+        out: dict[str, Any] = {}
+        for key, item in value.items():
+            if not verbose and key in _CURSOR_TOOL_NOISE_KEYS:
+                continue
+            out[key] = _strip_tool_noise(item, verbose=verbose)
+        return out
+    if isinstance(value, list):
+        return [_strip_tool_noise(item, verbose=verbose) for item in value]
+    return value
+
+
+def _format_cursor_tool_json(payload: dict[str, Any]) -> str:
+    verbose = _cursor_tool_verbose_json()
+    cleaned = _strip_tool_noise(payload, verbose=verbose)
+    text = json.dumps(cleaned, ensure_ascii=False, indent=2)
+    return _truncate_cursor_text(text, limit=CURSOR_TOOL_JSON_MAX_CHARS)
+
+
+def _cursor_tool_payload(tool_body: dict[str, Any]) -> tuple[str | None, dict[str, Any] | None]:
+    if "function" in tool_body and isinstance(tool_body.get("function"), dict):
+        return "function", tool_body["function"]
+    for key, value in tool_body.items():
+        if key in {"hookAdditionalContexts", "toolCallId", "startedAtMs", "completedAtMs"}:
+            continue
+        if isinstance(value, dict) and ("args" in value or "result" in value or key.endswith("ToolCall")):
+            return key, value
+    return None, None
+
+
+def _path_from_args(args: dict[str, Any]) -> str:
+    return str(args.get("path") or args.get("targetDirectory") or "?")
+
+
+def _preview_text(value: str, *, limit: int = 240) -> str:
+    if not value:
+        return ""
+    return _truncate_cursor_text(value, limit=limit).replace("\n", " ")
+
+
+@dataclass(frozen=True)
+class CursorToolSpec:
+    kind: str
+    format_started: Callable[[dict[str, Any]], str]
+    format_result: Callable[[dict[str, Any]], str] | None = None
+
+
+def _format_read_started(payload: dict[str, Any]) -> str:
+    args = payload.get("args") or {}
+    path = str(args.get("path") or "?")
+    limit = args.get("limit")
+    if limit is not None:
+        return f"`{path}` (limit={limit})"
+    return f"`{path}`"
+
+
+def _format_write_started(payload: dict[str, Any]) -> str:
+    args = payload.get("args") or {}
+    path = str(args.get("path") or "?")
+    preview = _preview_text(str(args.get("fileText") or ""))
+    if preview:
+        return f"`{path}` — {preview}"
+    return f"`{path}`"
+
+
+def _format_edit_started(payload: dict[str, Any]) -> str:
+    args = payload.get("args") or {}
+    path = str(args.get("path") or "?")
+    preview = _preview_text(str(args.get("streamContent") or args.get("patch") or ""))
+    if preview:
+        return f"`{path}` — {preview}"
+    return f"`{path}`"
+
+
+def _format_shell_started(payload: dict[str, Any]) -> str:
+    args = payload.get("args") or {}
+    command = str(args.get("command") or args.get("cmd") or args.get("script") or "")
+    if command:
+        return f"`{_preview_text(command)}`"
+    return "`(command)`"
+
+
+def _format_delete_started(payload: dict[str, Any]) -> str:
+    return f"`{_path_from_args(payload.get('args') or {})}`"
+
+
+def _format_glob_started(payload: dict[str, Any]) -> str:
+    args = payload.get("args") or {}
+    pattern = str(args.get("globPattern") or args.get("pattern") or "*")
+    directory = str(args.get("targetDirectory") or args.get("path") or ".")
+    return f"`{pattern}` in `{directory}`"
+
+
+def _format_grep_started(payload: dict[str, Any]) -> str:
+    args = payload.get("args") or {}
+    pattern = str(args.get("pattern") or "?")
+    path = str(args.get("path") or ".")
+    return f"`{_preview_text(pattern)}` in `{path}`"
+
+
+def _format_function_started(payload: dict[str, Any]) -> str:
+    name = str(payload.get("name") or "tool")
+    args = str(payload.get("arguments") or "")
+    return f"`{_preview_text(args)}`"
+
+
+def _format_glob_result(payload: dict[str, Any]) -> str:
+    result = payload.get("result") or {}
+    success = result.get("success") if isinstance(result, dict) else None
+    if not isinstance(success, dict):
+        return ""
+    files = success.get("files") or success.get("paths") or success.get("matches")
+    if isinstance(files, list):
+        lines = [str(item) for item in files[:20]]
+        if len(files) > 20:
+            lines.append(f"… ({len(files)} files total)")
+        return "\n".join(lines)
+    total = success.get("totalFiles")
+    if total is not None:
+        return f"{total} file(s) matched"
+    return ""
+
+
+def _format_grep_result(payload: dict[str, Any]) -> str:
+    result = payload.get("result") or {}
+    success = result.get("success") if isinstance(result, dict) else None
+    if not isinstance(success, dict):
+        return ""
+    lines: list[str] = []
+    workspace_results = success.get("workspaceResults")
+    if isinstance(workspace_results, dict):
+        for _root, entry in workspace_results.items():
+            if not isinstance(entry, dict):
+                continue
+            content = entry.get("content")
+            if not isinstance(content, dict):
+                continue
+            matches = content.get("matches")
+            if not isinstance(matches, list):
+                continue
+            for file_match in matches:
+                if not isinstance(file_match, dict):
+                    continue
+                file_path = str(file_match.get("file") or "?")
+                file_lines = file_match.get("matches")
+                if isinstance(file_lines, list) and file_lines:
+                    first = file_lines[0]
+                    if isinstance(first, dict):
+                        line_no = first.get("lineNumber")
+                        snippet = str(first.get("content") or "").strip()
+                        prefix = f"{file_path}:{line_no}" if line_no is not None else file_path
+                        lines.append(f"{prefix}: {_preview_text(snippet, limit=120)}")
+                    else:
+                        lines.append(file_path)
+                else:
+                    lines.append(file_path)
+    if lines:
+        return "\n".join(lines[:20])
+    pattern = success.get("pattern")
+    if pattern:
+        return f"pattern `{pattern}` — no matches"
+    return ""
+
+
+CURSOR_TOOL_SPECS: dict[str, CursorToolSpec] = {
+    "readToolCall": CursorToolSpec("read", _format_read_started),
+    "writeToolCall": CursorToolSpec("write", _format_write_started),
+    "editToolCall": CursorToolSpec("edit", _format_edit_started),
+    "deleteToolCall": CursorToolSpec("delete", _format_delete_started),
+    "globToolCall": CursorToolSpec("glob", _format_glob_started, _format_glob_result),
+    "grepToolCall": CursorToolSpec("grep", _format_grep_started, _format_grep_result),
+    "shellToolCall": CursorToolSpec("shell", _format_shell_started),
+    "runTerminalCommand": CursorToolSpec("shell", _format_shell_started),
+    "bashToolCall": CursorToolSpec("shell", _format_shell_started),
+    "terminalToolCall": CursorToolSpec("shell", _format_shell_started),
+}
+
+
 def _cursor_tool_body(tool_call: dict[str, Any]) -> dict[str, Any]:
     body = tool_call.get("tool_call")
     return body if isinstance(body, dict) else tool_call
 
 
-def _cursor_tool_kind_and_detail(tool_body: dict[str, Any]) -> tuple[str, str]:
-    if "readToolCall" in tool_body:
-        args = (tool_body["readToolCall"] or {}).get("args") or {}
-        path = str(args.get("path") or "?")
-        return "read", f"`{path}`"
-    if "writeToolCall" in tool_body:
-        args = (tool_body["writeToolCall"] or {}).get("args") or {}
-        path = str(args.get("path") or "?")
-        preview = str(args.get("fileText") or "")
-        if preview:
-            preview = _truncate_cursor_text(preview, limit=240).replace("\n", " ")
-            return "write", f"`{path}` — {preview}"
-        return "write", f"`{path}`"
-    if "editToolCall" in tool_body:
-        args = (tool_body["editToolCall"] or {}).get("args") or {}
-        path = str(args.get("path") or "?")
-        preview = str(args.get("streamContent") or args.get("patch") or "")
-        if preview:
-            preview = _truncate_cursor_text(preview, limit=240).replace("\n", " ")
-            return "edit", f"`{path}` — {preview}"
-        return "edit", f"`{path}`"
-    for shell_key in ("shellToolCall", "runTerminalCommand", "bashToolCall", "terminalToolCall"):
-        if shell_key in tool_body:
-            args = (tool_body[shell_key] or {}).get("args") or {}
-            command = str(args.get("command") or args.get("cmd") or args.get("script") or "")
-            if command:
-                return "shell", f"`{_truncate_cursor_text(command, limit=240)}`"
-            return "shell", "`(command)`"
-    if "function" in tool_body:
-        fn = tool_body["function"] or {}
-        name = str(fn.get("name") or "tool")
-        args = str(fn.get("arguments") or "")
-        return name, f"`{_truncate_cursor_text(args, limit=240)}`"
+def _cursor_tool_kind_and_detail(tool_body: dict[str, Any]) -> tuple[str, str, bool]:
+    """Return (kind, detail, known)."""
+    tool_key, payload = _cursor_tool_payload(tool_body)
+    if tool_key == "function" and payload is not None:
+        name = str(payload.get("name") or "tool")
+        return name, _format_function_started(payload), True
+    if tool_key is not None and payload is not None:
+        spec = CURSOR_TOOL_SPECS.get(tool_key)
+        if spec is not None:
+            return spec.kind, spec.format_started(payload), True
+        label = re.sub(r"ToolCall$", "", tool_key, flags=re.IGNORECASE).lower() or "tool"
+        return label, f"`{tool_key}`", False
     if tool_body:
         key = next(iter(tool_body))
         label = re.sub(r"ToolCall$", "", key, flags=re.IGNORECASE).lower() or "tool"
-        return label, f"`{key}`"
-    return "tool", "`(unknown)`"
+        return label, f"`{key}`", False
+    return "tool", "`(unknown)`", False
 
 
 def _cursor_tool_result_text(tool_body: dict[str, Any]) -> str:
+    tool_key, payload = _cursor_tool_payload(tool_body)
+    if tool_key is not None and payload is not None:
+        spec = CURSOR_TOOL_SPECS.get(tool_key)
+        if spec is not None and spec.format_result is not None:
+            formatted = spec.format_result(payload)
+            if formatted:
+                return _truncate_cursor_text(formatted)
+
     def _walk(value: Any) -> str:
         if isinstance(value, str) and value.strip():
             return value
@@ -422,11 +613,17 @@ def _cursor_tool_result_text(tool_body: dict[str, Any]) -> str:
             return "\n".join(part for part in parts if part)
         return ""
 
-    for key in tool_body:
-        payload = tool_body.get(key)
-        if not isinstance(payload, dict):
-            continue
+    if payload is not None:
         result = payload.get("result")
+        if result is not None:
+            text = _walk(result)
+            if text:
+                return _truncate_cursor_text(text)
+    for key in tool_body:
+        nested_payload = tool_body.get(key)
+        if not isinstance(nested_payload, dict):
+            continue
+        result = nested_payload.get("result")
         if result is not None:
             text = _walk(result)
             if text:
@@ -434,16 +631,52 @@ def _cursor_tool_result_text(tool_body: dict[str, Any]) -> str:
     return ""
 
 
+def _format_unknown_tool_markdown(tool_body: dict[str, Any], *, phase: str) -> str:
+    tool_key, payload = _cursor_tool_payload(tool_body)
+    body: dict[str, Any] = {"tool": tool_key or "unknown", "phase": phase}
+    if isinstance(payload, dict):
+        args = payload.get("args")
+        if isinstance(args, dict):
+            body["args"] = args
+        if phase == "completed":
+            result = payload.get("result")
+            if result is not None:
+                body["result"] = result
+    elif tool_body:
+        body["raw"] = tool_body
+    return (
+        "**cursor-agent · unknown**\n\n"
+        f"```json\n{_format_cursor_tool_json(body)}\n```\n"
+    )
+
+
 def format_cursor_tool_started_markdown(tool_call: dict[str, Any]) -> str:
-    kind, detail = _cursor_tool_kind_and_detail(_cursor_tool_body(tool_call))
+    body = _cursor_tool_body(tool_call)
+    kind, detail, known = _cursor_tool_kind_and_detail(body)
+    if not known:
+        return _format_unknown_tool_markdown(body, phase="started")
     return f"**cursor-agent · {kind}**\n\n> {detail}\n"
 
 
 def format_cursor_tool_completed_markdown(tool_call: dict[str, Any]) -> str:
-    result = _cursor_tool_result_text(_cursor_tool_body(tool_call))
+    body = _cursor_tool_body(tool_call)
+    kind, _, known = _cursor_tool_kind_and_detail(body)
+    if not known:
+        return "\n" + _format_unknown_tool_markdown(body, phase="completed")
+    result = _cursor_tool_result_text(body)
     if not result:
         return "\n**Result**\n\n_(completed)_\n"
     return f"\n**Result**\n\n```\n{result}\n```\n"
+
+
+def cursor_tool_display_kind(tool_call: dict[str, Any]) -> str:
+    kind, _, _ = _cursor_tool_kind_and_detail(_cursor_tool_body(tool_call))
+    return kind
+
+
+def cursor_tool_is_known(tool_call: dict[str, Any]) -> bool:
+    _, _, known = _cursor_tool_kind_and_detail(_cursor_tool_body(tool_call))
+    return known
 
 
 def format_cursor_thinking_markdown(text: str) -> str:

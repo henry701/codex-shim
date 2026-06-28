@@ -14,7 +14,6 @@ from codex_shim.cursor_passthrough import (
     iter_cursor_agent_events,
 )
 
-
 def test_parse_cursor_list_models_output():
     models = _parse_cursor_list_models_output(
         "auto - Auto\ncomposer-2.5 - Composer 2.5\ngpt-5.3-codex - Codex 5.3\n"
@@ -170,6 +169,74 @@ def test_format_cursor_tool_completed_markdown():
     )
     assert "**Result**" in markdown
     assert "file body" in markdown
+
+
+def test_delete_tool_call_markdown():
+    started = format_cursor_tool_started_markdown(
+        {"tool_call": {"deleteToolCall": {"args": {"path": "/tmp/to-delete.txt"}}}}
+    )
+    assert "**cursor-agent · delete**" in started
+    assert "to-delete.txt" in started
+
+
+def test_glob_tool_call_markdown():
+    started = format_cursor_tool_started_markdown(
+        {
+            "tool_call": {
+                "globToolCall": {
+                    "args": {"globPattern": "**/*.txt", "targetDirectory": "/workspace"},
+                }
+            }
+        }
+    )
+    assert "**cursor-agent · glob**" in started
+    assert "**/*.txt" in started
+    assert "/workspace" in started
+
+
+def test_grep_tool_call_markdown():
+    started = format_cursor_tool_started_markdown(
+        {
+            "tool_call": {
+                "grepToolCall": {
+                    "args": {"pattern": "TOKEN", "path": "/workspace"},
+                }
+            }
+        }
+    )
+    assert "**cursor-agent · grep**" in started
+    assert "TOKEN" in started
+
+
+def test_unknown_tool_renders_json_fence():
+    started = format_cursor_tool_started_markdown(
+        {
+            "tool_call": {
+                "fooToolCall": {
+                    "args": {"alpha": 1, "beta": "two"},
+                }
+            }
+        }
+    )
+    assert "**cursor-agent · unknown**" in started
+    assert "```json" in started
+    assert '"tool": "fooToolCall"' in started
+    assert '"phase": "started"' in started
+    assert '"alpha": 1' in started
+
+    completed = format_cursor_tool_completed_markdown(
+        {
+            "tool_call": {
+                "fooToolCall": {
+                    "args": {"alpha": 1},
+                    "result": {"success": {"status": "ok"}},
+                }
+            }
+        }
+    )
+    assert "```json" in completed
+    assert '"phase": "completed"' in completed
+    assert '"status": "ok"' in completed
 
 
 def test_cursor_response_collector_alternates_message_and_reasoning():

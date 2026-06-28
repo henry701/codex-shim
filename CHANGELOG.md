@@ -7,8 +7,24 @@ and this project does not yet follow semantic versioning (pre-1.0).
 
 ## Unreleased
 
+### Added
+
+- Cursor-agent tool translation registry: explicit mappings for `deleteToolCall`,
+  `globToolCall`, and `grepToolCall`; unknown tools render as JSON-fenced reasoning
+  blocks (`CODEX_SHIM_CURSOR_TOOL_VERBOSE=1` keeps noisy fields). Live composer-2.5
+  fixtures and capture scripts: `scripts/capture_cursor_tool_traces.sh`,
+  `scripts/extract_cursor_tool_keys.py`, `docs/cursor-agent-tools.md`.
+
 ### Fixed
 
+- WebSocket upstream passthrough for ChatGPT and BYOK `openai-responses` routes:
+  Codex's `/v1/responses` WebSocket now proxies to upstream WSS (`wss://chatgpt.com/backend-api/codex/responses`
+  or `{base_url}/responses`) instead of translating each frame through HTTP+SSE. BYOK chat-completions and
+  Anthropic routes still use the internal HTTP bridge. Set `CODEX_SHIM_WS_PASSTHROUGH=0` to force the legacy
+  HTTP upstream path; upstream connect failures automatically fall back to HTTP+SSE.
+- Remote compaction v2 over WebSocket and ChatGPT HTTP passthrough: requests ending in
+  `compaction_trigger` now hit the compact summarization path (one `compaction` output item) instead of
+  being forwarded to upstream ChatGPT/BYOK responses, which returned reasoning/message pairs Codex rejects.
 - `codex-shim stop` now terminates orphan listeners when the pid file is stale but
   `/health` still responds on the default port (uses `ss` when available).
 - `codex-shim doctor` warns when the pid file and port listener disagree.
@@ -34,7 +50,8 @@ and this project does not yet follow semantic versioning (pre-1.0).
 
 - Added `scripts/smoke_chatgpt_passthrough.sh` for live validation on an alternate
   port with trace logging (`CODEX_SHIM_UPSTREAM_HEADER_LOG`,
-  `CODEX_SHIM_PASSTHROUGH_TRACE`).
+  `CODEX_SHIM_PASSTHROUGH_TRACE`). The script summary includes `[ws-passthrough]`
+  vs `http-fallback` markers when WS upstream is active or falls back.
 - ChatGPT passthrough conversation cache raised from 128 to 1024 responses.
 
 - Desktop catalog picker order now matches alphabetical slug order: `write_catalog`

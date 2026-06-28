@@ -322,10 +322,12 @@ to install managed `model_provider = "openai"` routing with `openai_base_url`
 pointed at the local shim. This keeps Desktop sessions in the same provider
 namespace across restarts and migrates legacy `codex_shim` thread rows to
 `openai`. The route supports Responses WebSockets for ChatGPT passthrough models
-and accepts zstd-compressed Codex request bodies. BYOK routes remain HTTPS-backed
-internally; if Codex uses the WebSocket transport for a BYOK slug, the shim
-bridges that frame through its existing local HTTP `/v1/responses` route and
-relays the resulting SSE events back over the WebSocket. `app` also starts the
+and BYOK `openai-responses` providers: the shim opens an upstream WSS to
+`wss://chatgpt.com/backend-api/codex/responses` or `{base_url}/responses` and
+relays JSON frames bidirectionally (HTTP+SSE fallback when upstream WSS fails).
+BYOK chat-completions and Anthropic slugs still bridge through the shim's local
+HTTP `/v1/responses` route and relay SSE events back over the WebSocket. The
+shim accepts zstd-compressed Codex request bodies. `app` also starts the
 local daemon if needed and
 launches Desktop. The previous config is backed up under
 `.codex-shim/` and the managed block can be removed with:
@@ -652,8 +654,11 @@ The passthrough forwards Codex request headers wholesale (session/thread metadat
 `x-codex-*`, etc.), overrides only `Authorization` with your Codex access token,
 rewrites the model slug to the upstream ChatGPT id, and strips
 `previous_response_id` while replaying delta continuations from an in-memory cache
-(ChatGPT's OAuth backend rejects that field). Upstream response headers and usage
-(`cached_tokens` / prefix cache) are logged when
+(ChatGPT's OAuth backend rejects that field). When Codex uses the Responses
+WebSocket transport, the shim proxies to `wss://chatgpt.com/backend-api/codex/responses`
+and relays JSON frames (with the same expansion and model rewrite). If upstream
+WSS is unavailable, it falls back to the legacy HTTP+SSE path automatically.
+Upstream response headers and usage (`cached_tokens` / prefix cache) are logged when
 `CODEX_SHIM_UPSTREAM_HEADER_LOG=1` and relayed back to Codex where applicable.
 
 Debug env knobs:
@@ -663,6 +668,7 @@ Debug env knobs:
 | `CODEX_SHIM_UPSTREAM_HEADER_LOG=1` | Log upstream response headers + usage |
 | `CODEX_SHIM_PASSTHROUGH_TRACE=1` | Log forwarded client headers per ChatGPT request |
 | `CODEX_SHIM_STREAM_LOG=1` | Log SSE/WS event types |
+| `CODEX_SHIM_WS_PASSTHROUGH=0` | Force legacy HTTP+SSE upstream for ChatGPT/BYOK WS routes (default: on) |
 | `CODEX_SHIM_CHATGPT_EXPAND_CONTINUATIONS=0` | Disable delta replay (ChatGPT 400s on native `previous_response_id`) |
 
 Live smoke test (alternate port, `codex exec` with tool call + cache check):
@@ -719,6 +725,12 @@ reports `cursor_passthrough: true` when the shim can expose Composer.
 Do **not** configure Composer via `cursor-api.standardagents.ai` unless you
 intentionally want Dashboard API-key billing (`crsr_…`). That path is BYOK,
 not CLI subscription.
+
+Tool and thinking activity from `cursor-agent` is rendered as **reasoning**
+markdown in Codex Desktop (read/write/edit/delete/glob/grep/shell, etc.).
+Unknown tools are shown as JSON-fenced blocks for transparency. See
+[`docs/cursor-agent-tools.md`](docs/cursor-agent-tools.md) for the tool catalog,
+capture scripts, and how to refresh fixtures.
 
 ---
 

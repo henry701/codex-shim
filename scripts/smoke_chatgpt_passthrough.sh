@@ -89,8 +89,13 @@ tail -20 "${JSON_OUT}" || true
 echo
 echo "=== Shim trace summary (${LOG}) ==="
 if [[ -f "${LOG}" ]]; then
-  rg -n "${MARKER}|\[req\]|\[chatgpt-trace\]|\[upstream-headers\]|\[chatgpt-cache\]" "${LOG}" 2>/dev/null \
+  rg -n "${MARKER}|\[req\]|\[chatgpt-trace\]|\[upstream-headers\]|\[chatgpt-cache\]|\[ws-passthrough\]" "${LOG}" 2>/dev/null \
     | awk -v m="${MARKER}" 'found {print} $0 ~ m {found=1}' | tail -80 || true
+  if rg -q '\[ws-passthrough\] connected upstream' "${LOG}" 2>/dev/null; then
+    echo "(upstream transport: WebSocket passthrough)"
+  elif rg -q '\[ws-passthrough\] http-fallback' "${LOG}" 2>/dev/null; then
+    echo "(upstream transport: HTTP+SSE fallback)"
+  fi
 else
   echo "(log file not found)"
 fi

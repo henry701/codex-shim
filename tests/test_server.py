@@ -28,6 +28,8 @@ from codex_shim.server import (
 from codex_shim.catalog_slugs import codex_catalog_slug
 from codex_shim.settings import FALLBACK_CHATGPT_PASSTHROUGH_SLUGS
 from codex_shim.translate import SHIM_ENCRYPTED_CONTENT_PREFIX
+from codex_shim.ws_passthrough import WsPassthroughSession
+from ws_test_support import MockUpstreamWsState, start_mock_upstream_ws
 
 
 @pytest.fixture
@@ -456,6 +458,7 @@ class _FakeSseContent:
 
 
 async def test_chatgpt_passthrough_websocket_relays_sse_events(monkeypatch, tmp_path, auth_present):
+    monkeypatch.setenv("CODEX_SHIM_WS_PASSTHROUGH", "0")
     captured = {}
 
     class FakeUpstream:
@@ -526,6 +529,7 @@ async def test_chatgpt_passthrough_websocket_relays_sse_events(monkeypatch, tmp_
 
 
 async def test_chatgpt_passthrough_websocket_logs_usage_on_completed(monkeypatch, tmp_path, auth_present):
+    monkeypatch.setenv("CODEX_SHIM_WS_PASSTHROUGH", "0")
     observed = []
 
     def fake_observe(source, upstream, *, usage=None):
@@ -581,6 +585,7 @@ async def test_chatgpt_passthrough_websocket_logs_usage_on_completed(monkeypatch
 
 
 async def test_chatgpt_passthrough_websocket_expands_previous_response_id(monkeypatch, tmp_path, auth_present):
+    monkeypatch.setenv("CODEX_SHIM_WS_PASSTHROUGH", "0")
     captured = []
     first_input = [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "run"}]}]
     tool_call = {
@@ -2110,6 +2115,127 @@ async def test_responses_compaction_v2_emits_single_compaction_stream_item(tmp_p
     await upstream_client.close()
 
 
+async def test_chatgpt_ws_compaction_v2_emits_single_compaction_item(monkeypatch, tmp_path, auth_present):
+    captured = {}
+
+    class FakeUpstream:
+        status = 200
+        content_type = "application/json"
+
+        async def json(self, content_type=None):
+            return {
+                "id": "resp_compact",
+                "model": "gpt-5.5",
+                "output": [
+                    {
+                        "type": "compaction",
+                        "encrypted_content": "openai-native-compaction-blob",
+                    }
+                ],
+                "usage": {"input_tokens": 5, "output_tokens": 2, "total_tokens": 7},
+            }
+
+        def release(self):
+            pass
+
+    async def fake_post(self, url, json=None, headers=None):
+        captured["url"] = url
+        captured["body"] = json
+        return FakeUpstream()
+
+    monkeypatch.setattr("codex_shim.server.ClientSession.post", fake_post)
+
+    settings = tmp_path / "settings.json"
+    settings.write_text("{}")
+    shim_client = TestClient(TestServer(ShimServer(settings).app()))
+    await shim_client.start_server()
+    try:
+        ws = await shim_client.ws_connect("/v1/responses")
+        await ws.send_json(
+            {
+                "type": "response.create",
+                "model": "codex-gpt-5-5",
+                "stream": True,
+                "input": [
+                    {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "long thread"}]},
+                    {"type": "compaction_trigger"},
+                ],
+            }
+        )
+        events = []
+        while True:
+            msg = await ws.receive(timeout=2)
+            assert msg.type == WSMsgType.TEXT
+            payload = json.loads(msg.data)
+            events.append(payload)
+            if payload.get("type") == "response.completed":
+                break
+        assert captured["url"] == "https://chatgpt.com/backend-api/codex/responses/compact"
+        assert "compaction_trigger" not in json.dumps(captured["body"])
+        assert len(events) == 2
+        assert events[0]["type"] == "response.output_item.done"
+        assert events[0]["item"]["type"] == "compaction"
+        assert events[1]["response"]["output"] == [events[0]["item"]]
+        assert events[1]["response"]["model"] == "codex-gpt-5-5"
+        await ws.close()
+    finally:
+        await shim_client.close()
+
+
+async def test_chatgpt_http_compaction_v2_before_passthrough(monkeypatch, tmp_path, auth_present):
+    captured = {}
+
+    class FakeUpstream:
+        status = 200
+        content_type = "application/json"
+
+        async def json(self, content_type=None):
+            return {
+                "id": "resp_compact",
+                "model": "gpt-5.5",
+                "output": [
+                    {
+                        "type": "compaction",
+                        "encrypted_content": "openai-native-compaction-blob",
+                    }
+                ],
+            }
+
+        def release(self):
+            pass
+
+    async def fake_post(self, url, json=None, headers=None):
+        captured["url"] = url
+        return FakeUpstream()
+
+    monkeypatch.setattr("codex_shim.server.ClientSession.post", fake_post)
+
+    settings = tmp_path / "settings.json"
+    settings.write_text("{}")
+    shim_client = TestClient(TestServer(ShimServer(settings).app()))
+    await shim_client.start_server()
+    try:
+        resp = await shim_client.post(
+            "/v1/responses",
+            json={
+                "model": "codex-gpt-5-5",
+                "stream": True,
+                "input": [
+                    {"type": "message", "role": "user", "content": "long thread"},
+                    {"type": "compaction_trigger"},
+                ],
+            },
+        )
+        assert resp.status == 200
+        text = await resp.text()
+        assert captured["url"] == "https://chatgpt.com/backend-api/codex/responses/compact"
+        assert '"type":"compaction"' in text.replace(" ", "")
+        assert "reasoning" not in text
+        await shim_client.close()
+    finally:
+        await shim_client.close()
+
+
 async def test_responses_routes_openai_responses_provider_to_upstream_responses(tmp_path):
     captured = {}
 
@@ -2371,6 +2497,75 @@ async def test_cursor_passthrough_stream_shows_tool_activity_without_function_ca
         output_types = [item.get("type") for item in completed["response"]["output"]]
         assert output_types.count("message") == 2
         assert output_types.count("reasoning") == 1
+    finally:
+        await shim_client.close()
+
+
+async def test_cursor_passthrough_stream_unknown_tool_shows_json(
+    monkeypatch, tmp_path, cursor_present, auth_missing
+):
+    from codex_shim.cursor_passthrough import format_cursor_tool_completed_markdown, format_cursor_tool_started_markdown
+
+    settings = tmp_path / "settings.json"
+    settings.write_text(json.dumps({"customModels": []}))
+
+    async def fake_cursor_events(_prompt, _model):
+        yield {
+            "type": "tool_started",
+            "call_id": "tool-x",
+            "tool_call": {"mysteryToolCall": {"args": {"q": "search"}}},
+            "markdown": format_cursor_tool_started_markdown(
+                {"tool_call": {"mysteryToolCall": {"args": {"q": "search"}}}}
+            ),
+        }
+        yield {
+            "type": "tool_completed",
+            "call_id": "tool-x",
+            "tool_call": {
+                "mysteryToolCall": {
+                    "args": {"q": "search"},
+                    "result": {"success": {"hits": 1}},
+                }
+            },
+            "markdown": format_cursor_tool_completed_markdown(
+                {
+                    "tool_call": {
+                        "mysteryToolCall": {
+                            "args": {"q": "search"},
+                            "result": {"success": {"hits": 1}},
+                        }
+                    }
+                }
+            ),
+        }
+        yield {"type": "completed", "text": "done"}
+
+    monkeypatch.setattr(server_module, "iter_cursor_agent_events", fake_cursor_events)
+
+    shim_client = TestClient(TestServer(ShimServer(settings).app()))
+    await shim_client.start_server()
+    try:
+        resp = await shim_client.post(
+            "/v1/responses",
+            json={
+                "model": "cursor-composer-2-5",
+                "input": [{"role": "user", "content": "hello"}],
+                "stream": True,
+            },
+        )
+        assert resp.status == 200
+        events = _sse_events(await resp.text())
+        reasoning_done = [
+            event
+            for event in events
+            if event.get("type") == "response.output_item.done"
+            and (event.get("item") or {}).get("type") == "reasoning"
+        ][-1]
+        summary = (reasoning_done.get("item") or {}).get("summary") or []
+        text = summary[0]["text"] if summary else ""
+        assert "unknown" in text
+        assert "```json" in text
+        assert "mysteryToolCall" in text
     finally:
         await shim_client.close()
 
@@ -3126,3 +3321,293 @@ async def test_switch_model_requires_slug(tmp_path, auth_missing):
         assert resp.status == 400
     finally:
         await shim_client.close()
+
+
+def _ws_url_from_test_client(client: TestClient, path: str = "/v1/responses") -> str:
+    return str(client.make_url(path)).replace("http://", "ws://", 1)
+
+
+def _patch_chatgpt_ws_url(monkeypatch, url: str) -> None:
+    monkeypatch.setattr("codex_shim.ws_passthrough.CHATGPT_WS_URL", url)
+    monkeypatch.setattr("codex_shim.server.CHATGPT_WS_URL", url)
+
+
+async def test_chatgpt_ws_passthrough_relays_events(monkeypatch, tmp_path, auth_present):
+    state = MockUpstreamWsState(
+        response_sequences=[
+            [
+                {"type": "response.created", "response": {"id": "resp_1", "model": "gpt-5.5"}},
+                {"type": "response.output_text.delta", "delta": "ok"},
+                {"type": "response.completed", "response": {"id": "resp_1", "model": "gpt-5.5", "status": "completed"}},
+            ]
+        ]
+    )
+    upstream_state, upstream_client = await start_mock_upstream_ws(state)
+    _patch_chatgpt_ws_url(monkeypatch, _ws_url_from_test_client(upstream_client))
+
+    settings = tmp_path / "settings.json"
+    settings.write_text("{}")
+    shim_client = TestClient(TestServer(ShimServer(settings).app()))
+    await shim_client.start_server()
+    try:
+        ws = await shim_client.ws_connect("/v1/responses")
+        await ws.send_json(
+            {
+                "type": "response.create",
+                "model": "codex-gpt-5-5",
+                "input": [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]}],
+                "stream": True,
+            }
+        )
+        events = []
+        for _ in range(3):
+            msg = await ws.receive(timeout=2)
+            assert msg.type == WSMsgType.TEXT
+            events.append(json.loads(msg.data))
+        assert [event["type"] for event in events] == [
+            "response.created",
+            "response.output_text.delta",
+            "response.completed",
+        ]
+        assert events[0]["response"]["model"] == "codex-gpt-5-5"
+        assert upstream_state.received_frames[0]["model"] == "gpt-5.5"
+        assert upstream_state.received_frames[0]["type"] == "response.create"
+        assert "previous_response_id" not in upstream_state.received_frames[0]
+        await ws.close()
+    finally:
+        await shim_client.close()
+        await upstream_client.close()
+
+
+async def test_chatgpt_ws_passthrough_multi_create_same_connection(monkeypatch, tmp_path, auth_present):
+    first_input = [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "run"}]}]
+    tool_call = {
+        "type": "function_call",
+        "id": "fc_1",
+        "call_id": "call_1",
+        "name": "exec_command",
+        "arguments": "{\"cmd\":\"printf ok\"}",
+    }
+    tool_output = {"type": "function_call_output", "call_id": "call_1", "output": "ok"}
+    state = MockUpstreamWsState(
+        response_sequences=[
+            [
+                {"type": "response.created", "response": {"id": "resp_previous", "model": "gpt-5.5"}},
+                {
+                    "type": "response.output_item.done",
+                    "response": {"id": "resp_previous", "model": "gpt-5.5", "output": []},
+                    "item": tool_call,
+                },
+                {"type": "response.completed", "response": {"id": "resp_previous", "model": "gpt-5.5", "status": "completed", "output": []}},
+            ],
+            [
+                {"type": "response.created", "response": {"id": "resp_next", "model": "gpt-5.5"}},
+                {"type": "response.completed", "response": {"id": "resp_next", "model": "gpt-5.5", "status": "completed"}},
+            ],
+        ]
+    )
+    upstream_state, upstream_client = await start_mock_upstream_ws(state)
+    _patch_chatgpt_ws_url(monkeypatch, _ws_url_from_test_client(upstream_client))
+
+    settings = tmp_path / "settings.json"
+    settings.write_text("{}")
+    shim_client = TestClient(TestServer(ShimServer(settings).app()))
+    await shim_client.start_server()
+    try:
+        ws = await shim_client.ws_connect("/v1/responses")
+        await ws.send_json({"type": "response.create", "model": "codex-gpt-5-5", "input": first_input, "stream": True})
+        for _ in range(3):
+            msg = await ws.receive(timeout=2)
+            assert msg.type == WSMsgType.TEXT
+
+        await ws.send_json(
+            {
+                "type": "response.create",
+                "model": "codex-gpt-5-5",
+                "previous_response_id": "resp_previous",
+                "input": [tool_output],
+                "stream": True,
+            }
+        )
+        for _ in range(2):
+            msg = await ws.receive(timeout=2)
+            assert msg.type == WSMsgType.TEXT
+
+        assert len(upstream_state.received_frames) == 2
+        assert "previous_response_id" not in upstream_state.received_frames[1]
+        assert upstream_state.received_frames[1]["input"] == [*first_input, tool_call, tool_output]
+        await ws.close()
+    finally:
+        await shim_client.close()
+        await upstream_client.close()
+
+
+async def test_byok_openai_responses_ws_passthrough(tmp_path, monkeypatch):
+    state = MockUpstreamWsState(
+        response_sequences=[
+            [
+                {"type": "response.created", "response": {"id": "resp_1", "model": "gpt-4.1"}},
+                {"type": "response.completed", "response": {"id": "resp_1", "model": "gpt-4.1", "status": "completed"}},
+            ]
+        ]
+    )
+    upstream_state, upstream_client = await start_mock_upstream_ws(state)
+
+    settings = tmp_path / "settings.json"
+    settings.write_text(
+        json.dumps(
+            {
+                "models": [
+                    {
+                        "model": "gpt-4.1",
+                        "display_name": "GPT 4.1",
+                        "provider": "openai-responses",
+                        "base_url": str(upstream_client.make_url("/v1")),
+                        "api_key": "secret-key",
+                    }
+                ]
+            }
+        )
+    )
+    shim_client = TestClient(TestServer(ShimServer(settings).app()))
+    await shim_client.start_server()
+    try:
+        ws = await shim_client.ws_connect("/v1/responses")
+        await ws.send_json(
+            {
+                "type": "response.create",
+                "model": "gpt-4-1",
+                "input": [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]}],
+                "stream": True,
+            }
+        )
+        for _ in range(2):
+            msg = await ws.receive(timeout=2)
+            assert msg.type == WSMsgType.TEXT
+        assert upstream_state.received_frames[0]["model"] == "gpt-4.1"
+        assert upstream_state.handshakes[0].headers.get("Authorization") == "Bearer secret-key"
+        await ws.close()
+    finally:
+        await shim_client.close()
+        await upstream_client.close()
+
+
+async def test_ws_passthrough_falls_back_to_http_on_connect_failure(monkeypatch, tmp_path, auth_present):
+    _patch_chatgpt_ws_url(monkeypatch, "ws://127.0.0.1:1/unreachable")
+    captured = {}
+
+    class FakeUpstream:
+        status = 200
+        content_type = "text/event-stream"
+        headers = {}
+
+        def __init__(self):
+            self.content = _FakeSseContent(
+                [
+                    b'data: {"type":"response.created","response":{"id":"resp_1","model":"gpt-5.5"}}\n\n',
+                    b'data: {"type":"response.completed","response":{"id":"resp_1","model":"gpt-5.5","status":"completed"}}\n\n',
+                ]
+            )
+
+        def release(self):
+            pass
+
+    async def fake_post(self, url, json=None, headers=None):
+        captured["url"] = str(url)
+        captured["body"] = json
+        return FakeUpstream()
+
+    monkeypatch.setattr("codex_shim.server.ClientSession.post", fake_post)
+
+    settings = tmp_path / "settings.json"
+    settings.write_text("{}")
+    shim_client = TestClient(TestServer(ShimServer(settings).app()))
+    await shim_client.start_server()
+    try:
+        ws = await shim_client.ws_connect("/v1/responses")
+        await ws.send_json(
+            {
+                "type": "response.create",
+                "model": "codex-gpt-5-5",
+                "input": [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]}],
+                "stream": True,
+            }
+        )
+        for _ in range(2):
+            msg = await ws.receive(timeout=2)
+            assert msg.type == WSMsgType.TEXT
+        assert captured["url"] == "https://chatgpt.com/backend-api/codex/responses"
+        assert captured["body"]["model"] == "gpt-5.5"
+        await ws.close()
+    finally:
+        await shim_client.close()
+
+
+async def test_byok_chat_completions_still_uses_http_bridge(tmp_path, monkeypatch):
+    upstream_connect_calls = {"count": 0}
+    original_connect = WsPassthroughSession.connect_upstream
+
+    async def tracking_connect(self, url, headers):
+        upstream_connect_calls["count"] += 1
+        return await original_connect(self, url, headers)
+
+    monkeypatch.setattr(WsPassthroughSession, "connect_upstream", tracking_connect)
+
+    async def chat(request):
+        body = await request.json()
+        assert body["model"] == "real-openai"
+        response = web.StreamResponse(headers={"Content-Type": "text/event-stream"})
+        await response.prepare(request)
+        await response.write(b'data: {"choices":[{"delta":{"content":"hello"}}]}\n\n')
+        await response.write(b'data: {"choices":[{"delta":{}}]}\n\n')
+        await response.write(b"data: [DONE]\n\n")
+        await response.write_eof()
+        return response
+
+    upstream = web.Application()
+    upstream.router.add_post("/v1/chat/completions", chat)
+    upstream_client = TestClient(TestServer(upstream))
+    await upstream_client.start_server()
+
+    settings = tmp_path / "settings.json"
+    settings.write_text(
+        json.dumps(
+            {
+                "models": [
+                    {
+                        "model": "real-openai",
+                        "display_name": "Real OpenAI",
+                        "provider": "openai",
+                        "base_url": str(upstream_client.make_url("/v1")),
+                        "api_key": "secret",
+                    }
+                ]
+            }
+        )
+    )
+    shim_client = TestClient(TestServer(ShimServer(settings).app()))
+    await shim_client.start_server()
+    try:
+        ws = await shim_client.ws_connect("/v1/responses")
+        await ws.send_json(
+            {
+                "type": "response.create",
+                "model": "real-openai",
+                "input": [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]}],
+                "stream": True,
+            }
+        )
+        events = []
+        while True:
+            msg = await ws.receive(timeout=2)
+            assert msg.type == WSMsgType.TEXT
+            payload = json.loads(msg.data)
+            events.append(payload)
+            if payload.get("type") == "response.completed":
+                break
+        assert upstream_connect_calls["count"] == 0
+        assert events[-1]["response"]["model"] == "real-openai"
+        await ws.close()
+    finally:
+        await shim_client.close()
+        await upstream_client.close()

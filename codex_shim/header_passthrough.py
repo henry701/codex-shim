@@ -177,6 +177,64 @@ def chatgpt_passthrough_upstream_headers(
     )
 
 
+def chatgpt_passthrough_ws_upstream_headers(
+    request_headers: Mapping[str, str],
+    *,
+    access_token: str,
+    account_id: str,
+) -> dict[str, str]:
+    setdefaults: dict[str, str] = {}
+    if account_id and not _header_present(request_headers, "chatgpt-account-id"):
+        setdefaults["chatgpt-account-id"] = account_id
+    if not _header_present(request_headers, "OpenAI-Beta"):
+        setdefaults["OpenAI-Beta"] = "responses_websockets=2026-02-06"
+    if not _header_present(request_headers, "originator"):
+        setdefaults["originator"] = "codex_cli_rs"
+    return client_headers_for_upstream(
+        request_headers,
+        setdefaults=setdefaults,
+        overrides={
+            "Authorization": f"Bearer {access_token}",
+        },
+    )
+
+
+def openai_responses_ws_upstream_headers(
+    request_headers: Mapping[str, str],
+    *,
+    api_key: str | None = None,
+    extra_headers: Mapping[str, str] | None = None,
+) -> dict[str, str]:
+    setdefaults = dict(extra_headers or {})
+    if not _header_present(request_headers, "OpenAI-Beta") and not _header_present(setdefaults, "OpenAI-Beta"):
+        setdefaults["OpenAI-Beta"] = "responses_websockets=2026-02-06"
+    return openai_upstream_headers(
+        request_headers,
+        api_key=api_key,
+        extra_headers=setdefaults,
+        accept=None,
+    )
+
+
+_WS_UPGRADE_RESPONSE_BLOCKLIST = _RESPONSE_BLOCKLIST | frozenset(
+    {
+        "upgrade",
+        "sec-websocket-accept",
+        "sec-websocket-extensions",
+        "sec-websocket-protocol",
+    }
+)
+
+
+def forwardable_ws_upgrade_headers(upstream_headers: Mapping[str, str]) -> dict[str, str]:
+    forwarded: dict[str, str] = {}
+    for key, value in upstream_headers.items():
+        if key.lower() in _WS_UPGRADE_RESPONSE_BLOCKLIST:
+            continue
+        forwarded[key] = value
+    return forwarded
+
+
 def forwardable_upstream_response_headers(upstream_headers: Mapping[str, str]) -> dict[str, str]:
     forwarded: dict[str, str] = {}
     for key, value in upstream_headers.items():

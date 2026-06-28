@@ -14,6 +14,15 @@ from codex_shim.cursor_passthrough import (
 from codex_shim.cursor_stream_visualizer import visualize_ndjson_file
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "cursor_stream"
+FIXTURE_NAMES = [
+    "sleep_shell_read.ndjson",
+    "write_edit_patch.ndjson",
+    "move_rename.ndjson",
+    "delete_file.ndjson",
+    "write_new.ndjson",
+    "list_glob.ndjson",
+    "grep_search.ndjson",
+]
 
 
 def _load_fixture(name: str) -> str:
@@ -141,6 +150,49 @@ def test_fixture_write_edit_patch_replay():
         if item["type"] == "reasoning" and "edit" in item["summary"][0]["text"]
     ]
     assert len(edit_blocks) >= 2
+
+
+def test_fixture_delete_file_replay():
+    events, _, collector = replay_cursor_ndjson(_load_fixture("delete_file.ndjson"), collect_output=True)
+    assert collector is not None
+    delete_started = [event for event in events if event["type"] == "tool_started" and "delete" in event.get("markdown", "")]
+    assert delete_started
+    output = collector.build_output()
+    delete_blocks = [
+        item for item in output if item["type"] == "reasoning" and "delete" in item["summary"][0]["text"]
+    ]
+    assert delete_blocks
+
+
+def test_fixture_list_glob_replay():
+    events, _, collector = replay_cursor_ndjson(_load_fixture("list_glob.ndjson"), collect_output=True)
+    assert collector is not None
+    glob_started = [event for event in events if event["type"] == "tool_started" and "glob" in event.get("markdown", "")]
+    assert glob_started
+    output = collector.build_output()
+    glob_blocks = [
+        item for item in output if item["type"] == "reasoning" and "glob" in item["summary"][0]["text"]
+    ]
+    assert glob_blocks
+
+
+def test_fixture_grep_search_replay():
+    events, _, collector = replay_cursor_ndjson(_load_fixture("grep_search.ndjson"), collect_output=True)
+    assert collector is not None
+    grep_started = [event for event in events if event["type"] == "tool_started" and "grep" in event.get("markdown", "")]
+    assert grep_started
+    output = collector.build_output()
+    grep_blocks = [
+        item for item in output if item["type"] == "reasoning" and "grep" in item["summary"][0]["text"]
+    ]
+    assert grep_blocks
+
+
+def test_all_fixtures_replay_without_error():
+    for name in FIXTURE_NAMES:
+        events, parser, _ = replay_cursor_ndjson(_load_fixture(name))
+        assert isinstance(events, list)
+        assert parser.error is None
 
 
 def test_tmux_smoke_script_is_valid_bash():

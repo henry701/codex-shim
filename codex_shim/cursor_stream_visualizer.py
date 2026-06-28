@@ -8,7 +8,13 @@ import time
 from pathlib import Path
 from typing import Any, TextIO
 
-from .cursor_passthrough import CursorResponseCollector, CursorStreamParser, replay_cursor_ndjson
+from .cursor_passthrough import (
+    CursorResponseCollector,
+    CursorStreamParser,
+    cursor_tool_display_kind,
+    cursor_tool_is_known,
+    replay_cursor_ndjson,
+)
 
 _ANSI = {
     "reset": "\033[0m",
@@ -35,8 +41,21 @@ def format_event_line(event: dict[str, Any]) -> str:
     if event_type == "thinking_completed":
         return _c("magenta", "[think] (completed)")
     if event_type == "tool_started":
-        preview = str(event.get("markdown") or "").splitlines()[0]
-        return _c("yellow", f"[tool▶] {preview}")
+        tool_call = event.get("tool_call") or {}
+        kind = cursor_tool_display_kind({"tool_call": tool_call})
+        known = cursor_tool_is_known({"tool_call": tool_call})
+        preview = str(event.get("markdown") or "").splitlines()
+        detail = preview[2].lstrip("> ").strip() if len(preview) > 2 else ""
+        tag = "tool▶" if known else "tool?"
+        line = f"[{tag} {kind}] {detail}" if detail else f"[{tag} {kind}]"
+        if not known and preview:
+            json_lines = [row for row in preview if row.strip() and not row.startswith("**")]
+            if json_lines:
+                snippet = " ".join(json_lines[:3])
+                if len(snippet) > 120:
+                    snippet = snippet[:120] + "…"
+                line += f" {snippet!r}"
+        return _c("yellow", line)
     if event_type == "tool_completed":
         return _c("yellow", "[tool✓] (result appended)")
     if event_type == "segment_boundary":

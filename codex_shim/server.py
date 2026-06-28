@@ -11,7 +11,8 @@ import sys
 import time
 import uuid
 from pathlib import Path
-from typing import Any, Mapping
+from dataclasses import dataclass
+from typing import Any, Literal, Mapping
 from urllib.parse import urljoin
 
 from aiohttp import ClientError, ClientSession, ClientTimeout, WSMsgType, web
@@ -42,11 +43,20 @@ from . import tool_translate
 from .header_passthrough import (
     apply_upstream_headers_to_response,
     chatgpt_passthrough_upstream_headers,
+    chatgpt_passthrough_ws_upstream_headers,
     anthropic_upstream_headers,
     observe_upstream_response,
+    openai_responses_ws_upstream_headers,
     openai_upstream_headers,
     prepare_downstream_sse_response,
     upstream_headers_from_response,
+)
+from .ws_passthrough import (
+    CHATGPT_WS_URL,
+    WsPassthroughConnectError,
+    WsPassthroughSession,
+    responses_websocket_url,
+    ws_passthrough_enabled,
 )
 from .hostguard import build_allowed_hosts, host_guard_middleware
 from .settings import (
@@ -370,25 +380,244 @@ class ShimServer:
     async def responses_websocket(self, request: web.Request) -> web.WebSocketResponse:
         ws = web.WebSocketResponse(compress=True, heartbeat=30)
         await ws.prepare(request)
-        async for msg in ws:
-            if msg.type == WSMsgType.TEXT:
-                try:
-                    payload = json.loads(msg.data)
-                except json.JSONDecodeError:
-                    await _write_ws_error(ws, 400, "invalid_request_error", "invalid JSON websocket frame")
-                    continue
-                if not isinstance(payload, dict):
-                    await _write_ws_error(ws, 400, "invalid_request_error", "websocket frame must be a JSON object")
-                    continue
-                if payload.get("type") != "response.create":
-                    await _write_ws_error(ws, 400, "invalid_request_error", "only response.create websocket frames are supported")
-                    continue
-                await self._handle_response_create_websocket(request, ws, payload)
-            elif msg.type == WSMsgType.BINARY:
-                await _write_ws_error(ws, 400, "invalid_request_error", "binary websocket frames are not supported")
-            elif msg.type == WSMsgType.ERROR:
-                break
+        passthrough: WsPassthroughSession | None = None
+        async with ClientSession(timeout=self.timeout) as http_session:
+            async for msg in ws:
+                if msg.type == WSMsgType.TEXT:
+                    try:
+                        payload = json.loads(msg.data)
+                    except json.JSONDecodeError:
+                        await _write_ws_error(ws, 400, "invalid_request_error", "invalid JSON websocket frame")
+                        continue
+                    if not isinstance(payload, dict):
+                        await _write_ws_error(ws, 400, "invalid_request_error", "websocket frame must be a JSON object")
+                        continue
+                    if payload.get("type") != "response.create":
+                        await _write_ws_error(
+                            ws,
+                            400,
+                            "invalid_request_error",
+                            "only response.create websocket frames are supported",
+                        )
+                        continue
+                    if await self._maybe_handle_ws_compaction_v2(request, ws, payload):
+                        continue
+                    target = await self._resolve_ws_passthrough_target(payload)
+                    if target is not None and ws_passthrough_enabled():
+                        if passthrough is None:
+                            passthrough = WsPassthroughSession(client_session=http_session, client_ws=ws)
+                        handled = await self._handle_ws_passthrough_response_create(
+                            request,
+                            passthrough,
+                            payload,
+                            target,
+                        )
+                        if handled:
+                            continue
+                    if target is not None and target.kind == "chatgpt":
+                        await self._handle_chatgpt_response_create_websocket_http(
+                            request,
+                            ws,
+                            payload,
+                            target,
+                            http_session=http_session,
+                        )
+                        continue
+                    await self._handle_local_response_create_websocket(
+                        request,
+                        ws,
+                        payload,
+                        http_session=http_session,
+                    )
+                elif msg.type == WSMsgType.BINARY:
+                    await _write_ws_error(ws, 400, "invalid_request_error", "binary websocket frames are not supported")
+                elif msg.type == WSMsgType.ERROR:
+                    break
+            if passthrough is not None:
+                await passthrough.close_upstream()
         return ws
+
+    @dataclass(frozen=True)
+    class _WsPassthroughTarget:
+        kind: Literal["chatgpt", "openai_responses"]
+        requested_slug: str
+        upstream_model: str
+        response_model_override: str | None
+        route: ShimModel | None = None
+        access_token: str | None = None
+        account_id: str | None = None
+
+    async def _resolve_ws_passthrough_target(self, payload: dict[str, Any]) -> _WsPassthroughTarget | None:
+        requested = str(payload.get("model") or "")
+        if is_chatgpt_passthrough_slug(requested):
+            auth_path = DEFAULT_CODEX_AUTH.expanduser()
+            try:
+                auth = json.loads(auth_path.read_text())
+            except (FileNotFoundError, json.JSONDecodeError):
+                return None
+            tokens = auth.get("tokens") or {}
+            access_token = tokens.get("access_token")
+            if not access_token:
+                return None
+            upstream_model = chatgpt_upstream_model(requested)
+            return self._WsPassthroughTarget(
+                kind="chatgpt",
+                requested_slug=requested,
+                upstream_model=upstream_model,
+                response_model_override=requested if requested != upstream_model else None,
+                access_token=access_token,
+                account_id=tokens.get("account_id") or "",
+            )
+        body = await self._maybe_apply_auto_router(dict(payload))
+        model = str(body.get("model") or requested)
+        if is_cursor_passthrough_slug(model):
+            return None
+        if self._needs_image_gen(body) or self._needs_image_followup(body):
+            return None
+        try:
+            route = await self._route(body)
+        except web.HTTPException:
+            return None
+        if not route.is_openai_responses:
+            return None
+        return self._WsPassthroughTarget(
+            kind="openai_responses",
+            requested_slug=route.slug,
+            upstream_model=route.model,
+            response_model_override=route.slug if route.slug != route.model else None,
+            route=route,
+        )
+
+    async def _handle_ws_passthrough_response_create(
+        self,
+        request: web.Request,
+        passthrough: WsPassthroughSession,
+        payload: dict[str, Any],
+        target: _WsPassthroughTarget,
+    ) -> bool:
+        """Returns True when handled (including HTTP fallback). False to use local bridge."""
+        if target.kind == "chatgpt":
+            forwarded = self._prepare_chatgpt_passthrough_body({k: v for k, v in payload.items() if k != "type"})
+            forwarded["model"] = target.upstream_model
+            forwarded["stream"] = True
+            headers = chatgpt_passthrough_ws_upstream_headers(
+                request.headers,
+                access_token=target.access_token or "",
+                account_id=target.account_id or "",
+            )
+            _log_chatgpt_passthrough_trace(request, forwarded, headers, phase="pre-upstream-ws")
+            upstream_url = CHATGPT_WS_URL
+            source = "chatgpt-passthrough-ws"
+            collector_factory = lambda fwd: ChatgptPassthroughResponseCollector(fwd)
+            cache_enabled = _chatgpt_expand_continuations_enabled()
+            store_cache = self._store_chatgpt_passthrough_conversation
+        else:
+            route = target.route
+            assert route is not None
+            body = prepare_codex_byok_responses_body(
+                {k: v for k, v in payload.items() if k != "type"},
+                request.headers,
+            )
+            forwarded = dict(body)
+            forwarded["model"] = route.model
+            forwarded["stream"] = True
+            headers = openai_responses_ws_upstream_headers(
+                request.headers,
+                api_key=route.api_key or None,
+                extra_headers=route.extra_headers,
+            )
+            upstream_url = responses_websocket_url(route.base_url)
+            source = f"byok-openai-responses-ws:{route.slug}"
+            collector_factory = None
+            cache_enabled = False
+            store_cache = None
+
+        try:
+            if passthrough.upstream_ws is None or passthrough.upstream_ws.closed:
+                await passthrough.connect_upstream(upstream_url, headers)
+        except WsPassthroughConnectError as exc:
+            print(f"[ws-passthrough] upstream connect failed; http-fallback url={upstream_url} err={exc}", flush=True)
+            if target.kind == "chatgpt":
+                await self._handle_chatgpt_response_create_websocket_http(
+                    request,
+                    passthrough.client_ws,
+                    payload,
+                    target,
+                    http_session=passthrough.client_session,
+                )
+                return True
+            return False
+
+        collector = collector_factory(forwarded) if collector_factory else None
+        cache_collected = store_cache if cache_enabled and store_cache is not None else None
+
+        def on_event(event: dict[str, Any]) -> None:
+            if collector is not None:
+                collector.record(event)
+                if cache_collected is not None and _should_cache_chatgpt_passthrough_event(event):
+                    cache_collected(collector.response_id, collector.conversation_items())
+
+        await passthrough.send_response_create(forwarded)
+        client_ws = passthrough.client_ws
+
+        async def write_event(event: dict[str, Any]) -> None:
+            await _write_ws_json(client_ws, event)
+
+        await passthrough.relay_until_terminal(
+            source=source,
+            model_override=target.response_model_override,
+            on_event=on_event if collector is not None else None,
+            rewrite_model=_rewrite_response_model,
+            write_event=write_event,
+        )
+        if collector is not None and cache_enabled and store_cache is not None:
+            store_cache(collector.response_id, collector.conversation_items())
+        return True
+
+    async def _handle_chatgpt_response_create_websocket_http(
+        self,
+        request: web.Request,
+        ws: web.WebSocketResponse,
+        payload: dict[str, Any],
+        target: _WsPassthroughTarget,
+        *,
+        http_session: ClientSession,
+    ) -> None:
+        forwarded = self._prepare_chatgpt_passthrough_body({k: v for k, v in payload.items() if k != "type"})
+        forwarded["model"] = target.upstream_model
+        forwarded["stream"] = True
+        headers = _chatgpt_passthrough_upstream_headers(
+            request,
+            access_token=target.access_token or "",
+            account_id=target.account_id or "",
+            accept="text/event-stream",
+        )
+        _log_chatgpt_passthrough_trace(request, forwarded, headers, phase="pre-upstream-ws-http-fallback")
+        url = "https://chatgpt.com/backend-api/codex/responses"
+        print(f"[ws-passthrough] http-fallback POST {url}", flush=True)
+        upstream = await http_session.post(url, json=forwarded, headers=headers)
+        upstream_forward_headers = observe_upstream_response("chatgpt-passthrough-ws", upstream)
+        if upstream.status >= 400:
+            text = await upstream.text()
+            code, message = parse_upstream_error(text, upstream.status)
+            upstream.release()
+            await _write_ws_error(ws, upstream.status, code, message)
+            return
+        collector = ChatgptPassthroughResponseCollector(forwarded)
+        try:
+            await _relay_sse_response_to_ws(
+                upstream,
+                request,
+                ws,
+                response_model_override=target.response_model_override,
+                collector=collector,
+                cache_collected=self._store_chatgpt_passthrough_conversation if _chatgpt_expand_continuations_enabled() else None,
+                upstream_forward_headers=upstream_forward_headers,
+            )
+        finally:
+            if _chatgpt_expand_continuations_enabled():
+                self._store_chatgpt_passthrough_conversation(collector.response_id, collector.conversation_items())
+            await _close_upstream(upstream)
 
     async def _handle_response_create_websocket(
         self,
@@ -396,69 +625,70 @@ class ShimServer:
         ws: web.WebSocketResponse,
         payload: dict[str, Any],
     ) -> None:
-        requested = str(payload.get("model") or "")
-        if not is_chatgpt_passthrough_slug(requested):
-            await self._handle_local_response_create_websocket(request, ws, payload)
-            return
-        auth_path = DEFAULT_CODEX_AUTH.expanduser()
-        try:
-            auth = json.loads(auth_path.read_text())
-        except FileNotFoundError:
-            await _write_ws_error(ws, 401, "unauthorized", "~/.codex/auth.json not found")
-            return
-        except json.JSONDecodeError:
-            await _write_ws_error(ws, 401, "unauthorized", "auth.json is not valid JSON")
-            return
-        tokens = auth.get("tokens") or {}
-        access_token = tokens.get("access_token")
-        account_id = tokens.get("account_id") or ""
-        if not access_token:
-            await _write_ws_error(ws, 401, "unauthorized", "auth.json has no access_token")
-            return
-
-        upstream_model = chatgpt_upstream_model(requested)
-        response_model_override = requested if requested != upstream_model else None
-        forwarded = self._prepare_chatgpt_passthrough_body({k: v for k, v in payload.items() if k != "type"})
-        forwarded["model"] = upstream_model
-        forwarded["stream"] = True
-        headers = _chatgpt_passthrough_upstream_headers(
-            request,
-            access_token=access_token,
-            account_id=account_id,
-            accept="text/event-stream",
-        )
-        _log_chatgpt_passthrough_trace(request, forwarded, headers, phase="pre-upstream-ws")
-        url = "https://chatgpt.com/backend-api/codex/responses"
-        async with ClientSession(timeout=self.timeout) as session:
-            upstream = await session.post(url, json=forwarded, headers=headers)
-            upstream_forward_headers = observe_upstream_response("chatgpt-passthrough-ws", upstream)
-            if upstream.status >= 400:
-                text = await upstream.text()
-                code, message = parse_upstream_error(text, upstream.status)
-                upstream.release()
-                await _write_ws_error(ws, upstream.status, code, message)
-                return
-            collector = ChatgptPassthroughResponseCollector(forwarded)
-            try:
-                await _relay_sse_response_to_ws(
-                    upstream,
+        """Legacy entrypoint kept for tests; production uses responses_websocket loop."""
+        target = await self._resolve_ws_passthrough_target(payload)
+        if target is not None and ws_passthrough_enabled():
+            async with ClientSession(timeout=self.timeout) as http_session:
+                passthrough = WsPassthroughSession(client_session=http_session, client_ws=ws)
+                if await self._handle_ws_passthrough_response_create(request, passthrough, payload, target):
+                    await passthrough.close_upstream()
+                    return
+                await self._handle_local_response_create_websocket(
                     request,
                     ws,
-                    response_model_override=response_model_override,
-                    collector=collector,
-                    cache_collected=self._store_chatgpt_passthrough_conversation if _chatgpt_expand_continuations_enabled() else None,
-                    upstream_forward_headers=upstream_forward_headers,
+                    payload,
+                    http_session=http_session,
                 )
-            finally:
-                if _chatgpt_expand_continuations_enabled():
-                    self._store_chatgpt_passthrough_conversation(collector.response_id, collector.conversation_items())
-                await _close_upstream(upstream)
+            return
+        if is_chatgpt_passthrough_slug(str(payload.get("model") or "")):
+            auth_path = DEFAULT_CODEX_AUTH.expanduser()
+            try:
+                auth = json.loads(auth_path.read_text())
+            except FileNotFoundError:
+                await _write_ws_error(ws, 401, "unauthorized", "~/.codex/auth.json not found")
+                return
+            except json.JSONDecodeError:
+                await _write_ws_error(ws, 401, "unauthorized", "auth.json is not valid JSON")
+                return
+            tokens = auth.get("tokens") or {}
+            access_token = tokens.get("access_token")
+            if not access_token:
+                await _write_ws_error(ws, 401, "unauthorized", "auth.json has no access_token")
+                return
+            upstream_model = chatgpt_upstream_model(str(payload.get("model") or ""))
+            requested = str(payload.get("model") or "")
+            target = self._WsPassthroughTarget(
+                kind="chatgpt",
+                requested_slug=requested,
+                upstream_model=upstream_model,
+                response_model_override=requested if requested != upstream_model else None,
+                access_token=access_token,
+                account_id=tokens.get("account_id") or "",
+            )
+            async with ClientSession(timeout=self.timeout) as http_session:
+                await self._handle_chatgpt_response_create_websocket_http(
+                    request,
+                    ws,
+                    payload,
+                    target,
+                    http_session=http_session,
+                )
+            return
+        async with ClientSession(timeout=self.timeout) as http_session:
+            await self._handle_local_response_create_websocket(
+                request,
+                ws,
+                payload,
+                http_session=http_session,
+            )
 
     async def _handle_local_response_create_websocket(
         self,
         request: web.Request,
         ws: web.WebSocketResponse,
         payload: dict[str, Any],
+        *,
+        http_session: ClientSession | None = None,
     ) -> None:
         forwarded = {k: v for k, v in payload.items() if k != "type"}
         forwarded["stream"] = True
@@ -467,27 +697,45 @@ class ShimServer:
             request.headers,
             accept="text/event-stream",
         )
-        async with ClientSession(timeout=self.timeout) as session:
-            upstream = await session.post(url, json=forwarded, headers=headers)
-            if upstream.status >= 400:
-                text = await upstream.text()
-                code, message = parse_upstream_error(text, upstream.status)
-                upstream.release()
-                await _write_ws_error(ws, upstream.status, code, message)
-                return
-            try:
-                await _relay_sse_response_to_ws(
-                    upstream,
-                    request,
-                    ws,
-                )
-            finally:
-                await _close_upstream(upstream)
+        session = http_session
+        if session is None:
+            async with ClientSession(timeout=self.timeout) as owned:
+                await self._relay_local_response_create_over_http(owned, url, forwarded, headers, request, ws)
+            return
+        await self._relay_local_response_create_over_http(session, url, forwarded, headers, request, ws)
+
+    async def _relay_local_response_create_over_http(
+        self,
+        session: ClientSession,
+        url: str,
+        forwarded: dict[str, Any],
+        headers: dict[str, str],
+        request: web.Request,
+        ws: web.WebSocketResponse,
+    ) -> None:
+        upstream = await session.post(url, json=forwarded, headers=headers)
+        if upstream.status >= 400:
+            text = await upstream.text()
+            code, message = parse_upstream_error(text, upstream.status)
+            upstream.release()
+            await _write_ws_error(ws, upstream.status, code, message)
+            return
+        try:
+            await _relay_sse_response_to_ws(
+                upstream,
+                request,
+                ws,
+            )
+        finally:
+            await _close_upstream(upstream)
 
     async def responses(self, request: web.Request) -> web.StreamResponse:
         body = await request.json()
         _log_incoming_request("/v1/responses", body)
         body = await self._maybe_apply_auto_router(body)
+        compaction_response = await self._maybe_handle_http_compaction_v2(request, body)
+        if compaction_response is not None:
+            return compaction_response
         model = str(body.get("model") or "")
         if is_chatgpt_passthrough_slug(model):
             upstream = chatgpt_upstream_model(model)
@@ -511,22 +759,6 @@ class ShimServer:
         tool_types = responses_tool_type_map(body.get("tools"))
         tool_resolve = responses_tool_resolve_map(body.get("tools"))
         body = prepare_codex_byok_responses_body(body, request.headers)
-        try:
-            stripped_input = strip_terminal_compaction_trigger(body.get("input"))
-        except CompactionTriggerError as exc:
-            return web.json_response(
-                _responses_error_payload(route.slug, "invalid_request_error", str(exc)),
-                status=400,
-            )
-        if stripped_input is not None:
-            return await self._responses_compaction_v2(
-                request,
-                body,
-                stripped_input,
-                route=route,
-                tool_types=tool_types,
-                tool_resolve=tool_resolve,
-            )
         if route.is_openai_responses:
             return await self._post_openai_responses(request, route, body)
         if route.is_openai_chat:
@@ -547,16 +779,88 @@ class ShimServer:
             return decode_shim_compaction_summary(item.get("encrypted_content")) or ""
         return compaction_summary_from_output(payload.get("output"))
 
-    async def _responses_compaction_v2(
+    async def _maybe_handle_http_compaction_v2(
+        self,
+        request: web.Request,
+        body: dict[str, Any],
+    ) -> web.StreamResponse | web.Response | None:
+        try:
+            stripped_input = strip_terminal_compaction_trigger(body.get("input"))
+        except CompactionTriggerError as exc:
+            model = str(body.get("model") or "unknown")
+            return web.json_response(
+                _responses_error_payload(model, "invalid_request_error", str(exc)),
+                status=400,
+            )
+        if stripped_input is None:
+            return None
+        return await self._responses_compaction_v2(request, body, stripped_input)
+
+    async def _maybe_handle_ws_compaction_v2(
+        self,
+        request: web.Request,
+        ws: web.WebSocketResponse,
+        payload: dict[str, Any],
+    ) -> bool:
+        body = {k: v for k, v in payload.items() if k != "type"}
+        body = await self._maybe_apply_auto_router(body)
+        try:
+            stripped_input = strip_terminal_compaction_trigger(body.get("input"))
+        except CompactionTriggerError as exc:
+            await _write_ws_error(ws, 400, "invalid_request_error", str(exc))
+            return True
+        if stripped_input is None:
+            return False
+        compaction_item, response_slug, usage, error_response = await self._resolve_compaction_v2_result(
+            request,
+            body,
+            stripped_input,
+        )
+        if error_response is not None:
+            await _ws_error_from_http_response(ws, error_response)
+            return True
+        await _write_compaction_v2_ws(ws, response_slug, compaction_item, usage)
+        return True
+
+    async def _resolve_compaction_v2_result(
         self,
         request: web.Request,
         body: dict[str, Any],
         stripped_input: list[Any],
         *,
-        route: ShimModel,
-        tool_types: dict[str, str] | None,
-        tool_resolve: dict[str, tuple[str | None, str]] | None,
-    ) -> web.StreamResponse:
+        route: ShimModel | None = None,
+        tool_types: dict[str, str] | None = None,
+        tool_resolve: dict[str, tuple[str | None, str]] | None = None,
+    ) -> tuple[dict[str, Any], str, dict[str, Any] | None, web.StreamResponse | web.Response | None]:
+        model = str(body.get("model") or "")
+        if is_chatgpt_passthrough_slug(model):
+            upstream_model = chatgpt_upstream_model(model)
+            item, usage, error_response = await self._fetch_chatgpt_compaction_v2_item(
+                request,
+                body,
+                stripped_input,
+                requested_slug=model,
+                upstream_model=upstream_model,
+            )
+            if error_response is not None:
+                return {}, model, None, error_response
+            return item, model, usage, None
+        if is_cursor_passthrough_slug(model):
+            item, usage, error_response = await self._fetch_cursor_compaction_v2_item(
+                request,
+                body,
+                stripped_input,
+                requested_slug=model,
+            )
+            if error_response is not None:
+                return {}, model, None, error_response
+            return item, model, usage, None
+        if route is None:
+            route = await self._route(body)
+        if tool_types is None:
+            tool_types = responses_tool_type_map(body.get("tools"))
+        if tool_resolve is None:
+            tool_resolve = responses_tool_resolve_map(body.get("tools"))
         compact_body = _compact_request_body({**body, "input": stripped_input}, route.model)
         summary, usage, error_response = await self._fetch_byok_compact_summary(
             request,
@@ -566,44 +870,90 @@ class ShimServer:
             tool_resolve=tool_resolve,
         )
         if error_response is not None:
+            return {}, route.slug, None, error_response
+        return compaction_output_item(summary), route.slug, usage, None
+
+    async def _fetch_chatgpt_compaction_v2_item(
+        self,
+        request: web.Request,
+        body: dict[str, Any],
+        stripped_input: list[Any],
+        *,
+        requested_slug: str,
+        upstream_model: str,
+    ) -> tuple[dict[str, Any], dict[str, Any] | None, web.StreamResponse | web.Response | None]:
+        compact_body = _compact_request_body({**body, "input": stripped_input}, upstream_model)
+        compact_body["model"] = requested_slug
+        response = await self._chatgpt_compact_passthrough(request, compact_body, upstream_model=upstream_model)
+        if response.status >= 400:
+            return {}, None, response
+        try:
+            payload = json.loads(response.text or "{}")
+        except json.JSONDecodeError:
+            return {}, None, response
+        if not isinstance(payload, dict):
+            return {}, None, response
+        item = compaction_item_from_response_payload(payload)
+        if item is None:
+            summary = compaction_summary_from_output(payload.get("output"))
+            item = compaction_output_item(summary or "Compaction summary unavailable.")
+        usage = payload.get("usage") if isinstance(payload.get("usage"), dict) else None
+        return item, usage, None
+
+    async def _fetch_cursor_compaction_v2_item(
+        self,
+        request: web.Request,
+        body: dict[str, Any],
+        stripped_input: list[Any],
+        *,
+        requested_slug: str,
+    ) -> tuple[dict[str, Any], dict[str, Any] | None, web.StreamResponse | web.Response | None]:
+        compact_body = _compact_request_body({**body, "input": stripped_input}, cursor_upstream_model(requested_slug))
+        compact_body["model"] = requested_slug
+        compact_body["instructions"] = (
+            f"{body.get('instructions') or ''}\n\nSummarize the conversation above into a compact "
+            "context window suitable for continuing the task."
+        ).strip()
+        response = await self._cursor_passthrough(
+            request,
+            compact_body,
+            response_model_override=requested_slug,
+            upstream_model=cursor_upstream_model(requested_slug),
+            force_non_stream=True,
+        )
+        if response.status >= 400:
+            return {}, None, response
+        try:
+            payload = json.loads(response.text or "{}")
+        except json.JSONDecodeError:
+            return {}, None, response
+        if not isinstance(payload, dict):
+            return {}, None, response
+        summary = compaction_summary_from_output(payload.get("output"))
+        usage = payload.get("usage") if isinstance(payload.get("usage"), dict) else None
+        return compaction_output_item(summary or "Compaction summary unavailable."), usage, None
+
+    async def _responses_compaction_v2(
+        self,
+        request: web.Request,
+        body: dict[str, Any],
+        stripped_input: list[Any],
+        *,
+        route: ShimModel | None = None,
+        tool_types: dict[str, str] | None = None,
+        tool_resolve: dict[str, tuple[str | None, str]] | None = None,
+    ) -> web.StreamResponse:
+        compaction_item, response_slug, usage, error_response = await self._resolve_compaction_v2_result(
+            request,
+            body,
+            stripped_input,
+            route=route,
+            tool_types=tool_types,
+            tool_resolve=tool_resolve,
+        )
+        if error_response is not None:
             return error_response
-        compaction_item = compaction_output_item(summary)
-        response = _sse_response()
-        await response.prepare(request)
-        response_id = f"resp_compact_{int(time.time() * 1000)}"
-        completed_response: dict[str, Any] = {
-            "id": response_id,
-            "object": "response",
-            "status": "completed",
-            "model": route.slug,
-            "output": [compaction_item],
-        }
-        if usage is not None:
-            completed_response["usage"] = usage
-        try:
-            await _write_sse(
-                response,
-                {
-                    "type": "response.output_item.done",
-                    "output_index": 0,
-                    "item": compaction_item,
-                },
-            )
-            await _write_sse(
-                response,
-                {
-                    "type": "response.completed",
-                    "response": completed_response,
-                },
-            )
-            await response.write(b"data: [DONE]\n\n")
-        except ClientDisconnected:
-            pass
-        try:
-            await response.write_eof()
-        except Exception:
-            pass
-        return response
+        return await _stream_compaction_v2_sse(request, response_slug, compaction_item, usage)
 
     async def _fetch_byok_compact_summary(
         self,
@@ -3690,6 +4040,91 @@ async def _write_sse(response: web.StreamResponse, payload: dict[str, Any]) -> N
 async def _write_ws_json(ws: web.WebSocketResponse, payload: dict[str, Any]) -> None:
     _log_stream_event(payload)
     await ws.send_str(json.dumps(payload, separators=(",", ":")))
+
+
+async def _write_compaction_v2_ws(
+    ws: web.WebSocketResponse,
+    response_slug: str,
+    compaction_item: dict[str, Any],
+    usage: dict[str, Any] | None,
+) -> None:
+    response_id = f"resp_compact_{int(time.time() * 1000)}"
+    completed_response: dict[str, Any] = {
+        "id": response_id,
+        "object": "response",
+        "status": "completed",
+        "model": response_slug,
+        "output": [compaction_item],
+    }
+    if usage is not None:
+        completed_response["usage"] = usage
+    await _write_ws_json(
+        ws,
+        {
+            "type": "response.output_item.done",
+            "output_index": 0,
+            "item": compaction_item,
+        },
+    )
+    await _write_ws_json(
+        ws,
+        {
+            "type": "response.completed",
+            "response": completed_response,
+        },
+    )
+
+
+async def _ws_error_from_http_response(ws: web.WebSocketResponse, response: web.StreamResponse | web.Response) -> None:
+    text = ""
+    if isinstance(response, web.Response):
+        text = response.text or ""
+    code, message = parse_upstream_error(text, response.status)
+    await _write_ws_error(ws, response.status, code, message)
+
+
+async def _stream_compaction_v2_sse(
+    request: web.Request,
+    response_slug: str,
+    compaction_item: dict[str, Any],
+    usage: dict[str, Any] | None,
+) -> web.StreamResponse:
+    response = _sse_response()
+    await response.prepare(request)
+    response_id = f"resp_compact_{int(time.time() * 1000)}"
+    completed_response: dict[str, Any] = {
+        "id": response_id,
+        "object": "response",
+        "status": "completed",
+        "model": response_slug,
+        "output": [compaction_item],
+    }
+    if usage is not None:
+        completed_response["usage"] = usage
+    try:
+        await _write_sse(
+            response,
+            {
+                "type": "response.output_item.done",
+                "output_index": 0,
+                "item": compaction_item,
+            },
+        )
+        await _write_sse(
+            response,
+            {
+                "type": "response.completed",
+                "response": completed_response,
+            },
+        )
+        await response.write(b"data: [DONE]\n\n")
+    except ClientDisconnected:
+        pass
+    try:
+        await response.write_eof()
+    except Exception:
+        pass
+    return response
 
 
 async def _write_ws_error(ws: web.WebSocketResponse, status: int, code: str, message: str) -> None:
