@@ -33,6 +33,61 @@ class CursorCatalogModel:
     display_name: str
 
 
+_DEFAULT_CURSOR_CONTEXT = 200_000
+_CURSOR_COMPACT_FRACTION = 0.8
+_CURSOR_TRUNCATION_LIMIT = 64_000
+_CONTEXT_1M_RE = re.compile(r"\b1\s*M\b", re.IGNORECASE)
+_CONTEXT_K_RE = re.compile(r"\b(\d{2,4})\s*[Kk]\b")
+_COMPOSER_UPSTREAM_RE = re.compile(r"^composer(?:[-.]\d+(?:\.\d+)*)?(?:[-.](?:fast|high|low))?$", re.IGNORECASE)
+_GPT5_UPSTREAM_RE = re.compile(r"^gpt-5", re.IGNORECASE)
+
+
+def infer_cursor_context_limit(
+    *,
+    display_name: str,
+    upstream_id: str,
+    catalog_slug: str = "",
+) -> int:
+    """Best-effort context window from cursor-agent labels (not exposed by CLI metadata)."""
+    label = display_name or ""
+    upstream = (upstream_id or catalog_slug or "").strip().lower()
+
+    if _CONTEXT_1M_RE.search(label):
+        return 1_000_000
+
+    k_match = _CONTEXT_K_RE.search(label)
+    if k_match:
+        return int(k_match.group(1)) * 1_000
+
+    if _COMPOSER_UPSTREAM_RE.match(upstream) or upstream.startswith("composer"):
+        return 200_000
+
+    if "codex" in upstream:
+        return 272_000
+
+    if _GPT5_UPSTREAM_RE.match(upstream):
+        return 400_000
+
+    if "claude" in upstream or "claude" in label.lower():
+        return 200_000
+
+    return _DEFAULT_CURSOR_CONTEXT
+
+
+def cursor_context_catalog_fields(model: CursorCatalogModel) -> dict[str, int | dict[str, Any]]:
+    context = infer_cursor_context_limit(
+        display_name=model.display_name,
+        upstream_id=model.upstream_id,
+        catalog_slug=model.catalog_slug,
+    )
+    return {
+        "context_window": context,
+        "max_context_window": context,
+        "auto_compact_token_limit": int(context * _CURSOR_COMPACT_FRACTION),
+        "truncation_policy": {"mode": "tokens", "limit": _CURSOR_TRUNCATION_LIMIT},
+    }
+
+
 def cursor_spawn_env() -> dict[str, str]:
     """Environment for cursor-agent child processes.
 
@@ -265,6 +320,7 @@ def cursor_passthrough_display_names() -> dict[str, str]:
 
 def cursor_catalog_entry(model: CursorCatalogModel) -> dict[str, Any]:
     display_name = model.display_name
+    context_fields = cursor_context_catalog_fields(model)
     return {
         "slug": model.catalog_slug,
         "display_name": display_name,
@@ -272,10 +328,7 @@ def cursor_catalog_entry(model: CursorCatalogModel) -> dict[str, Any]:
             display_name,
             "routed through your Cursor subscription (cursor-agent login)",
         ),
-        "context_window": 272_000,
-        "max_context_window": 272_000,
-        "auto_compact_token_limit": 217_600,
-        "truncation_policy": {"mode": "tokens", "limit": 64_000},
+        **context_fields,
         "default_reasoning_level": "medium",
         "supported_reasoning_levels": [
             {"effort": "low", "description": "Faster, lighter reasoning"},

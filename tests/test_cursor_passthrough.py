@@ -3,13 +3,16 @@ from __future__ import annotations
 import json
 
 from codex_shim.cursor_passthrough import (
+    CursorCatalogModel,
     CursorResponseCollector,
     CursorStreamParser,
     _parse_cursor_list_models_output,
     build_cursor_prompt,
+    cursor_catalog_entry,
     cursor_upstream_model,
     format_cursor_tool_completed_markdown,
     format_cursor_tool_started_markdown,
+    infer_cursor_context_limit,
     is_cursor_passthrough_slug,
     iter_cursor_agent_events,
 )
@@ -21,6 +24,73 @@ def test_parse_cursor_list_models_output():
     assert models["cursor-composer-2-5"].upstream_id == "composer-2.5"
     assert models["cursor-composer-2-5"].display_name == "Cursor - Composer 2.5"
     assert models["cursor-gpt-5-3-codex"].upstream_id == "gpt-5.3-codex"
+
+
+def test_infer_cursor_context_limit_heuristics():
+    assert (
+        infer_cursor_context_limit(
+            display_name="Cursor - Composer 2.5",
+            upstream_id="composer-2.5",
+        )
+        == 200_000
+    )
+    assert (
+        infer_cursor_context_limit(
+            display_name="Cursor - Opus 4.6 1M Thinking",
+            upstream_id="claude-opus-4-6-opus-high-thinking",
+        )
+        == 1_000_000
+    )
+    assert (
+        infer_cursor_context_limit(
+            display_name="Cursor - GPT-5.5 1M High",
+            upstream_id="gpt-5.5-high",
+        )
+        == 1_000_000
+    )
+    assert (
+        infer_cursor_context_limit(
+            display_name="Cursor - GPT-5.5 High",
+            upstream_id="gpt-5.5-high",
+        )
+        == 400_000
+    )
+    assert (
+        infer_cursor_context_limit(
+            display_name="Cursor - Sonnet 4.5",
+            upstream_id="claude-4-5-sonnet",
+        )
+        == 200_000
+    )
+    assert (
+        infer_cursor_context_limit(
+            display_name="Cursor - Codex 5.3",
+            upstream_id="gpt-5.3-codex",
+        )
+        == 272_000
+    )
+
+
+def test_cursor_catalog_entry_uses_context_heuristics():
+    composer = cursor_catalog_entry(
+        CursorCatalogModel(
+            catalog_slug="cursor-composer-2-5",
+            upstream_id="composer-2.5",
+            display_name="Cursor - Composer 2.5",
+        )
+    )
+    assert composer["context_window"] == 200_000
+    assert composer["auto_compact_token_limit"] == 160_000
+
+    opus = cursor_catalog_entry(
+        CursorCatalogModel(
+            catalog_slug="cursor-claude-4-6-opus-high-thinking",
+            upstream_id="claude-opus-4-6-opus-high-thinking",
+            display_name="Cursor - Opus 4.6 1M Thinking",
+        )
+    )
+    assert opus["context_window"] == 1_000_000
+    assert opus["auto_compact_token_limit"] == 800_000
 
 
 def test_is_cursor_passthrough_slug(monkeypatch):
