@@ -117,6 +117,18 @@ Injection is always driven by the HTTP invoke, not by parsing NDJSON.
 - **Goals still loop** — confirm Composer actually ran the bridge curl (check reasoning / shell output) and that `update_goal` was invoked with `status: complete` or `blocked`.
 - **`create_goal` fails validation** — Codex requires an `objective` string, not `name`/`description`.
 
+## Verified in live session (2026-06-28)
+
+Real bridged Codex session under Cursor Composer 2.5 (bridge session `uyqpNSBgq2SBawBG` on :8765):
+
+- The full injected suffix block (including workspace path `/home/henry`, exact curl recipe, allowed tools list, and goal rules) was received by the inner agent exactly as emitted by `build_bridge_suffix`.
+- `create_goal` was invoked via the prescribed `curl -sS -X POST ...` pattern using Shell tool; shim accepted it and returned `{"ok": true, ..., "codex_call_id": "call_..._1"}`, confirming the emit path to Codex.
+- Regular operations (edits, `git`, tests via `uv run pytest`, `codex-shim doctor`) were performed with direct shell — bridge curl used **only** for listed Codex tools per the injected rules.
+- `codex-shim doctor` reported: cursor_passthrough true, 1 session dir in chatgpt-conversations cache, 4 cached responses, stale-pid warning handled gracefully (health still OK).
+- Goal completion will be signaled via `update_goal` + `status: "complete"` at end of task.
+
+This validates the bridge solves goal/tool visibility for Codex when routed through Cursor passthrough.
+
 ## Smoke test
 
 End-to-end tmux smoke (fresh temp dir, `codex exec`, composer-2.5, goal + bridge):

@@ -653,8 +653,10 @@ mint a new token and the entry comes back automatically on the next
 The passthrough forwards Codex request headers wholesale (session/thread metadata,
 `x-codex-*`, etc.), overrides only `Authorization` with your Codex access token,
 rewrites the model slug to the upstream ChatGPT id, and strips
-`previous_response_id` while replaying delta continuations from an in-memory cache
-(ChatGPT's OAuth backend rejects that field). When Codex uses the Responses
+`previous_response_id` while replaying delta continuations from a session-scoped
+JSON cache under `~/.codex-shim/chatgpt-conversations/` (override with
+`CODEX_SHIM_CHATGPT_CONVERSATIONS_DIR`). The cache survives shim restarts; use one
+shim instance per home directory. When Codex uses the Responses
 WebSocket transport, the shim proxies to `wss://chatgpt.com/backend-api/codex/responses`
 and relays JSON frames (with the same expansion and model rewrite). If upstream
 WSS is unavailable, it falls back to the legacy HTTP+SSE path automatically.
@@ -670,6 +672,7 @@ Debug env knobs:
 | `CODEX_SHIM_STREAM_LOG=1` | Log SSE/WS event types |
 | `CODEX_SHIM_WS_PASSTHROUGH=0` | Force legacy HTTP+SSE upstream for ChatGPT/BYOK WS routes (default: on) |
 | `CODEX_SHIM_CHATGPT_EXPAND_CONTINUATIONS=0` | Disable delta replay (ChatGPT 400s on native `previous_response_id`) |
+| `CODEX_SHIM_CHATGPT_CONVERSATIONS_DIR` | Root for persisted expansion cache (default: `~/.codex-shim/chatgpt-conversations`) |
 
 Live smoke test (alternate port, `codex exec` with tool call + cache check):
 
@@ -679,7 +682,8 @@ SMOKE_PORT=8766 bash scripts/smoke_chatgpt_passthrough.sh
 
 **Two different caches:** ChatGPT **prefix cache** (`cached_tokens` in upstream usage) is
 server-side and keyed by stable session/thread headers the shim forwards. The shim
-**conversation cache** (1024 responses, in-memory) replays delta continuations because
+**conversation cache** (1024 responses per session, JSON on disk under
+`~/.codex-shim/chatgpt-conversations/`) replays delta continuations because
 ChatGPT's OAuth backend rejects `previous_response_id` (HTTP 400). Expansion is on by
 default and required for multi-turn tool calls; it does not block prefix cache —
 continuation turns often show ~95%+ `cached_tokens` when thread metadata is stable.

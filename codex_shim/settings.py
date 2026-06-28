@@ -10,6 +10,7 @@ from typing import Any
 from .catalog_slugs import CHATGPT_CATALOG_SLUG, CHATGPT_UPSTREAM_DEFAULT, codex_catalog_slug
 
 DEFAULT_SETTINGS = Path.home() / ".codex-shim" / "models.json"
+DEFAULT_CHATGPT_CONVERSATIONS_DIR = Path.home() / ".codex-shim" / "chatgpt-conversations"
 DEFAULT_CURSOR_API_KEY_FILE = Path.home() / ".codex-shim" / "cursor-api-key"
 DEFAULT_CODEX_AUTH = Path.home() / ".codex" / "auth.json"
 DEFAULT_CODEX_MODELS_CACHE = Path.home() / ".codex" / "models_cache.json"

@@ -48,6 +48,13 @@ def auth_missing(monkeypatch, tmp_path):
     monkeypatch.setattr("codex_shim.server.DEFAULT_CODEX_AUTH", missing)
 
 
+@pytest.fixture
+def chatgpt_cache_dir(monkeypatch, tmp_path):
+    cache_root = tmp_path / "chatgpt-conversations"
+    monkeypatch.setattr(server_module, "_chatgpt_conversations_dir", lambda: cache_root)
+    return cache_root
+
+
 def test_sanitize_chatgpt_passthrough_body_drops_shim_reasoning():
     body = {
         "model": "claude-local",
@@ -327,9 +334,10 @@ async def test_chatgpt_passthrough_strips_previous_response_id_when_expand_disab
 
 
 async def test_chatgpt_passthrough_expands_previous_response_id_by_default(
-    monkeypatch, tmp_path, auth_present
+    monkeypatch, tmp_path, auth_present, chatgpt_cache_dir
 ):
     captured = []
+    session_headers = {"session-id": "test-session-expand"}
     first_input = [{"type": "message", "role": "user", "content": "run a command"}]
     tool_call = {
         "type": "function_call",
@@ -366,7 +374,11 @@ async def test_chatgpt_passthrough_expands_previous_response_id_by_default(
     shim_client = TestClient(TestServer(ShimServer(settings).app()))
     await shim_client.start_server()
 
-    first = await shim_client.post("/v1/responses", json={"model": "codex-gpt-5-5", "input": first_input})
+    first = await shim_client.post(
+        "/v1/responses",
+        json={"model": "codex-gpt-5-5", "input": first_input},
+        headers=session_headers,
+    )
     assert first.status == 200
 
     second = await shim_client.post(
@@ -376,12 +388,115 @@ async def test_chatgpt_passthrough_expands_previous_response_id_by_default(
             "previous_response_id": "resp_previous",
             "input": [tool_output],
         },
+        headers=session_headers,
     )
     assert second.status == 200
 
     assert "previous_response_id" not in captured[1]
     assert captured[1]["input"] == [*first_input, tool_call, tool_output]
 
+    await shim_client.close()
+
+
+async def test_chatgpt_passthrough_expands_from_disk_after_restart(
+    monkeypatch, tmp_path, auth_present, chatgpt_cache_dir
+):
+    captured = []
+    session_headers = {"session-id": "test-session-restart"}
+    first_input = [{"type": "message", "role": "user", "content": "run a command"}]
+    tool_call = {
+        "type": "function_call",
+        "id": "fc_1",
+        "call_id": "call_1",
+        "name": "exec_command",
+        "arguments": "{\"cmd\":\"printf ok\"}",
+    }
+    tool_output = {"type": "function_call_output", "call_id": "call_1", "output": "ok"}
+
+    class FakeUpstream:
+        status = 200
+        content_type = "application/json"
+        headers = {}
+
+        def __init__(self, payload):
+            self.payload = payload
+
+        async def json(self, content_type=None):
+            return self.payload
+
+        def release(self):
+            pass
+
+    async def fake_post(self, url, json=None, headers=None):
+        captured.append(json)
+        if len(captured) == 1:
+            return FakeUpstream({"id": "resp_previous", "model": "gpt-5.5", "output": [tool_call]})
+        return FakeUpstream({"id": "resp_next", "model": "gpt-5.5", "output": []})
+
+    monkeypatch.setattr("codex_shim.server.ClientSession.post", fake_post)
+    settings = tmp_path / "settings.json"
+    settings.write_text("{}")
+
+    first_client = TestClient(TestServer(ShimServer(settings).app()))
+    await first_client.start_server()
+    first = await first_client.post(
+        "/v1/responses",
+        json={"model": "codex-gpt-5-5", "input": first_input},
+        headers=session_headers,
+    )
+    assert first.status == 200
+    await first_client.close()
+
+    second_client = TestClient(TestServer(ShimServer(settings).app()))
+    await second_client.start_server()
+    second = await second_client.post(
+        "/v1/responses",
+        json={
+            "model": "codex-gpt-5-5",
+            "previous_response_id": "resp_previous",
+            "input": [tool_output],
+        },
+        headers=session_headers,
+    )
+    assert second.status == 200
+    assert captured[1]["input"] == [*first_input, tool_call, tool_output]
+    await second_client.close()
+
+
+async def test_chatgpt_passthrough_logs_cache_miss(
+    monkeypatch, tmp_path, auth_present, chatgpt_cache_dir, capsys
+):
+    class FakeUpstream:
+        status = 200
+        content_type = "application/json"
+        headers = {}
+
+        async def json(self, content_type=None):
+            return {"id": "resp_next", "model": "gpt-5.5", "output": []}
+
+        def release(self):
+            pass
+
+    async def fake_post(self, url, json=None, headers=None):
+        return FakeUpstream()
+
+    monkeypatch.setattr("codex_shim.server.ClientSession.post", fake_post)
+    settings = tmp_path / "settings.json"
+    settings.write_text("{}")
+    shim_client = TestClient(TestServer(ShimServer(settings).app()))
+    await shim_client.start_server()
+
+    response = await shim_client.post(
+        "/v1/responses",
+        json={
+            "model": "codex-gpt-5-5",
+            "previous_response_id": "resp_missing",
+            "input": [{"type": "message", "role": "user", "content": "delta"}],
+        },
+        headers={"session-id": "test-session-miss"},
+    )
+    assert response.status == 200
+    assert "MISS session=test-session-miss previous_response_id=resp_missing" in capsys.readouterr().out
     await shim_client.close()
 
 

@@ -9,11 +9,19 @@ and this project does not yet follow semantic versioning (pre-1.0).
 
 ### Added
 
+- ChatGPT passthrough conversation cache persistence: expansion snapshots are stored
+  per Codex `session-id` (or `thread-id`) as immutable JSON files under
+  `~/.codex-shim/chatgpt-conversations/` (`CODEX_SHIM_CHATGPT_CONVERSATIONS_DIR`).
+  Survives shim restarts; mtime FIFO eviction keeps 1024 responses per session.
+  `codex-shim doctor` reports cache stats.
+
 - Cursor-agent tool translation registry: explicit mappings for `deleteToolCall`,
   `globToolCall`, and `grepToolCall`; unknown tools render as JSON-fenced reasoning
   blocks (`CODEX_SHIM_CURSOR_TOOL_VERBOSE=1` keeps noisy fields). Live composer-2.5
   fixtures and capture scripts: `scripts/capture_cursor_tool_traces.sh`,
   `scripts/extract_cursor_tool_keys.py`, `docs/cursor-agent-tools.md`.
+
+- Bridge live verification: end-to-end curl invoke from Composer 2.5 session (`create_goal`, `update_goal`) works; `codex-shim doctor` now includes conversation cache stats; injected suffix matches production usage in Cursor passthrough.
 
 ### Fixed
 

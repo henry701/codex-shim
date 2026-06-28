@@ -21,6 +21,7 @@ import struct
 from urllib.request import urlopen
 
 from . import router as router_module
+from .chatgpt_conversation_cache import ChatgptConversationCache
 from .catalog import _toml_escape, codex_config_overrides, write_catalog, write_config
 from .cursor_passthrough import (
     cursor_catalog_models,
@@ -32,6 +33,7 @@ from .cursor_passthrough import (
 from .discover import discover_byok_models, discover_summary
 from .catalog_slugs import CHATGPT_CATALOG_SLUG
 from .settings import (
+    DEFAULT_CHATGPT_CONVERSATIONS_DIR,
     DEFAULT_CODEX_AUTH,
     DEFAULT_SETTINGS,
     DEFAULT_HOST,
@@ -319,6 +321,7 @@ def doctor(settings_path: Path, port: int) -> int:
     checks.extend(_doctor_codex_cli())
     checks.extend(_doctor_settings(expanded))
     checks.extend(_doctor_runtime_files())
+    checks.extend(_doctor_chatgpt_conversation_cache())
     checks.extend(_doctor_daemon(port))
     checks.extend(_doctor_chatgpt())
     checks.extend(_doctor_cursor())
@@ -441,6 +444,31 @@ def _doctor_runtime_files() -> list[DoctorCheck]:
     checks.append(DoctorCheck("Runtime files", "OK" if CONFIG_PATH.exists() else "INFO", f"config{'' if CONFIG_PATH.exists() else ' missing'}: {CONFIG_PATH}"))
     checks.append(DoctorCheck("Runtime files", "INFO", f"pid file{'' if PID_PATH.exists() else ' missing'}: {PID_PATH}"))
     checks.append(DoctorCheck("Runtime files", "INFO", f"log file{'' if LOG_PATH.exists() else ' missing'}: {LOG_PATH}"))
+    return checks
+
+
+def _doctor_chatgpt_conversation_cache() -> list[DoctorCheck]:
+    section = "ChatGPT conversation cache"
+    root = Path(os.environ.get("CODEX_SHIM_CHATGPT_CONVERSATIONS_DIR", DEFAULT_CHATGPT_CONVERSATIONS_DIR)).expanduser()
+    cache = ChatgptConversationCache(root)
+    stats = cache.stats()
+    checks = [
+        DoctorCheck(section, "OK", f"root: {root}"),
+        DoctorCheck(section, "INFO", f"session dirs: {stats['session_dirs']}"),
+        DoctorCheck(section, "INFO", f"cached responses: {stats['file_count']}"),
+        DoctorCheck(section, "INFO", f"disk bytes: {stats['total_bytes']}"),
+        DoctorCheck(section, "INFO", f"in-memory read entries: {stats['read_cache_entries']}"),
+    ]
+    if stats["file_count"] > 0:
+        checks.append(
+            DoctorCheck(
+                section,
+                "INFO",
+                "persists per-thread expansion across shim restarts",
+                "One JSON file per response_id under session-id (or thread-id). "
+                "Run a single shim instance per home directory; there is no cross-process locking.",
+            )
+        )
     return checks
 
 
