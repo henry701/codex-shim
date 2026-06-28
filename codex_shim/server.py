@@ -1422,11 +1422,11 @@ class ShimServer:
                 )
                 if fallback is not None:
                     return fallback
-                return web.Response(
-                    status=status,
-                    text=text,
+                return _upstream_text_response(
+                    status,
+                    text,
                     content_type=content_type,
-                    headers=upstream_forward_headers,
+                    upstream_headers=upstream_forward_headers,
                 )
             if not forwarded.get("stream"):
                 payload = await upstream.json(content_type=None)
@@ -1574,11 +1574,11 @@ class ShimServer:
                 )
                 if fallback is not None:
                     return fallback
-                return web.Response(
-                    status=status,
-                    text=text,
+                return _upstream_text_response(
+                    status,
+                    text,
                     content_type=content_type,
-                    headers=upstream_forward_headers,
+                    upstream_headers=upstream_forward_headers,
                 )
             payload = await upstream.json(content_type=None)
         usage = payload.get("usage") if isinstance(payload, dict) else None
@@ -4706,8 +4706,19 @@ async def _error_response(upstream, *, slug: str | None = None) -> web.Response:
         print(f"[err] upstream {slug} returned {status}: {message[:500]}", flush=True)
     upstream_response_headers = upstream_headers_from_response(upstream)
     upstream.release()
+    return _upstream_text_response(status, text, content_type=content_type, upstream_headers=upstream_response_headers)
+
+
+def _upstream_text_response(
+    status: int,
+    text: str,
+    *,
+    content_type: str,
+    upstream_headers: Mapping[str, str] | None = None,
+) -> web.Response:
     response = web.Response(status=status, text=text, content_type=content_type)
-    apply_upstream_headers_to_response(response, upstream_response_headers)
+    if upstream_headers:
+        apply_upstream_headers_to_response(response, upstream_headers)
     return response
 
 

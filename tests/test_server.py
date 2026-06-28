@@ -2372,6 +2372,56 @@ async def test_chatgpt_http_compaction_v2_before_passthrough(monkeypatch, tmp_pa
         await shim_client.close()
 
 
+async def test_chatgpt_compact_passthrough_forwards_upstream_error_without_crash(
+    monkeypatch, tmp_path, auth_present
+):
+    class FakeUpstream:
+        status = 503
+        content_type = "application/json"
+        headers = {
+            "Content-Type": "application/json",
+            "x-request-id": "req-compact-503",
+        }
+
+        async def text(self):
+            return (
+                '{"error":{"message":"We\'re currently experiencing high demand, '
+                'which may cause temporary errors."}}'
+            )
+
+        def release(self):
+            pass
+
+    async def fake_post(self, url, json=None, headers=None):
+        assert url == "https://chatgpt.com/backend-api/codex/responses/compact"
+        return FakeUpstream()
+
+    monkeypatch.setattr("codex_shim.server.ClientSession.post", fake_post)
+
+    settings = tmp_path / "settings.json"
+    settings.write_text("{}")
+    shim_client = TestClient(TestServer(ShimServer(settings).app()))
+    await shim_client.start_server()
+    try:
+        resp = await shim_client.post(
+            "/v1/responses",
+            json={
+                "model": "codex-gpt-5-5",
+                "stream": True,
+                "input": [
+                    {"type": "message", "role": "user", "content": "long thread"},
+                    {"type": "compaction_trigger"},
+                ],
+            },
+        )
+        assert resp.status == 503
+        body = await resp.text()
+        assert "high demand" in body
+        assert resp.headers.get("x-request-id") == "req-compact-503"
+    finally:
+        await shim_client.close()
+
+
 async def test_responses_routes_openai_responses_provider_to_upstream_responses(tmp_path):
     captured = {}
 
