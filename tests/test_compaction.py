@@ -4,6 +4,7 @@ import pytest
 
 from codex_shim.compaction import (
     CompactionTriggerError,
+    apply_compaction_fallback_notice,
     compact_response_payload,
     compaction_output_item,
     compaction_summary_from_output,
@@ -36,6 +37,13 @@ def test_compaction_round_trip_summary_encoding():
     summary = "Task: finish compaction support for DeepSeek."
     encrypted = encode_shim_compaction_summary(summary)
     assert decode_shim_compaction_summary(encrypted) == summary
+
+
+def test_apply_compaction_fallback_notice_prepends_agent_context():
+    text = apply_compaction_fallback_notice("Keep going.", "Bad Request")
+    assert "Remote native compaction failed (Bad Request)" in text
+    assert "fallback summarization" in text
+    assert text.endswith("Keep going.")
 
 
 def test_compact_response_payload_emits_compaction_item():

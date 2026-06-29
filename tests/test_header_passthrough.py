@@ -4,6 +4,7 @@ from multidict import CIMultiDict
 
 from codex_shim.header_passthrough import (
     apply_upstream_headers_to_response,
+    chatgpt_passthrough_upstream_headers,
     client_headers_for_upstream,
     forwardable_upstream_response_headers,
     log_upstream_response_headers,
@@ -38,6 +39,17 @@ def test_client_headers_for_upstream_preserves_codex_headers_and_applies_overrid
     assert merged["OpenAI-Beta"] == "responses=2026-02-06"
     assert "Host" not in merged
     assert "X-Codex-Shim-Picker-Token" not in merged
+
+
+def test_chatgpt_passthrough_upstream_headers_overrides_websocket_beta_for_http():
+    merged = chatgpt_passthrough_upstream_headers(
+        {"OpenAI-Beta": "responses_websockets=2026-02-06", "originator": "Codex Desktop"},
+        access_token="token",
+        account_id="acct",
+        accept="application/json",
+    )
+    assert merged["OpenAI-Beta"] == "responses=2026-02-06"
+    assert merged["Authorization"] == "Bearer token"
 
 
 def test_forwardable_upstream_response_headers_skips_hop_by_hop():

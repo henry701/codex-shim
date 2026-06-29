@@ -20,6 +20,7 @@ from aiohttp import ClientError, ClientSession, ClientTimeout, WSMsgType, web
 from .compaction import (
     CompactionTriggerError,
     SHIM_COMPACTION_PREFIX,
+    apply_compaction_fallback_notice,
     compact_response_payload,
     compaction_item_from_response_payload,
     compaction_output_item,
@@ -111,6 +112,7 @@ from .translate import (
     _responses_usage_to_anthropic_usage,
 )
 from .upstream_compat import learn_parallel_tool_calls_compat_if_needed, prepare_openai_chat_body
+from .upstream_io_trace import log_upstream_request, log_upstream_response, shim_io_log_enabled
 
 DEBUG_DIR = Path(__file__).resolve().parents[1] / ".codex-shim"
 CODEX_CONFIG_PATH = Path.home() / ".codex" / "config.toml"
@@ -170,6 +172,15 @@ class ShimServer:
         }
         self._chatgpt_conversation_cache = ChatgptConversationCache(_chatgpt_conversations_dir())
         self.picker_token = secrets.token_urlsafe(32)
+        self._chatgpt_compaction_locks: dict[str, asyncio.Lock] = {}
+        self._compact_timeout = ClientTimeout(total=300, sock_connect=120, sock_read=300)
+
+    def _chatgpt_compaction_lock(self, session_key: str) -> asyncio.Lock:
+        lock = self._chatgpt_compaction_locks.get(session_key)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._chatgpt_compaction_locks[session_key] = lock
+        return lock
 
     def _session_key(self, request: web.Request) -> str:
         return session_key_from_headers(request.headers)
@@ -424,6 +435,9 @@ class ShimServer:
                             "only response.create websocket frames are supported",
                         )
                         continue
+                    body = {k: v for k, v in payload.items() if k != "type"}
+                    if _shim_io_log_enabled() or _input_has_compaction_trigger(body.get("input")):
+                        _log_client_request("/v1/responses/ws", body, transport="ws")
                     if await self._maybe_handle_ws_compaction_v2(request, ws, payload):
                         continue
                     target = await self._resolve_ws_passthrough_target(payload)
@@ -638,11 +652,20 @@ class ShimServer:
         _log_chatgpt_passthrough_trace(request, forwarded, headers, phase="pre-upstream-ws-http-fallback")
         url = "https://chatgpt.com/backend-api/codex/responses"
         print(f"[ws-passthrough] http-fallback POST {url}", flush=True)
+        log_upstream_request("chatgpt-passthrough-ws-http", url, forwarded)
         upstream = await http_session.post(url, json=forwarded, headers=headers)
         upstream_forward_headers = observe_upstream_response("chatgpt-passthrough-ws", upstream)
         if upstream.status >= 400:
             text = await upstream.text()
             code, message = parse_upstream_error(text, upstream.status)
+            log_upstream_response(
+                "chatgpt-passthrough-ws-http",
+                url,
+                upstream.status,
+                text,
+                request_body=forwarded,
+                stream=True,
+            )
             upstream.release()
             await _write_ws_error(ws, upstream.status, code, message)
             return
@@ -849,6 +872,7 @@ class ShimServer:
             )
         if stripped_input is None:
             return None
+        _log_client_request("/v1/responses compaction-v2", body)
         return await self._responses_compaction_v2(request, body, stripped_input)
 
     async def _maybe_handle_ws_compaction_v2(
@@ -866,14 +890,29 @@ class ShimServer:
             return True
         if stripped_input is None:
             return False
+        _log_client_request("ws compaction-v2", body, transport="ws")
         compaction_item, response_slug, usage, error_response = await self._resolve_compaction_v2_result(
             request,
             body,
             stripped_input,
         )
         if error_response is not None:
+            text = error_response.text if isinstance(error_response, web.Response) else ""
+            code, message = parse_upstream_error(text, error_response.status)
+            _log_client_response(
+                "ws compaction-v2",
+                error_response.status,
+                detail=message,
+                code=code,
+            )
             await _ws_error_from_http_response(ws, error_response)
             return True
+        summary_chars = len(decode_shim_compaction_summary(compaction_item.get("encrypted_content")) or "")
+        _log_client_response(
+            "ws compaction-v2",
+            200,
+            detail=f"compaction item id={compaction_item.get('id')!r} summary_chars={summary_chars}",
+        )
         await _write_compaction_v2_ws(ws, response_slug, compaction_item, usage)
         return True
 
@@ -888,6 +927,10 @@ class ShimServer:
         tool_resolve: dict[str, tuple[str | None, str]] | None = None,
     ) -> tuple[dict[str, Any], str, dict[str, Any] | None, web.StreamResponse | web.Response | None]:
         model = str(body.get("model") or "")
+        print(
+            f"[compaction-v2] resolve model={model!r} stripped_input_items={len(stripped_input)}",
+            flush=True,
+        )
         if is_chatgpt_passthrough_slug(model):
             upstream_model = chatgpt_upstream_model(model)
             item, usage, error_response = await self._fetch_chatgpt_compaction_v2_item(
@@ -937,23 +980,179 @@ class ShimServer:
         requested_slug: str,
         upstream_model: str,
     ) -> tuple[dict[str, Any], dict[str, Any] | None, web.StreamResponse | web.Response | None]:
-        compact_body = _compact_request_body({**body, "input": stripped_input}, upstream_model)
+        session_key = self._session_key(request)
+        async with self._chatgpt_compaction_lock(session_key):
+            compact_body = _chatgpt_compact_request_body(stripped_input, upstream_model)
+            compact_body["model"] = requested_slug
+            response = await self._chatgpt_compact_passthrough(request, compact_body, upstream_model=upstream_model)
+            if response.status >= 400:
+                text = response.text or ""
+                _, message = parse_upstream_error(text, response.status)
+                return await self._try_native_compaction_v2_fallback(
+                    request,
+                    body,
+                    stripped_input,
+                    requested_slug=requested_slug,
+                    upstream_model=upstream_model,
+                    native_status=response.status,
+                    native_message=message,
+                    native_response=response,
+                )
+            try:
+                payload = json.loads(response.text or "{}")
+            except json.JSONDecodeError:
+                return {}, None, response
+            if not isinstance(payload, dict):
+                return {}, None, response
+            item = compaction_item_from_response_payload(payload)
+            if item is None:
+                summary = compaction_summary_from_output(payload.get("output"))
+                item = compaction_output_item(summary or "Compaction summary unavailable.")
+            usage = payload.get("usage") if isinstance(payload.get("usage"), dict) else None
+            _log_upstream_status(
+                "chatgpt-compact",
+                "https://chatgpt.com/backend-api/codex/responses/compact",
+                200,
+            )
+            return item, usage, None
+
+    async def _try_native_compaction_v2_fallback(
+        self,
+        request: web.Request,
+        body: dict[str, Any],
+        stripped_input: list[Any],
+        *,
+        requested_slug: str,
+        upstream_model: str,
+        native_status: int,
+        native_message: str,
+        native_response: web.StreamResponse | web.Response,
+    ) -> tuple[dict[str, Any], dict[str, Any] | None, web.StreamResponse | web.Response | None]:
+        print(
+            f"[fallback] {requested_slug} native compaction {native_status} -> summarization: "
+            f"{native_message[:200]}",
+            flush=True,
+        )
+        summary, usage, error_response = await self._fetch_chatgpt_summarization_compact_summary(
+            request,
+            body,
+            stripped_input,
+            requested_slug=requested_slug,
+            upstream_model=upstream_model,
+        )
+        if error_response is None and summary:
+            return (
+                compaction_output_item(
+                    apply_compaction_fallback_notice(summary, native_message),
+                ),
+                usage,
+                None,
+            )
+        byok_summary, byok_usage, byok_error = await self._fetch_compaction_v2_byok_fallback_summary(
+            request,
+            body,
+            stripped_input,
+            requested_slug=requested_slug,
+            native_message=native_message,
+        )
+        if byok_error is None and byok_summary:
+            return (
+                compaction_output_item(
+                    apply_compaction_fallback_notice(byok_summary, native_message),
+                ),
+                byok_usage,
+                None,
+            )
+        return {}, None, native_response
+
+    async def _fetch_chatgpt_summarization_compact_summary(
+        self,
+        request: web.Request,
+        body: dict[str, Any],
+        stripped_input: list[Any],
+        *,
+        requested_slug: str,
+        upstream_model: str,
+    ) -> tuple[str, dict[str, Any] | None, web.StreamResponse | web.Response | None]:
+        compact_body = _chatgpt_compact_request_body(stripped_input, upstream_model)
         compact_body["model"] = requested_slug
-        response = await self._chatgpt_compact_passthrough(request, compact_body, upstream_model=upstream_model)
-        if response.status >= 400:
-            return {}, None, response
+        compact_body["stream"] = True
+        compact_body["instructions"] = (
+            f"{_default_compact_instructions()}\n\n"
+            "Summarize the conversation above into a compact context window suitable for continuing the task."
+        )
+        _log_compaction_upstream_trace(
+            phase="pre-summarization-fallback",
+            url="https://chatgpt.com/backend-api/codex/responses",
+            forwarded=compact_body,
+        )
+        log_upstream_request("chatgpt-summarization-compact", "https://chatgpt.com/backend-api/codex/responses", compact_body)
+        response = await self._chatgpt_passthrough(
+            request,
+            compact_body,
+            response_model_override=requested_slug,
+            upstream_model=upstream_model,
+            allow_byok_fallback=False,
+            collect_stream=True,
+        )
+        if not isinstance(response, web.Response) or response.status >= 400:
+            text = response.text if isinstance(response, web.Response) else ""
+            status = response.status if isinstance(response, web.Response) else None
+            _log_compaction_upstream_trace(
+                phase="summarization-fallback-error",
+                url="https://chatgpt.com/backend-api/codex/responses",
+                forwarded=compact_body,
+                status=status,
+                response_text=text,
+            )
+            return "", None, response
         try:
             payload = json.loads(response.text or "{}")
         except json.JSONDecodeError:
-            return {}, None, response
+            return "", None, response
         if not isinstance(payload, dict):
-            return {}, None, response
-        item = compaction_item_from_response_payload(payload)
-        if item is None:
-            summary = compaction_summary_from_output(payload.get("output"))
-            item = compaction_output_item(summary or "Compaction summary unavailable.")
+            return "", None, response
+        summary = self._summary_from_compact_upstream_payload(payload)
+        if not summary.strip():
+            return "", None, response
         usage = payload.get("usage") if isinstance(payload.get("usage"), dict) else None
-        return item, usage, None
+        _log_upstream_status(
+            "chatgpt-summarization-compact",
+            "https://chatgpt.com/backend-api/codex/responses",
+            response.status,
+            message=f"summary_chars={len(summary)}",
+        )
+        return summary, usage, None
+
+    async def _fetch_compaction_v2_byok_fallback_summary(
+        self,
+        request: web.Request,
+        body: dict[str, Any],
+        stripped_input: list[Any],
+        *,
+        requested_slug: str,
+        native_message: str,
+    ) -> tuple[str, dict[str, Any] | None, web.StreamResponse | web.Response | None]:
+        fallback_slug = self._passthrough_fallback_slug(requested_slug)
+        if not fallback_slug:
+            return "", None, None
+        print(
+            f"[fallback] {requested_slug} native compaction -> BYOK {fallback_slug}: "
+            f"{native_message[:200]}",
+            flush=True,
+        )
+        fallback_body = {**body, "input": stripped_input, "model": fallback_slug}
+        route = await self._route(fallback_body)
+        tool_types = responses_tool_type_map(body.get("tools"))
+        tool_resolve = responses_tool_resolve_map(body.get("tools"))
+        compact_body = _compact_request_body(fallback_body, route.model)
+        return await self._fetch_byok_compact_summary(
+            request,
+            route,
+            compact_body,
+            tool_types=tool_types,
+            tool_resolve=tool_resolve,
+        )
 
     async def _fetch_cursor_compaction_v2_item(
         self,
@@ -1007,7 +1206,35 @@ class ShimServer:
             tool_resolve=tool_resolve,
         )
         if error_response is not None:
-            return error_response
+            response_slug = response_slug or str(body.get("model") or "unknown")
+            text = error_response.text if isinstance(error_response, web.Response) else ""
+            code, message = parse_upstream_error(text, error_response.status)
+            _log_client_response(
+                "http compaction-v2",
+                error_response.status,
+                detail=message,
+                code=code,
+            )
+            if body.get("stream"):
+                return await _stream_responses_error_from_http_response(
+                    request,
+                    response_slug,
+                    error_response,
+                    slug="compaction-v2",
+                )
+            text = error_response.text or ""
+            code, message = parse_upstream_error(text, error_response.status)
+            print(f"[err] compaction-v2 returned {error_response.status}: {message[:500]}", flush=True)
+            return web.json_response(
+                _responses_error_payload(response_slug, code, message),
+                status=error_response.status,
+            )
+        summary_chars = len(decode_shim_compaction_summary(compaction_item.get("encrypted_content")) or "")
+        _log_client_response(
+            "http compaction-v2",
+            200,
+            detail=f"compaction item id={compaction_item.get('id')!r} summary_chars={summary_chars}",
+        )
         return await _stream_compaction_v2_sse(request, response_slug, compaction_item, usage)
 
     async def _fetch_byok_compact_summary(
@@ -1021,9 +1248,20 @@ class ShimServer:
     ) -> tuple[str, dict[str, Any] | None, web.StreamResponse | web.Response | None]:
         compact_body = prepare_codex_byok_responses_body(compact_body, request.headers)
         compact_body["stream"] = False
+        _log_upstream_io_detail(
+            surface="byok-compact",
+            phase="pre-request",
+            url=f"{route.slug}:{route.provider}",
+            forwarded=compact_body,
+        )
         if route.is_openai_responses:
             upstream_response = await self._post_openai_responses(request, route, compact_body)
             if not isinstance(upstream_response, web.Response) or upstream_response.status >= 400:
+                _log_upstream_response_from_http(
+                    "byok-compact-openai-responses",
+                    route.slug,
+                    upstream_response,
+                )
                 return "", None, upstream_response
             try:
                 payload = json.loads(upstream_response.text or "{}")
@@ -1033,6 +1271,7 @@ class ShimServer:
                 return "", None, upstream_response
             summary = self._summary_from_compact_upstream_payload(payload)
             usage = payload.get("usage") if isinstance(payload.get("usage"), dict) else None
+            _log_upstream_status("byok-compact-openai-responses", route.slug, 200, message=f"summary_chars={len(summary)}")
             return summary, usage, None
         if route.is_openai_chat:
             forwarded = responses_to_chat(compact_body, route.model)
@@ -1046,6 +1285,7 @@ class ShimServer:
                 tool_resolve=tool_resolve,
             )
             if not isinstance(upstream_response, web.Response) or upstream_response.status >= 400:
+                _log_upstream_response_from_http("byok-compact-openai-chat", route.slug, upstream_response)
                 return "", None, upstream_response
             try:
                 payload = json.loads(upstream_response.text or "{}")
@@ -1055,6 +1295,7 @@ class ShimServer:
                 return "", None, upstream_response
             summary = self._summary_from_compact_upstream_payload(payload)
             usage = payload.get("usage") if isinstance(payload.get("usage"), dict) else None
+            _log_upstream_status("byok-compact-openai-chat", route.slug, 200, message=f"summary_chars={len(summary)}")
             return summary, usage, None
         if route.is_anthropic:
             forwarded = responses_to_anthropic(compact_body, route.model, route.max_output_tokens)
@@ -1068,6 +1309,7 @@ class ShimServer:
                 tool_resolve=tool_resolve,
             )
             if not isinstance(upstream_response, web.Response) or upstream_response.status >= 400:
+                _log_upstream_response_from_http("byok-compact-anthropic", route.slug, upstream_response)
                 return "", None, upstream_response
             try:
                 payload = json.loads(upstream_response.text or "{}")
@@ -1077,6 +1319,7 @@ class ShimServer:
                 return "", None, upstream_response
             summary = self._summary_from_compact_upstream_payload(payload)
             usage = payload.get("usage") if isinstance(payload.get("usage"), dict) else None
+            _log_upstream_status("byok-compact-anthropic", route.slug, 200, message=f"summary_chars={len(summary)}")
             return summary, usage, None
         error = web.HTTPBadGateway(text=f"Unsupported model provider: {route.provider}")
         return "", None, web.json_response(
@@ -1356,6 +1599,9 @@ class ShimServer:
         body: dict[str, Any],
         response_model_override: str | None = None,
         upstream_model: str | None = None,
+        *,
+        allow_byok_fallback: bool = True,
+        collect_stream: bool = False,
     ) -> web.StreamResponse:
         """Forward a Responses request to chatgpt.com using the user's Codex auth.
 
@@ -1395,6 +1641,8 @@ class ShimServer:
             raise web.HTTPUnauthorized(text="auth.json has no access_token")
         session_key = self._session_key(request)
         forwarded = self._prepare_chatgpt_passthrough_body(body, session_key=session_key)
+        if collect_stream:
+            forwarded["stream"] = True
         forwarded["model"] = upstream_model or CHATGPT_MODEL_SLUG
         headers = _chatgpt_passthrough_upstream_headers(
             request,
@@ -1404,6 +1652,7 @@ class ShimServer:
         )
         _log_chatgpt_passthrough_trace(request, forwarded, headers, phase="pre-upstream")
         url = "https://chatgpt.com/backend-api/codex/responses"
+        log_upstream_request("chatgpt-passthrough", url, forwarded)
         async with ClientSession(timeout=self.timeout) as session:
             upstream = await session.post(url, json=forwarded, headers=headers)
             if upstream.status >= 400:
@@ -1412,16 +1661,25 @@ class ShimServer:
                 status = upstream.status
                 content_type = upstream.content_type or "text/plain"
                 upstream.release()
-                fallback = await self._maybe_passthrough_byok_fallback(
-                    request,
-                    body,
-                    requested=requested,
-                    response_slug=requested,
-                    status=status,
-                    detail=text,
+                log_upstream_response(
+                    "chatgpt-passthrough",
+                    url,
+                    status,
+                    text,
+                    request_body=forwarded,
+                    stream=bool(forwarded.get("stream")),
                 )
-                if fallback is not None:
-                    return fallback
+                if allow_byok_fallback:
+                    fallback = await self._maybe_passthrough_byok_fallback(
+                        request,
+                        body,
+                        requested=requested,
+                        response_slug=requested,
+                        status=status,
+                        detail=text,
+                    )
+                    if fallback is not None:
+                        return fallback
                 return _upstream_text_response(
                     status,
                     text,
@@ -1446,12 +1704,79 @@ class ShimServer:
                     upstream,
                     usage=usage if isinstance(usage, dict) else None,
                 )
+                _log_upstream_status(
+                    "chatgpt-passthrough",
+                    url,
+                    200,
+                    message=f"response_id={payload.get('id') if isinstance(payload, dict) else None!r}",
+                )
+                log_upstream_response(
+                    "chatgpt-passthrough",
+                    url,
+                    200,
+                    json.dumps(payload, default=str)[:12_000] if isinstance(payload, dict) else "",
+                    request_body=forwarded,
+                    stream=False,
+                )
                 _rewrite_response_model(payload, response_model_override)
                 response = web.json_response(payload)
                 apply_upstream_headers_to_response(response, upstream_headers_from_response(upstream))
                 upstream.release()
                 return response
             observe_upstream_response("chatgpt-passthrough", upstream)
+            log_upstream_response(
+                "chatgpt-passthrough",
+                url,
+                upstream.status,
+                request_body=forwarded,
+                stream=True,
+            )
+            if collect_stream:
+                completed: dict[str, Any] | None = None
+                failed_message = ""
+                try:
+                    async for line in _sse_lines(upstream, request):
+                        if line == "[DONE]":
+                            break
+                        try:
+                            payload = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+                        if payload.get("type") == "response.failed":
+                            response_obj = payload.get("response")
+                            if isinstance(response_obj, dict):
+                                err = response_obj.get("error")
+                                if isinstance(err, dict):
+                                    failed_message = str(err.get("message") or failed_message)
+                            break
+                        if payload.get("type") == "response.completed":
+                            response_obj = payload.get("response")
+                            if isinstance(response_obj, dict):
+                                completed = response_obj
+                            break
+                finally:
+                    await _close_upstream(upstream)
+                if completed is None:
+                    detail = failed_message or "ChatGPT passthrough stream ended without response.completed"
+                    return _upstream_text_response(
+                        502,
+                        detail,
+                        content_type="text/plain",
+                    )
+                usage = completed.get("usage") if isinstance(completed.get("usage"), dict) else None
+                upstream_forward_headers = upstream_headers_from_response(upstream)
+                log_upstream_response(
+                    "chatgpt-passthrough",
+                    url,
+                    200,
+                    json.dumps(completed, default=str)[:12_000],
+                    request_body=forwarded,
+                    stream=True,
+                )
+                _rewrite_response_model(completed, response_model_override)
+                response = web.json_response(completed)
+                apply_upstream_headers_to_response(response, upstream_forward_headers)
+                return response
             response = prepare_downstream_sse_response(upstream)
             await response.prepare(request)
             collector = ChatgptPassthroughResponseCollector(forwarded)
@@ -1544,10 +1869,9 @@ class ShimServer:
             if fallback is not None:
                 return fallback
             raise web.HTTPUnauthorized(text="auth.json has no access_token")
-        forwarded = _sanitize_chatgpt_passthrough_body(body)
+        forwarded = _sanitize_chatgpt_compact_passthrough_body(body)
         original_model = str(forwarded.get("model") or "")
         forwarded["model"] = upstream_model or CHATGPT_MODEL_SLUG
-        forwarded.pop("stream", None)
         headers = _chatgpt_passthrough_upstream_headers(
             request,
             access_token=access_token,
@@ -1555,14 +1879,42 @@ class ShimServer:
             accept="application/json",
         )
         url = "https://chatgpt.com/backend-api/codex/responses/compact"
-        async with ClientSession(timeout=self.timeout) as session:
+        _log_compaction_upstream_trace(phase="pre-native-compact", url=url, forwarded=forwarded)
+        log_upstream_request("chatgpt-compact", url, forwarded)
+        async with ClientSession(timeout=self._compact_timeout) as session:
             upstream = await session.post(url, json=forwarded, headers=headers)
             upstream_forward_headers = observe_upstream_response("chatgpt-compact-passthrough", upstream)
             if upstream.status >= 400:
                 text = await upstream.text()
                 status = upstream.status
                 content_type = upstream.content_type or "text/plain"
+                code, message = parse_upstream_error(text, status)
+                print(f"[err] chatgpt-compact returned {status}: {message[:500]}", flush=True)
+                _log_compaction_upstream_trace(
+                    phase="native-compact-error",
+                    url=url,
+                    forwarded=forwarded,
+                    status=status,
+                    response_text=text,
+                )
+                log_upstream_response(
+                    "chatgpt-compact",
+                    url,
+                    status,
+                    text,
+                    request_body=forwarded,
+                )
                 upstream.release()
+                summarization = await self._chatgpt_summarization_compact_response(
+                    request,
+                    body,
+                    upstream_model=upstream_model,
+                    response_slug=original_model or requested,
+                    native_message=message,
+                )
+                if summarization is not None:
+                    apply_upstream_headers_to_response(summarization, upstream_forward_headers)
+                    return summarization
                 fallback = await self._maybe_passthrough_byok_fallback(
                     request,
                     body,
@@ -1573,7 +1925,11 @@ class ShimServer:
                     compact=True,
                 )
                 if fallback is not None:
-                    return fallback
+                    return self._apply_native_compaction_notice_to_compact_response(
+                        fallback,
+                        response_slug=original_model or requested,
+                        native_message=message,
+                    )
                 return _upstream_text_response(
                     status,
                     text,
@@ -1587,11 +1943,82 @@ class ShimServer:
             upstream,
             usage=usage if isinstance(usage, dict) else None,
         )
+        _log_upstream_status(
+            "chatgpt-compact",
+            url,
+            200,
+            message=f"output_items={len(payload.get('output') or []) if isinstance(payload, dict) else 0}",
+        )
+        log_upstream_response(
+            "chatgpt-compact",
+            url,
+            200,
+            json.dumps(payload, default=str)[:12_000] if isinstance(payload, dict) else "",
+            request_body=forwarded,
+        )
         _rewrite_response_model(payload, original_model or None)
         response = web.json_response(payload)
         apply_upstream_headers_to_response(response, upstream_headers_from_response(upstream))
         upstream.release()
         return response
+
+    async def _chatgpt_summarization_compact_response(
+        self,
+        request: web.Request,
+        body: dict[str, Any],
+        *,
+        upstream_model: str | None,
+        response_slug: str,
+        native_message: str,
+    ) -> web.Response | None:
+        input_items = body.get("input")
+        if not isinstance(input_items, list):
+            input_items = [input_items] if input_items is not None else []
+        summary, usage, error_response = await self._fetch_chatgpt_summarization_compact_summary(
+            request,
+            body,
+            input_items,
+            requested_slug=response_slug,
+            upstream_model=upstream_model or CHATGPT_MODEL_SLUG,
+        )
+        if error_response is not None or not summary.strip():
+            return None
+        print(
+            f"[fallback] {response_slug} native compaction -> ChatGPT summarization",
+            flush=True,
+        )
+        compacted = compact_response_payload(
+            response_slug,
+            apply_compaction_fallback_notice(summary, native_message),
+            usage,
+        )
+        return web.json_response(compacted)
+
+    def _apply_native_compaction_notice_to_compact_response(
+        self,
+        response: web.StreamResponse | web.Response,
+        *,
+        response_slug: str,
+        native_message: str,
+    ) -> web.StreamResponse | web.Response:
+        if not isinstance(response, web.Response) or response.status >= 400:
+            return response
+        try:
+            payload = json.loads(response.text or "{}")
+        except json.JSONDecodeError:
+            return response
+        if not isinstance(payload, dict):
+            return response
+        summary = self._summary_from_compact_upstream_payload(payload)
+        if not summary.strip():
+            return response
+        return web.json_response(
+            compact_response_payload(
+                response_slug,
+                apply_compaction_fallback_notice(summary, native_message),
+                payload.get("usage"),
+            )
+        )
 
     async def _cursor_passthrough(
         self,
@@ -2022,11 +2449,20 @@ class ShimServer:
             accept="text/event-stream" if forwarded.get("stream") else None,
         )
         _dump_debug_request(route.slug, url, forwarded)
+        log_upstream_request(f"byok-openai-responses:{route.slug}", url, forwarded)
         async with ClientSession(timeout=self.timeout) as session:
             upstream = await session.post(url, json=forwarded, headers=headers)
             if upstream.status >= 400:
                 observe_upstream_response(f"byok-openai-responses:{route.slug}", upstream)
                 text = await upstream.text()
+                log_upstream_response(
+                    f"byok-openai-responses:{route.slug}",
+                    url,
+                    upstream.status,
+                    text,
+                    request_body=forwarded,
+                    stream=bool(forwarded.get("stream")),
+                )
                 code, message = parse_upstream_error(text, upstream.status)
                 upstream.release()
                 error = web.json_response(
@@ -2045,9 +2481,23 @@ class ShimServer:
                 )
                 response = web.json_response(payload)
                 apply_upstream_headers_to_response(response, upstream_headers_from_response(upstream))
+                log_upstream_response(
+                    f"byok-openai-responses:{route.slug}",
+                    url,
+                    200,
+                    json.dumps(payload, default=str)[:12_000] if isinstance(payload, dict) else "",
+                    request_body=forwarded,
+                )
                 upstream.release()
                 return response
             observe_upstream_response(f"byok-openai-responses:{route.slug}", upstream)
+            log_upstream_response(
+                f"byok-openai-responses:{route.slug}",
+                url,
+                upstream.status,
+                request_body=forwarded,
+                stream=True,
+            )
             response = prepare_downstream_sse_response(upstream)
             await response.prepare(request)
             try:
@@ -2079,11 +2529,27 @@ class ShimServer:
         last_error: tuple[int, str, str, str] | None = None
         for attempt in range(2):
             prepared = prepare_openai_chat_body(route, body)
+            log_upstream_request(f"byok-openai-chat:{route.slug}", url, prepared)
             upstream = await session.post(url, json=prepared, headers=headers)
             if upstream.status < 400:
+                log_upstream_response(
+                    f"byok-openai-chat:{route.slug}",
+                    url,
+                    upstream.status,
+                    request_body=prepared,
+                    stream=bool(body.get("stream")),
+                )
                 return upstream, None
             status = upstream.status
             text = await upstream.text()
+            log_upstream_response(
+                f"byok-openai-chat:{route.slug}",
+                url,
+                status,
+                text,
+                request_body=prepared,
+                stream=bool(body.get("stream")),
+            )
             code, message = parse_upstream_error(text, status)
             upstream.release()
             last_error = (status, text, code, message)
@@ -2294,12 +2760,37 @@ class ShimServer:
     ) -> web.StreamResponse:
         url = _join_url(route.base_url, "/messages")
         headers = _anthropic_headers(request.headers, route)
+        log_upstream_request(f"byok-anthropic-messages:{route.slug}", url, body)
         async with ClientSession(timeout=self.timeout) as session:
             upstream = await session.post(url, json=body, headers=headers)
             if upstream.status >= 400:
                 observe_upstream_response(f"byok-anthropic-messages:{route.slug}", upstream)
-                return await _error_response(upstream, slug=route.slug)
+                text = await upstream.text()
+                status = upstream.status
+                content_type = upstream.content_type or "text/plain"
+                log_upstream_response(
+                    f"byok-anthropic-messages:{route.slug}",
+                    url,
+                    status,
+                    text,
+                    request_body=body,
+                    stream=bool(body.get("stream")),
+                )
+                upstream.release()
+                return _upstream_text_response(
+                    status,
+                    text,
+                    content_type=content_type,
+                    upstream_headers=upstream_headers_from_response(upstream),
+                )
             observe_upstream_response(f"byok-anthropic-messages:{route.slug}", upstream)
+            log_upstream_response(
+                f"byok-anthropic-messages:{route.slug}",
+                url,
+                upstream.status,
+                request_body=body,
+                stream=bool(body.get("stream")),
+            )
             if body.get("stream"):
                 return await self._stream_raw_sse(request, upstream, route.slug)
             payload = await upstream.json(content_type=None)
@@ -2325,6 +2816,7 @@ class ShimServer:
             route,
             accept="text/event-stream" if body.get("stream") else None,
         )
+        log_upstream_request(f"byok-anthropic:{route.slug}", url, body)
         async with ClientSession(timeout=self.timeout) as session:
             upstream = await session.post(url, json=body, headers=headers)
             if upstream.status >= 400:
@@ -2336,8 +2828,32 @@ class ShimServer:
                         upstream,
                         slug=route.slug,
                     )
-                return await _error_response(upstream, slug=route.slug)
+                text = await upstream.text()
+                status = upstream.status
+                content_type = upstream.content_type or "text/plain"
+                log_upstream_response(
+                    f"byok-anthropic:{route.slug}",
+                    url,
+                    status,
+                    text,
+                    request_body=body,
+                    stream=bool(body.get("stream")),
+                )
+                upstream.release()
+                return _upstream_text_response(
+                    status,
+                    text,
+                    content_type=content_type,
+                    upstream_headers=upstream_headers_from_response(upstream),
+                )
             observe_upstream_response(f"byok-anthropic:{route.slug}", upstream)
+            log_upstream_response(
+                f"byok-anthropic:{route.slug}",
+                url,
+                upstream.status,
+                request_body=body,
+                stream=bool(body.get("stream")),
+            )
             if body.get("stream"):
                 return await self._stream_anthropic(
                     request,
@@ -2536,7 +3052,43 @@ def _sanitize_chatgpt_passthrough_body(body: dict[str, Any], *, strip_previous_r
         return {}
     if strip_previous_response_id:
         sanitized.pop("previous_response_id", None)
-    return sanitized
+    return _finalize_chatgpt_passthrough_body(sanitized)
+
+
+_CHATGPT_UNSUPPORTED_REQUEST_KEYS = (
+    "max_output_tokens",
+    "max_tokens",
+    "service_tier",
+)
+
+
+def _finalize_chatgpt_passthrough_body(body: dict[str, Any]) -> dict[str, Any]:
+    forwarded = dict(body)
+    for key in _CHATGPT_UNSUPPORTED_REQUEST_KEYS:
+        forwarded.pop(key, None)
+    forwarded["store"] = False
+    return forwarded
+
+
+_CHATGPT_COMPACT_UNSUPPORTED_REQUEST_KEYS = (
+    *_CHATGPT_UNSUPPORTED_REQUEST_KEYS,
+    "store",
+    "stream",
+)
+
+
+def _finalize_chatgpt_compact_passthrough_body(body: dict[str, Any]) -> dict[str, Any]:
+    forwarded = dict(body)
+    for key in _CHATGPT_COMPACT_UNSUPPORTED_REQUEST_KEYS:
+        forwarded.pop(key, None)
+    return forwarded
+
+
+def _sanitize_chatgpt_compact_passthrough_body(body: dict[str, Any]) -> dict[str, Any]:
+    sanitized = _sanitize_chatgpt_passthrough_value(body)
+    if not isinstance(sanitized, dict):
+        return {}
+    return _finalize_chatgpt_compact_passthrough_body(sanitized)
 
 
 def _sanitize_chatgpt_passthrough_value(value: Any) -> Any:
@@ -2554,6 +3106,7 @@ def _sanitize_chatgpt_passthrough_value(value: Any) -> Any:
             replaced = _replace_shim_compaction_for_chatgpt(value)
             if replaced is not None:
                 return replaced
+            return _DROP_ITEM
         output = {}
         for key, item in value.items():
             if key == "encrypted_content" and isinstance(item, str) and _is_shim_opaque_encrypted_content(item):
@@ -4446,6 +4999,145 @@ def _passthrough_trace_enabled() -> bool:
     return os.environ.get("CODEX_SHIM_PASSTHROUGH_TRACE", "").lower() in {"1", "true", "yes", "on"}
 
 
+def _shim_io_log_enabled() -> bool:
+    return shim_io_log_enabled()
+
+
+def _input_has_compaction_trigger(input_items: Any) -> bool:
+    if not isinstance(input_items, list):
+        return False
+    return any(isinstance(item, dict) and item.get("type") == "compaction_trigger" for item in input_items)
+
+
+def _summarize_input_items(input_items: Any, *, tail: int = 6) -> tuple[int, list[str]]:
+    if not isinstance(input_items, list):
+        return 0, []
+    summary: list[str] = []
+    for item in input_items[-tail:]:
+        if not isinstance(item, dict):
+            summary.append("?")
+            continue
+        item_type = str(item.get("type") or item.get("role") or "?")
+        extra = ""
+        if item_type == "function_call":
+            extra = f"({item.get('name', '?')})"
+        elif item_type == "function_call_output":
+            extra = f"(call_id={str(item.get('call_id', ''))[:24]})"
+        elif item_type == "web_search_call":
+            action = item.get("action") or {}
+            extra = f"(query={str(action.get('query', ''))[:40]})"
+        elif item_type == "mcp_tool_call":
+            extra = f"({item.get('server', '?')}/{item.get('tool', '?')})"
+        elif item_type == "message":
+            role = item.get("role")
+            if role:
+                extra = f"(role={role})"
+        summary.append(f"{item_type}{extra}")
+    return len(input_items), summary
+
+
+def _log_client_request(endpoint: str, body: dict[str, Any], *, transport: str = "http") -> None:
+    try:
+        tools = body.get("tools") or []
+        names = []
+        for tool in tools[:80]:
+            if isinstance(tool, dict):
+                name = tool.get("name") or (tool.get("function") or {}).get("name") or tool.get("type")
+                if name:
+                    names.append(str(name))
+        tail = 12 if _input_has_compaction_trigger(body.get("input")) else 6
+        input_count, input_summary = _summarize_input_items(body.get("input"), tail=tail)
+        print(
+            f"[req] {endpoint} transport={transport} model={body.get('model')!r} stream={body.get('stream')!r} "
+            f"previous_response_id={body.get('previous_response_id')!r} "
+            f"tools={len(tools)} ({names[:8]}) "
+            f"input={input_count} ({input_summary})",
+            flush=True,
+        )
+    except Exception as exc:
+        print(f"[req] failed to log: {exc}", flush=True)
+
+
+def _log_client_response(
+    surface: str,
+    status: int,
+    *,
+    detail: str | None = None,
+    code: str | None = None,
+) -> None:
+    parts = [f"[resp] {surface} status={status}"]
+    if code:
+        parts.append(f"code={code!r}")
+    if detail:
+        parts.append(f"detail={detail[:500]!r}")
+    print(" ".join(parts), flush=True)
+
+
+def _log_upstream_status(
+    surface: str,
+    url: str,
+    status: int,
+    *,
+    message: str | None = None,
+) -> None:
+    line = f"[upstream] {surface} url={url} status={status}"
+    if message:
+        line += f" {message[:500]}"
+    print(line, flush=True)
+
+
+def _log_upstream_response_from_http(
+    surface: str,
+    route_slug: str,
+    response: web.StreamResponse | web.Response | None,
+) -> None:
+    if response is None:
+        _log_upstream_status(surface, route_slug, 0, message="no response")
+        return
+    text = response.text if isinstance(response, web.Response) else ""
+    _, message = parse_upstream_error(text, response.status)
+    _log_upstream_status(surface, route_slug, response.status, message=message)
+    _log_upstream_io_detail(
+        surface=surface,
+        phase="response",
+        url=route_slug,
+        status=response.status,
+        response_text=text,
+    )
+
+
+def _log_upstream_io_detail(
+    *,
+    surface: str,
+    phase: str,
+    url: str,
+    forwarded: dict[str, Any] | None = None,
+    status: int | None = None,
+    response_text: str | None = None,
+) -> None:
+    if not _shim_io_log_enabled():
+        return
+    payload: dict[str, Any] = {"surface": surface, "phase": phase, "url": url}
+    if forwarded is not None:
+        input_items = forwarded.get("input")
+        input_types = _summarize_compaction_input_items(input_items)
+        payload.update(
+            {
+                "model": forwarded.get("model"),
+                "stream": forwarded.get("stream"),
+                "input_item_count": len(input_items) if isinstance(input_items, list) else 0,
+                "input_item_types": input_types,
+                "instructions_chars": len(str(forwarded.get("instructions") or "")),
+                "max_output_tokens": forwarded.get("max_output_tokens"),
+            }
+        )
+    if status is not None:
+        payload["status"] = status
+    if response_text is not None:
+        payload["response_text"] = response_text[:2000]
+    print(f"[io] {json.dumps(payload, separators=(',', ':'), default=str)}", flush=True)
+
+
 def _log_chatgpt_passthrough_trace(
     request: web.Request,
     forwarded: dict[str, Any],
@@ -4483,41 +5175,51 @@ def _log_chatgpt_passthrough_trace(
     )
 
 
+def _summarize_compaction_input_items(input_items: Any) -> list[str]:
+    if not isinstance(input_items, list):
+        return []
+    summary: list[str] = []
+    for item in input_items:
+        if not isinstance(item, dict):
+            summary.append("?")
+            continue
+        item_type = str(item.get("type") or item.get("role") or "?")
+        extra = ""
+        if item_type == "function_call":
+            extra = f" name={item.get('name', '?')!r}"
+        elif item_type == "function_call_output":
+            extra = f" call_id={str(item.get('call_id', ''))[:24]!r}"
+        elif item_type == "message":
+            role = item.get("role")
+            if role:
+                extra = f" role={role!r}"
+        summary.append(f"{item_type}{extra}")
+    return summary
+
+
+def _log_compaction_upstream_trace(
+    *,
+    phase: str,
+    url: str,
+    forwarded: dict[str, Any],
+    status: int | None = None,
+    response_text: str | None = None,
+) -> None:
+    _log_upstream_io_detail(
+        surface="compaction",
+        phase=phase,
+        url=url,
+        forwarded=forwarded,
+        status=status,
+        response_text=response_text,
+    )
+    if status is not None:
+        _, message = parse_upstream_error(response_text or "", status)
+        _log_upstream_status("compaction", url, status, message=message)
+
+
 def _log_incoming_request(endpoint: str, body: dict[str, Any]) -> None:
-    try:
-        tools = body.get("tools") or []
-        names = []
-        for t in tools[:80]:
-            if isinstance(t, dict):
-                name = t.get("name") or (t.get("function") or {}).get("name") or t.get("type")
-                if name:
-                    names.append(str(name))
-        input_items = body.get("input") or []
-        input_summary = []
-        if isinstance(input_items, list):
-            for item in input_items[-6:]:
-                if isinstance(item, dict):
-                    t = item.get("type") or item.get("role") or "?"
-                    extra = ""
-                    if t == "function_call":
-                        extra = f"({item.get('name', '?')})"
-                    elif t == "function_call_output":
-                        extra = f"(call_id={str(item.get('call_id', ''))[:24]})"
-                    elif t == "web_search_call":
-                        action = item.get("action") or {}
-                        extra = f"(query={str(action.get('query', ''))[:40]})"
-                    elif t == "mcp_tool_call":
-                        extra = f"({item.get('server', '?')}/{item.get('tool', '?')})"
-                    input_summary.append(f"{t}{extra}")
-        print(
-            f"[req] {endpoint} model={body.get('model')!r} stream={body.get('stream')!r} "
-            f"previous_response_id={body.get('previous_response_id')!r} "
-            f"tools={len(tools)} ({names[:8]}) "
-            f"input={len(input_items)} ({input_summary})",
-            flush=True,
-        )
-    except Exception as exc:
-        print(f"[req] failed to log: {exc}", flush=True)
+    _log_client_request(endpoint, body)
 
 
 def _request_disconnected(request: web.Request | None) -> bool:
@@ -4603,6 +5305,14 @@ def _compact_request_body(body: dict[str, Any], upstream_model: str) -> dict[str
     }
 
 
+def _chatgpt_compact_request_body(stripped_input: list[Any], upstream_model: str) -> dict[str, Any]:
+    return {
+        "model": upstream_model,
+        "instructions": _default_compact_instructions(),
+        "input": stripped_input,
+    }
+
+
 def _default_compact_instructions() -> str:
     return (
         "Compact the conversation into a concise state handoff for the next Codex turn. "
@@ -4655,6 +5365,14 @@ def parse_upstream_error(body: str, http_status: int) -> tuple[str, str]:
     if isinstance(top_code, str) and top_code.strip():
         code = top_code.strip()
 
+    detail = payload.get("detail")
+    if isinstance(detail, str) and detail.strip():
+        message = detail.strip()
+    elif isinstance(detail, list):
+        parts = [str(item).strip() for item in detail if str(item).strip()]
+        if parts:
+            message = "; ".join(parts)
+
     return code, message
 
 
@@ -4679,8 +5397,34 @@ async def _stream_responses_upstream_error(
 ) -> web.StreamResponse:
     text = await upstream.text()
     status = upstream.status
-    content_type = upstream.content_type or "text/plain"
     upstream.release()
+    return await _stream_responses_error_from_body(request, client_slug, status, text, slug=slug)
+
+
+async def _stream_responses_error_from_http_response(
+    request: web.Request,
+    client_slug: str,
+    error_response: web.Response,
+    *,
+    slug: str | None = None,
+) -> web.StreamResponse:
+    return await _stream_responses_error_from_body(
+        request,
+        client_slug,
+        error_response.status,
+        error_response.text or "",
+        slug=slug,
+    )
+
+
+async def _stream_responses_error_from_body(
+    request: web.Request,
+    client_slug: str,
+    status: int,
+    text: str,
+    *,
+    slug: str | None = None,
+) -> web.StreamResponse:
     code, message = parse_upstream_error(text, status)
     if slug:
         print(f"[err] upstream {slug} returned {status}: {message[:500]}", flush=True)
@@ -4696,7 +5440,13 @@ async def _stream_responses_upstream_error(
     return response
 
 
-async def _error_response(upstream, *, slug: str | None = None) -> web.Response:
+async def _error_response(
+    upstream,
+    *,
+    slug: str | None = None,
+    url: str | None = None,
+    request_body: dict[str, Any] | None = None,
+) -> web.Response:
     observe_upstream_response(f"upstream-error:{slug or 'unknown'}", upstream)
     text = await upstream.text()
     status = upstream.status
@@ -4704,6 +5454,13 @@ async def _error_response(upstream, *, slug: str | None = None) -> web.Response:
     code, message = parse_upstream_error(text, status)
     if slug:
         print(f"[err] upstream {slug} returned {status}: {message[:500]}", flush=True)
+    log_upstream_response(
+        slug or "upstream-error",
+        url or slug or "unknown",
+        status,
+        text,
+        request_body=request_body,
+    )
     upstream_response_headers = upstream_headers_from_response(upstream)
     upstream.release()
     return _upstream_text_response(status, text, content_type=content_type, upstream_headers=upstream_response_headers)
@@ -4715,7 +5472,11 @@ def _upstream_text_response(
     *,
     content_type: str,
     upstream_headers: Mapping[str, str] | None = None,
+    client_surface: str | None = None,
 ) -> web.Response:
+    if status >= 400:
+        code, message = parse_upstream_error(text, status)
+        _log_client_response(client_surface or "downstream", status, detail=message, code=code)
     response = web.Response(status=status, text=text, content_type=content_type)
     if upstream_headers:
         apply_upstream_headers_to_response(response, upstream_headers)

@@ -173,6 +173,8 @@ def chatgpt_passthrough_upstream_headers(
             "Authorization": f"Bearer {access_token}",
             "Content-Type": "application/json",
             "Accept": accept,
+            # Codex may send the websocket beta header on HTTP compaction turns.
+            "OpenAI-Beta": "responses=2026-02-06",
         },
     )
 

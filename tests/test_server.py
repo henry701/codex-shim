@@ -108,6 +108,21 @@ def test_sanitize_chatgpt_passthrough_body_removes_nested_shim_encrypted_content
     assert "encrypted_content" in body["input"][0]["content"][0]
 
 
+def test_sanitize_chatgpt_passthrough_body_drops_native_compaction_item():
+    body = {
+        "model": "codex-gpt-5-5",
+        "input": [
+            {"type": "message", "role": "user", "content": "hi"},
+            {"type": "compaction", "encrypted_content": "gAAAA-openai-native"},
+        ],
+    }
+
+    sanitized = _sanitize_chatgpt_passthrough_body(body)
+
+    assert len(sanitized["input"]) == 1
+    assert sanitized["input"][0]["type"] == "message"
+
+
 def test_sanitize_chatgpt_passthrough_body_rewrites_shim_compaction_item():
     from codex_shim.compaction import compaction_output_item
 
@@ -160,6 +175,44 @@ def test_sanitize_chatgpt_passthrough_body_can_strip_previous_response_id_for_le
 
     assert "previous_response_id" not in sanitized
     assert body["previous_response_id"] == "resp_previous"
+
+
+def test_finalize_chatgpt_passthrough_body_strips_token_limits_and_forces_store_false():
+    from codex_shim.server import _finalize_chatgpt_passthrough_body
+
+    sanitized = _finalize_chatgpt_passthrough_body(
+        {
+            "model": "gpt-5.5",
+            "max_output_tokens": 4096,
+            "max_tokens": 2048,
+            "service_tier": "default",
+            "store": True,
+        }
+    )
+
+    assert "max_output_tokens" not in sanitized
+    assert "max_tokens" not in sanitized
+    assert "service_tier" not in sanitized
+    assert sanitized["store"] is False
+
+
+def test_finalize_chatgpt_compact_passthrough_body_omits_store_and_stream():
+    from codex_shim.server import _finalize_chatgpt_compact_passthrough_body
+
+    sanitized = _finalize_chatgpt_compact_passthrough_body(
+        {
+            "model": "gpt-5.5",
+            "max_output_tokens": 4096,
+            "store": False,
+            "stream": False,
+            "instructions": "Compact.",
+        }
+    )
+
+    assert sanitized["instructions"] == "Compact."
+    assert "max_output_tokens" not in sanitized
+    assert "store" not in sanitized
+    assert "stream" not in sanitized
 
 
 def test_rewrite_response_model_only_rewrites_chatgpt_metadata():
@@ -560,6 +613,7 @@ async def test_chatgpt_compact_passthrough_requests_advertise_zstd_encoding(monk
 
     async def fake_post(self, url, json=None, headers=None):
         captured["url"] = str(url)
+        captured["body"] = json
         captured["headers"] = headers
         return FakeUpstream()
 
@@ -578,6 +632,9 @@ async def test_chatgpt_compact_passthrough_requests_advertise_zstd_encoding(monk
     assert resp.status == 200
     assert captured["url"] == "https://chatgpt.com/backend-api/codex/responses/compact"
     assert captured["headers"]["Accept-Encoding"] == "zstd, gzip"
+    assert "max_output_tokens" not in captured["body"]
+    assert "store" not in captured["body"]
+    assert "stream" not in captured["body"]
 
     await shim_client.close()
 
@@ -1043,6 +1100,29 @@ def test_parse_upstream_error_reads_zen_model_error():
     code, message = parse_upstream_error(body, 400)
     assert code == "ModelError"
     assert "Free promotion has ended" in message
+
+
+def test_parse_upstream_error_reads_fastapi_detail():
+    body = json.dumps({"detail": "Bad Request"})
+    code, message = parse_upstream_error(body, 400)
+    assert code == "upstream_http_400"
+    assert message == "Bad Request"
+
+
+def test_parse_upstream_error_reads_fastapi_detail_list():
+    body = json.dumps({"detail": ["field required", "invalid model"]})
+    code, message = parse_upstream_error(body, 422)
+    assert message == "field required; invalid model"
+
+
+def test_input_has_compaction_trigger_and_longer_tail_summary():
+    from codex_shim.server import _input_has_compaction_trigger, _summarize_input_items
+
+    items = [{"type": "message", "role": "user"}] * 10 + [{"type": "compaction_trigger"}]
+    assert _input_has_compaction_trigger(items)
+    count, summary = _summarize_input_items(items, tail=12)
+    assert count == 11
+    assert summary[-1] == "compaction_trigger"
 
 
 async def test_responses_stream_state_fail_emits_terminal_error_events():
@@ -2372,16 +2452,15 @@ async def test_chatgpt_http_compaction_v2_before_passthrough(monkeypatch, tmp_pa
         await shim_client.close()
 
 
-async def test_chatgpt_compact_passthrough_forwards_upstream_error_without_crash(
+async def test_chatgpt_compact_passthrough_falls_back_to_summarization_on_native_error(
     monkeypatch, tmp_path, auth_present
 ):
-    class FakeUpstream:
+    calls: list[str] = []
+
+    class FailingCompactUpstream:
         status = 503
         content_type = "application/json"
-        headers = {
-            "Content-Type": "application/json",
-            "x-request-id": "req-compact-503",
-        }
+        headers = {"Content-Type": "application/json"}
 
         async def text(self):
             return (
@@ -2392,9 +2471,46 @@ async def test_chatgpt_compact_passthrough_forwards_upstream_error_without_crash
         def release(self):
             pass
 
+    class SummarizationUpstream:
+        status = 200
+        content_type = "text/event-stream"
+        headers = {"Content-Type": "text/event-stream"}
+
+        def __init__(self):
+            completed = {
+                "type": "response.completed",
+                "response": {
+                    "id": "resp_summarize",
+                    "model": "gpt-5.5",
+                    "status": "completed",
+                    "output": [
+                        {
+                            "type": "message",
+                            "role": "assistant",
+                            "content": [{"type": "output_text", "text": "Compacted thread summary."}],
+                        }
+                    ],
+                    "usage": {"input_tokens": 3, "output_tokens": 2, "total_tokens": 5},
+                },
+            }
+            self.content = _FakeSseContent(
+                [
+                    b'data: {"type":"response.created","response":{"id":"resp_summarize","model":"gpt-5.5","status":"in_progress"}}\n\n',
+                    f"data: {json.dumps(completed)}\n\n".encode(),
+                    b"data: [DONE]\n\n",
+                ]
+            )
+
+        def release(self):
+            pass
+
     async def fake_post(self, url, json=None, headers=None):
-        assert url == "https://chatgpt.com/backend-api/codex/responses/compact"
-        return FakeUpstream()
+        calls.append(str(url))
+        if str(url).endswith("/responses/compact"):
+            return FailingCompactUpstream()
+        if "chatgpt.com/backend-api/codex/responses" in str(url):
+            return SummarizationUpstream()
+        raise AssertionError(f"unexpected url: {url}")
 
     monkeypatch.setattr("codex_shim.server.ClientSession.post", fake_post)
 
@@ -2414,10 +2530,58 @@ async def test_chatgpt_compact_passthrough_forwards_upstream_error_without_crash
                 ],
             },
         )
-        assert resp.status == 503
-        body = await resp.text()
-        assert "high demand" in body
-        assert resp.headers.get("x-request-id") == "req-compact-503"
+        assert resp.status == 200
+        events = _sse_events(await resp.text())
+        done = next(event for event in events if event.get("type") == "response.output_item.done")
+        summary = decode_shim_compaction_summary(done["item"]["encrypted_content"])
+        assert "Remote native compaction failed" in summary
+        assert "high demand" in summary
+        assert "Compacted thread summary." in summary
+        assert any(url.endswith("/responses/compact") for url in calls)
+        assert any("/codex/responses" in url and not url.endswith("/compact") for url in calls)
+    finally:
+        await shim_client.close()
+
+
+async def test_chatgpt_compact_passthrough_reports_error_when_all_fallbacks_fail(
+    monkeypatch, tmp_path, auth_present
+):
+    class FailingUpstream:
+        status = 400
+        content_type = "application/json"
+        headers = {"Content-Type": "application/json"}
+
+        async def text(self):
+            return '{"detail":"Bad Request"}'
+
+        def release(self):
+            pass
+
+    async def fake_post(self, url, json=None, headers=None):
+        return FailingUpstream()
+
+    monkeypatch.setattr("codex_shim.server.ClientSession.post", fake_post)
+
+    settings = tmp_path / "settings.json"
+    settings.write_text("{}")
+    shim_client = TestClient(TestServer(ShimServer(settings).app()))
+    await shim_client.start_server()
+    try:
+        resp = await shim_client.post(
+            "/v1/responses",
+            json={
+                "model": "codex-gpt-5-5",
+                "stream": True,
+                "input": [
+                    {"type": "message", "role": "user", "content": "long thread"},
+                    {"type": "compaction_trigger"},
+                ],
+            },
+        )
+        assert resp.status == 200
+        events = _sse_events(await resp.text())
+        failed = next(event for event in events if event.get("type") == "response.failed")
+        assert failed["response"]["error"]["message"] == "Bad Request"
     finally:
         await shim_client.close()
 
@@ -2515,6 +2679,9 @@ async def test_responses_compact_chatgpt_passthrough_uses_compact_endpoint(monke
     assert payload["output"][0]["model"] == "openai-gpt-5-5-codex-max"
     assert captured["url"] == "https://chatgpt.com/backend-api/codex/responses/compact"
     assert captured["body"]["model"] == "gpt-5.5"
+    assert "stream" not in captured["body"]
+    assert "max_output_tokens" not in captured["body"]
+    assert "store" not in captured["body"]
     assert "stream" not in captured["body"]
     assert captured["headers"]["Accept"] == "application/json"
 
