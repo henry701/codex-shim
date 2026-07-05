@@ -867,18 +867,52 @@ Known edge cases:
 
 ## Compaction
 
-Codex can compact long sessions through `POST /v1/responses/compact`.
+Codex can compact long sessions through compaction v2 (`compaction_trigger` on
+`POST /v1/responses`) or legacy `POST /v1/responses/compact`. All routes share
+the `codex_shim.compaction` orchestrator: prepare input (orphan sanitization,
+optional tool-output rewrite, optional recent-user-turn exclusion for
+summarization), native compact, then OpenCode-style summarization fallback, then
+optional BYOK tertiary fallback.
 
-| route | behavior |
-|---|---|
-| ChatGPT passthrough (`gpt-5.5` / `openai-gpt-5-5*`) | Forwards to ChatGPT's native `/backend-api/codex/responses/compact` endpoint and rewrites returned model metadata back to the requested shim slug. |
-| BYOK OpenAI/chat-completions providers | Sends a non-streaming summarization request through `/chat/completions`, then returns a Responses-shaped compacted window whose `output` can be used as the next `input`. |
-| BYOK Anthropic providers | Sends a non-streaming compact request through `/messages`, then returns the same Responses-shaped compacted window. |
+ChatGPT passthrough expands compaction requests from the conversation cache when
+`previous_response_id` is set, and preserves detached tail tool outputs Codex
+sends without in-batch `function_call` items.
 
-The BYOK path intentionally strips provider-hostile fields such as `stream` and
-`service_tier` before forwarding. It preserves the practical Codex behavior — a
-smaller next context window — without pretending third-party chat APIs can emit
-OpenAI's opaque encrypted compaction items.
+| route | native | summarization fallback |
+|---|---|---|
+| ChatGPT passthrough | ChatGPT `/backend-api/codex/responses/compact` | ChatGPT `/codex/responses` stream with anchored compaction prompt |
+| Cursor passthrough | Cursor agent passthrough | Same summarization prompt via Cursor passthrough |
+| BYOK OpenAI Responses / chat / Anthropic | Provider compact request | Same route with structured summarization body |
+
+Optional `compaction` block in `~/.codex-shim/models.json`:
+
+```json
+{
+  "compaction": {
+    "model": "gpt-5.4-mini",
+    "fallback_enabled": true,
+    "tail_turns": 2,
+    "tool_output_max_chars": 2000,
+    "compaction_output_token_reserve": 16000,
+    "prompt_cache_key_version": "v1",
+    "tertiary_fallback_slug": "gpt-5.4-mini"
+  }
+}
+```
+
+Compaction input shaping uses the compaction model's context window minus an
+output reserve. By default the reserve is `summary_max_output_tokens` plus
+8192 tokens of instruction/tool overhead, or an explicit
+`compaction_output_token_reserve`. The shim char-truncates tool outputs only when
+estimated input exceeds that budget, then prunes oldest tool outputs if still
+over budget. If the history remains over budget after both steps, compaction
+continues with a warning.
+
+`codex-shim doctor` prints compaction model, prompt version, and fallback status.
+
+The BYOK path strips provider-hostile fields such as `stream` and `service_tier`
+before forwarding when required. ChatGPT native compact forwards client
+`instructions`, `tools`, and `parallel_tool_calls` when present.
 
 ---
 

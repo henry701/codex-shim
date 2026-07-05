@@ -26,8 +26,30 @@ from .compaction import (
     compaction_output_item,
     compaction_summary_from_output,
     decode_shim_compaction_summary,
+    drop_orphaned_tool_outputs,
+    is_orphan_tool_call_upstream_error,
     strip_terminal_compaction_trigger,
 )
+from .compaction.adapters import compaction_orchestrator_for, compaction_request_from_v2
+from .compaction.logging import (
+    log_compaction_cache_expansion,
+    log_compaction_input_snapshot,
+    log_compaction_upstream_body,
+)
+from .compaction.input_audit import summarize_compaction_input_items
+from .compaction.model_resolver import CompactionModelResolver
+from .compaction.orchestrator import (
+    CompactionOrchestratorError,
+    enrich_orphan_upstream_warning,
+    native_item_from_payload,
+)
+from .compaction.pipeline import PreparedInput
+from .compaction.strategies.bodies import (
+    build_byok_compact_body,
+    build_native_compact_body,
+    build_summarization_compact_body,
+)
+from .compaction.types import CompactionRequest, NativeAttemptResult, SummarizationAttemptResult
 from .cursor_bridge import (
     BridgeError,
     BridgeToolNotAllowedError,
@@ -184,6 +206,477 @@ class ShimServer:
 
     def _session_key(self, request: web.Request) -> str:
         return session_key_from_headers(request.headers)
+
+    async def _compaction_acquire_chatgpt_lock(self, request: CompactionRequest) -> asyncio.Lock:
+        return self._chatgpt_compaction_lock(request.session_key)
+
+    async def _post_chatgpt_native_compact(
+        self,
+        request: web.Request,
+        compact_body: dict[str, Any],
+        *,
+        upstream_model: str,
+        requested_slug: str,
+    ) -> web.StreamResponse | web.Response:
+        forwarded = _sanitize_chatgpt_compact_passthrough_body(compact_body)
+        forwarded["model"] = upstream_model
+        auth_path = DEFAULT_CODEX_AUTH.expanduser()
+        try:
+            auth = json.loads(auth_path.read_text())
+        except FileNotFoundError:
+            raise web.HTTPUnauthorized(text="~/.codex/auth.json not found")
+        tokens = auth.get("tokens") or {}
+        access_token = tokens.get("access_token")
+        account_id = tokens.get("account_id") or ""
+        if not access_token:
+            raise web.HTTPUnauthorized(text="auth.json has no access_token")
+        headers = _chatgpt_passthrough_upstream_headers(
+            request,
+            access_token=access_token,
+            account_id=account_id,
+            accept="application/json",
+        )
+        url = "https://chatgpt.com/backend-api/codex/responses/compact"
+        _log_compaction_upstream_trace(phase="pre-native-compact", url=url, forwarded=forwarded)
+        log_upstream_request("chatgpt-compact", url, forwarded)
+        async with ClientSession(timeout=self._compact_timeout) as session:
+            upstream = await session.post(url, json=forwarded, headers=headers)
+            upstream_forward_headers = observe_upstream_response("chatgpt-compact-passthrough", upstream)
+            if upstream.status >= 400:
+                text = await upstream.text()
+                status = upstream.status
+                content_type = upstream.content_type or "text/plain"
+                code, message = parse_upstream_error(text, status)
+                print(f"[err] chatgpt-compact returned {status}: {message[:500]}", flush=True)
+                _log_compaction_upstream_trace(
+                    phase="native-compact-error",
+                    url=url,
+                    forwarded=forwarded,
+                    status=status,
+                    response_text=text,
+                )
+                log_upstream_response("chatgpt-compact", url, status, text, request_body=forwarded)
+                upstream.release()
+                return _upstream_text_response(
+                    status,
+                    text,
+                    content_type=content_type,
+                    upstream_headers=upstream_forward_headers,
+                )
+            payload = await upstream.json(content_type=None)
+        usage = payload.get("usage") if isinstance(payload, dict) else None
+        observe_upstream_response(
+            "chatgpt-compact-passthrough",
+            upstream,
+            usage=usage if isinstance(usage, dict) else None,
+        )
+        _log_upstream_status(
+            "chatgpt-compact",
+            url,
+            200,
+            message=f"output_items={len(payload.get('output') or []) if isinstance(payload, dict) else 0}",
+        )
+        log_upstream_response(
+            "chatgpt-compact",
+            url,
+            200,
+            json.dumps(payload, default=str)[:12_000] if isinstance(payload, dict) else "",
+            request_body=forwarded,
+        )
+        _rewrite_response_model(payload, requested_slug or None)
+        response = web.json_response(payload)
+        apply_upstream_headers_to_response(response, upstream_headers_from_response(upstream))
+        upstream.release()
+        return response
+
+    async def _compaction_native_chatgpt(
+        self,
+        request: CompactionRequest,
+        prepared: PreparedInput,
+    ) -> NativeAttemptResult:
+        upstream_model = request.upstream_model or chatgpt_upstream_model(request.requested_slug)
+        compact_body = build_native_compact_body(
+            prepared,
+            body=request.body,
+            upstream_model=upstream_model,
+            requested_slug=request.requested_slug,
+            settings=request.settings,
+            session_key=request.session_key,
+        )
+        log_compaction_upstream_body(
+            route="native-chatgpt",
+            phase="request",
+            input_items=compact_body.get("input") or [],
+            model=request.requested_slug,
+            sanitization_dropped=prepared.stats.get("sanitization_dropped", 0),
+            sanitization_preserved=prepared.stats.get("sanitization_preserved", 0),
+        )
+        async with self._chatgpt_compaction_lock(request.session_key):
+            response = await self._post_chatgpt_native_compact(
+                request.http_request,
+                compact_body,
+                upstream_model=upstream_model,
+                requested_slug=request.requested_slug,
+            )
+        if response.status >= 400:
+            text = response.text or ""
+            _, message = parse_upstream_error(text, response.status)
+            merged_warnings = enrich_orphan_upstream_warning(message, prepared.warnings)
+            for warning in merged_warnings:
+                if warning not in prepared.warnings:
+                    print(f"[warn] compaction: {warning}", flush=True)
+            return NativeAttemptResult(
+                native_status=response.status,
+                native_message=message,
+                error_response=response,
+            )
+        try:
+            payload = json.loads(response.text or "{}")
+        except json.JSONDecodeError:
+            return NativeAttemptResult(error_response=response)
+        if not isinstance(payload, dict):
+            return NativeAttemptResult(error_response=response)
+        item = native_item_from_payload(payload)
+        if item is None:
+            item = compaction_output_item("Compaction summary unavailable.")
+        usage = payload.get("usage") if isinstance(payload.get("usage"), dict) else None
+        _log_upstream_status(
+            "chatgpt-compact",
+            "https://chatgpt.com/backend-api/codex/responses/compact",
+            200,
+        )
+        return NativeAttemptResult(item=item, usage=usage, legacy_payload=payload)
+
+    async def _compaction_native_cursor(
+        self,
+        request: CompactionRequest,
+        prepared: PreparedInput,
+    ) -> NativeAttemptResult:
+        compact_body = build_native_compact_body(
+            prepared,
+            body=request.body,
+            upstream_model=cursor_upstream_model(request.requested_slug),
+            requested_slug=request.requested_slug,
+            settings=request.settings,
+            session_key=request.session_key,
+        )
+        compact_body["model"] = request.requested_slug
+        response = await self._cursor_passthrough(
+            request.http_request,
+            compact_body,
+            response_model_override=request.requested_slug,
+            upstream_model=cursor_upstream_model(request.requested_slug),
+            force_non_stream=True,
+        )
+        if response.status >= 400:
+            text = response.text or ""
+            _, message = parse_upstream_error(text, response.status)
+            return NativeAttemptResult(
+                native_status=response.status,
+                native_message=message,
+                error_response=response,
+            )
+        try:
+            payload = json.loads(response.text or "{}")
+        except json.JSONDecodeError:
+            return NativeAttemptResult(error_response=response)
+        if not isinstance(payload, dict):
+            return NativeAttemptResult(error_response=response)
+        item = native_item_from_payload(payload)
+        usage = payload.get("usage") if isinstance(payload.get("usage"), dict) else None
+        return NativeAttemptResult(item=item, usage=usage)
+
+    async def _compaction_native_byok(
+        self,
+        request: CompactionRequest,
+        prepared: PreparedInput,
+    ) -> NativeAttemptResult:
+        route = request.route
+        if route is None:
+            route = await self._route(request.body)
+        tool_types = request.tool_types or responses_tool_type_map(request.body.get("tools"))
+        tool_resolve = request.tool_resolve or responses_tool_resolve_map(request.body.get("tools"))
+        compact_body = build_byok_compact_body(
+            prepared,
+            body=request.body,
+            upstream_model=route.model,
+            settings=request.settings,
+            session_key=request.session_key,
+        )
+        log_compaction_upstream_body(
+            route="native-byok",
+            phase="request",
+            input_items=compact_body.get("input") or [],
+            model=route.slug,
+            sanitization_dropped=prepared.stats.get("sanitization_dropped", 0),
+            sanitization_preserved=prepared.stats.get("sanitization_preserved", 0),
+        )
+        summary, usage, error_response = await self._fetch_byok_compact_summary(
+            request.http_request,
+            route,
+            compact_body,
+            tool_types=tool_types,
+            tool_resolve=tool_resolve,
+        )
+        if error_response is not None:
+            text = error_response.text if isinstance(error_response, web.Response) else ""
+            status = error_response.status if isinstance(error_response, web.Response) else 502
+            _, message = parse_upstream_error(text, status)
+            return NativeAttemptResult(
+                native_status=status,
+                native_message=message,
+                error_response=error_response,
+            )
+        if summary.strip():
+            return NativeAttemptResult(item=compaction_output_item(summary), usage=usage)
+        return NativeAttemptResult(
+            native_status=502,
+            native_message="empty compaction summary from BYOK native compact",
+            error_response=web.json_response(
+                _responses_error_payload(route.slug, "upstream_error", "empty compaction summary"),
+                status=502,
+            ),
+        )
+
+    async def _compaction_summarization_chatgpt(
+        self,
+        request: CompactionRequest,
+        prepared: PreparedInput,
+        native_message: str,
+    ) -> SummarizationAttemptResult:
+        upstream_model = request.upstream_model or chatgpt_upstream_model(request.requested_slug)
+        resolver = CompactionModelResolver(request.settings)
+        resolved = resolver.resolve(requested_slug=request.requested_slug, body=request.body)
+        summarization_slug = resolved.summarization_slug
+        compact_body = build_summarization_compact_body(
+            prepared,
+            body=request.body,
+            upstream_model=upstream_model,
+            requested_slug=summarization_slug,
+            settings=request.settings,
+            session_key=request.session_key,
+            stream=True,
+        )
+        log_compaction_upstream_body(
+            route="summarization-chatgpt",
+            phase="fallback-request",
+            input_items=compact_body.get("input") or [],
+            model=summarization_slug,
+            sanitization_dropped=prepared.stats.get("sanitization_dropped", 0),
+            sanitization_preserved=prepared.stats.get("sanitization_preserved", 0),
+        )
+        _log_compaction_upstream_trace(
+            phase="pre-summarization-fallback",
+            url="https://chatgpt.com/backend-api/codex/responses",
+            forwarded=compact_body,
+        )
+        log_upstream_request("chatgpt-summarization-compact", "https://chatgpt.com/backend-api/codex/responses", compact_body)
+        response = await self._chatgpt_passthrough(
+            request.http_request,
+            compact_body,
+            response_model_override=summarization_slug,
+            upstream_model=upstream_model,
+            allow_byok_fallback=False,
+            collect_stream=True,
+        )
+        return self._summarization_result_from_chatgpt_response(compact_body, response)
+
+    def _summarization_result_from_chatgpt_response(
+        self,
+        compact_body: dict[str, Any],
+        response: web.StreamResponse | web.Response,
+    ) -> SummarizationAttemptResult:
+        if not isinstance(response, web.Response) or response.status >= 400:
+            text = response.text if isinstance(response, web.Response) else ""
+            status = response.status if isinstance(response, web.Response) else None
+            _log_compaction_upstream_trace(
+                phase="summarization-fallback-error",
+                url="https://chatgpt.com/backend-api/codex/responses",
+                forwarded=compact_body,
+                status=status,
+                response_text=text,
+            )
+            return SummarizationAttemptResult(error_response=response)
+        try:
+            payload = json.loads(response.text or "{}")
+        except json.JSONDecodeError:
+            return SummarizationAttemptResult(error_response=response)
+        if not isinstance(payload, dict):
+            return SummarizationAttemptResult(error_response=response)
+        summary = self._summary_from_compact_upstream_payload(payload)
+        if not summary.strip():
+            return SummarizationAttemptResult(error_response=response)
+        usage = payload.get("usage") if isinstance(payload.get("usage"), dict) else None
+        cached = None
+        if isinstance(usage, dict):
+            details = usage.get("input_tokens_details")
+            if isinstance(details, dict):
+                cached = details.get("cached_tokens")
+        _log_upstream_status(
+            "chatgpt-summarization-compact",
+            "https://chatgpt.com/backend-api/codex/responses",
+            response.status,
+            message=f"summary_chars={len(summary)} cached_tokens={cached}",
+        )
+        return SummarizationAttemptResult(summary=summary, usage=usage)
+
+    async def _compaction_summarization_cursor(
+        self,
+        request: CompactionRequest,
+        prepared: PreparedInput,
+        native_message: str,
+    ) -> SummarizationAttemptResult:
+        resolver = CompactionModelResolver(request.settings)
+        resolved = resolver.resolve(requested_slug=request.requested_slug, body=request.body)
+        summarization_slug = resolved.summarization_slug
+        compact_body = build_summarization_compact_body(
+            prepared,
+            body={**request.body, "model": summarization_slug},
+            upstream_model=cursor_upstream_model(summarization_slug),
+            requested_slug=summarization_slug,
+            settings=request.settings,
+            session_key=request.session_key,
+            stream=False,
+        )
+        response = await self._cursor_passthrough(
+            request.http_request,
+            compact_body,
+            response_model_override=summarization_slug,
+            upstream_model=cursor_upstream_model(summarization_slug),
+            force_non_stream=True,
+        )
+        if not isinstance(response, web.Response) or response.status >= 400:
+            return SummarizationAttemptResult(error_response=response)
+        try:
+            payload = json.loads(response.text or "{}")
+        except json.JSONDecodeError:
+            return SummarizationAttemptResult(error_response=response)
+        if not isinstance(payload, dict):
+            return SummarizationAttemptResult(error_response=response)
+        summary = compaction_summary_from_output(payload.get("output"))
+        if not summary.strip():
+            return SummarizationAttemptResult(error_response=response)
+        usage = payload.get("usage") if isinstance(payload.get("usage"), dict) else None
+        return SummarizationAttemptResult(summary=summary, usage=usage)
+
+    async def _compaction_summarization_byok(
+        self,
+        request: CompactionRequest,
+        prepared: PreparedInput,
+        native_message: str,
+    ) -> SummarizationAttemptResult:
+        route = request.route
+        if route is None:
+            route = await self._route(request.body)
+        resolver = CompactionModelResolver(
+            request.settings,
+            route_fn=self._route,
+            has_credentials_fn=byok_model_has_credentials,
+        )
+        resolved = resolver.resolve(requested_slug=request.requested_slug, body=request.body)
+        summarization_slug = resolved.summarization_slug
+        fallback_body = {**request.body, "model": summarization_slug}
+        route = await self._route(fallback_body)
+        tool_types = request.tool_types or responses_tool_type_map(request.body.get("tools"))
+        tool_resolve = request.tool_resolve or responses_tool_resolve_map(request.body.get("tools"))
+        compact_body = build_byok_compact_body(
+            prepared,
+            body=fallback_body,
+            upstream_model=route.model,
+            for_summarization=True,
+            settings=request.settings,
+            session_key=request.session_key,
+        )
+        log_compaction_upstream_body(
+            route="summarization-byok",
+            phase="fallback-request",
+            input_items=compact_body.get("input") or [],
+            model=route.slug,
+            sanitization_dropped=prepared.stats.get("sanitization_dropped", 0),
+            sanitization_preserved=prepared.stats.get("sanitization_preserved", 0),
+        )
+        summary, usage, error_response = await self._fetch_byok_compact_summary(
+            request.http_request,
+            route,
+            compact_body,
+            tool_types=tool_types,
+            tool_resolve=tool_resolve,
+        )
+        if error_response is not None:
+            return SummarizationAttemptResult(error_response=error_response)
+        return SummarizationAttemptResult(summary=summary, usage=usage)
+
+    async def _compaction_tertiary_byok(
+        self,
+        request: CompactionRequest,
+        prepared: PreparedInput,
+        native_message: str,
+        tertiary_slug: str,
+    ) -> SummarizationAttemptResult:
+        fallback_body = {**request.body, "model": tertiary_slug, "input": prepared.summarization_input}
+        route = await self._route(fallback_body)
+        tool_types = request.tool_types or responses_tool_type_map(request.body.get("tools"))
+        tool_resolve = request.tool_resolve or responses_tool_resolve_map(request.body.get("tools"))
+        compact_body = build_byok_compact_body(
+            prepared,
+            body=fallback_body,
+            upstream_model=route.model,
+            for_summarization=True,
+            settings=request.settings,
+            session_key=request.session_key,
+        )
+        log_compaction_upstream_body(
+            route="tertiary-byok",
+            phase="fallback-request",
+            input_items=compact_body.get("input") or [],
+            model=route.slug,
+            sanitization_dropped=prepared.stats.get("sanitization_dropped", 0),
+            sanitization_preserved=prepared.stats.get("sanitization_preserved", 0),
+        )
+        summary, usage, error_response = await self._fetch_byok_compact_summary(
+            request.http_request,
+            route,
+            compact_body,
+            tool_types=tool_types,
+            tool_resolve=tool_resolve,
+        )
+        if error_response is not None:
+            return SummarizationAttemptResult(error_response=error_response)
+        return SummarizationAttemptResult(summary=summary, usage=usage)
+
+    async def _run_compaction_orchestrator(
+        self,
+        request: web.Request,
+        body: dict[str, Any],
+        stripped_input: list[Any],
+        *,
+        provider: Literal["chatgpt", "cursor", "byok"],
+        requested_slug: str,
+        upstream_model: str | None = None,
+        route: ShimModel | None = None,
+        tool_types: dict[str, str] | None = None,
+        tool_resolve: dict[str, tuple[str | None, str]] | None = None,
+        transport: Literal["v2", "legacy_compact"] = "v2",
+        skip_native: bool = False,
+        preset_native_message: str = "",
+    ):
+        compaction_request = compaction_request_from_v2(
+            self,
+            request,
+            body,
+            stripped_input,
+            provider=provider,
+            requested_slug=requested_slug,
+            upstream_model=upstream_model,
+            route=route,
+            tool_types=tool_types,
+            tool_resolve=tool_resolve,
+            transport=transport,
+            skip_native=skip_native,
+            preset_native_message=preset_native_message,
+        )
+        orchestrator = compaction_orchestrator_for(self)
+        return await orchestrator.run(compaction_request)
 
     def app(self) -> web.Application:
         allowed_hosts = build_allowed_hosts(self.host)
@@ -927,265 +1420,74 @@ class ShimServer:
         tool_resolve: dict[str, tuple[str | None, str]] | None = None,
     ) -> tuple[dict[str, Any], str, dict[str, Any] | None, web.StreamResponse | web.Response | None]:
         model = str(body.get("model") or "")
+        log_compaction_input_snapshot(
+            "pre-expand",
+            stripped_input,
+            model=model,
+            previous_response_id=body.get("previous_response_id"),
+        )
+        if is_chatgpt_passthrough_slug(model):
+            stripped_input = self._expand_chatgpt_compaction_stripped_input(
+                request,
+                body,
+                stripped_input,
+            )
+        log_compaction_input_snapshot(
+            "post-expand",
+            stripped_input,
+            model=model,
+            previous_response_id=body.get("previous_response_id"),
+        )
         print(
             f"[compaction-v2] resolve model={model!r} stripped_input_items={len(stripped_input)}",
             flush=True,
         )
-        if is_chatgpt_passthrough_slug(model):
-            upstream_model = chatgpt_upstream_model(model)
-            item, usage, error_response = await self._fetch_chatgpt_compaction_v2_item(
-                request,
-                body,
-                stripped_input,
-                requested_slug=model,
-                upstream_model=upstream_model,
-            )
-            if error_response is not None:
-                return {}, model, None, error_response
-            return item, model, usage, None
-        if is_cursor_passthrough_slug(model):
-            item, usage, error_response = await self._fetch_cursor_compaction_v2_item(
-                request,
-                body,
-                stripped_input,
-                requested_slug=model,
-            )
-            if error_response is not None:
-                return {}, model, None, error_response
-            return item, model, usage, None
-        if route is None:
-            route = await self._route(body)
-        if tool_types is None:
-            tool_types = responses_tool_type_map(body.get("tools"))
-        if tool_resolve is None:
-            tool_resolve = responses_tool_resolve_map(body.get("tools"))
-        compact_body = _compact_request_body({**body, "input": stripped_input}, route.model)
-        summary, usage, error_response = await self._fetch_byok_compact_summary(
-            request,
-            route,
-            compact_body,
-            tool_types=tool_types,
-            tool_resolve=tool_resolve,
-        )
-        if error_response is not None:
-            return {}, route.slug, None, error_response
-        return compaction_output_item(summary), route.slug, usage, None
-
-    async def _fetch_chatgpt_compaction_v2_item(
-        self,
-        request: web.Request,
-        body: dict[str, Any],
-        stripped_input: list[Any],
-        *,
-        requested_slug: str,
-        upstream_model: str,
-    ) -> tuple[dict[str, Any], dict[str, Any] | None, web.StreamResponse | web.Response | None]:
-        session_key = self._session_key(request)
-        async with self._chatgpt_compaction_lock(session_key):
-            compact_body = _chatgpt_compact_request_body(stripped_input, upstream_model)
-            compact_body["model"] = requested_slug
-            response = await self._chatgpt_compact_passthrough(request, compact_body, upstream_model=upstream_model)
-            if response.status >= 400:
-                text = response.text or ""
-                _, message = parse_upstream_error(text, response.status)
-                return await self._try_native_compaction_v2_fallback(
+        try:
+            if is_chatgpt_passthrough_slug(model):
+                result = await self._run_compaction_orchestrator(
                     request,
                     body,
                     stripped_input,
-                    requested_slug=requested_slug,
-                    upstream_model=upstream_model,
-                    native_status=response.status,
-                    native_message=message,
-                    native_response=response,
+                    provider="chatgpt",
+                    requested_slug=model,
+                    upstream_model=chatgpt_upstream_model(model),
                 )
-            try:
-                payload = json.loads(response.text or "{}")
-            except json.JSONDecodeError:
-                return {}, None, response
-            if not isinstance(payload, dict):
-                return {}, None, response
-            item = compaction_item_from_response_payload(payload)
-            if item is None:
-                summary = compaction_summary_from_output(payload.get("output"))
-                item = compaction_output_item(summary or "Compaction summary unavailable.")
-            usage = payload.get("usage") if isinstance(payload.get("usage"), dict) else None
-            _log_upstream_status(
-                "chatgpt-compact",
-                "https://chatgpt.com/backend-api/codex/responses/compact",
-                200,
+                return result.item, model, result.usage, None
+            if is_cursor_passthrough_slug(model):
+                result = await self._run_compaction_orchestrator(
+                    request,
+                    body,
+                    stripped_input,
+                    provider="cursor",
+                    requested_slug=model,
+                )
+                return result.item, model, result.usage, None
+            if route is None:
+                route = await self._route(body)
+            if tool_types is None:
+                tool_types = responses_tool_type_map(body.get("tools"))
+            if tool_resolve is None:
+                tool_resolve = responses_tool_resolve_map(body.get("tools"))
+            result = await self._run_compaction_orchestrator(
+                request,
+                body,
+                stripped_input,
+                provider="byok",
+                requested_slug=route.slug,
+                route=route,
+                tool_types=tool_types,
+                tool_resolve=tool_resolve,
             )
-            return item, usage, None
-
-    async def _try_native_compaction_v2_fallback(
-        self,
-        request: web.Request,
-        body: dict[str, Any],
-        stripped_input: list[Any],
-        *,
-        requested_slug: str,
-        upstream_model: str,
-        native_status: int,
-        native_message: str,
-        native_response: web.StreamResponse | web.Response,
-    ) -> tuple[dict[str, Any], dict[str, Any] | None, web.StreamResponse | web.Response | None]:
-        print(
-            f"[fallback] {requested_slug} native compaction {native_status} -> summarization: "
-            f"{native_message[:200]}",
-            flush=True,
-        )
-        summary, usage, error_response = await self._fetch_chatgpt_summarization_compact_summary(
-            request,
-            body,
-            stripped_input,
-            requested_slug=requested_slug,
-            upstream_model=upstream_model,
-        )
-        if error_response is None and summary:
-            return (
-                compaction_output_item(
-                    apply_compaction_fallback_notice(summary, native_message),
-                ),
-                usage,
-                None,
-            )
-        byok_summary, byok_usage, byok_error = await self._fetch_compaction_v2_byok_fallback_summary(
-            request,
-            body,
-            stripped_input,
-            requested_slug=requested_slug,
-            native_message=native_message,
-        )
-        if byok_error is None and byok_summary:
-            return (
-                compaction_output_item(
-                    apply_compaction_fallback_notice(byok_summary, native_message),
-                ),
-                byok_usage,
-                None,
-            )
-        return {}, None, native_response
-
-    async def _fetch_chatgpt_summarization_compact_summary(
-        self,
-        request: web.Request,
-        body: dict[str, Any],
-        stripped_input: list[Any],
-        *,
-        requested_slug: str,
-        upstream_model: str,
-    ) -> tuple[str, dict[str, Any] | None, web.StreamResponse | web.Response | None]:
-        compact_body = _chatgpt_compact_request_body(stripped_input, upstream_model)
-        compact_body["model"] = requested_slug
-        compact_body["stream"] = True
-        compact_body["instructions"] = (
-            f"{_default_compact_instructions()}\n\n"
-            "Summarize the conversation above into a compact context window suitable for continuing the task."
-        )
-        _log_compaction_upstream_trace(
-            phase="pre-summarization-fallback",
-            url="https://chatgpt.com/backend-api/codex/responses",
-            forwarded=compact_body,
-        )
-        log_upstream_request("chatgpt-summarization-compact", "https://chatgpt.com/backend-api/codex/responses", compact_body)
-        response = await self._chatgpt_passthrough(
-            request,
-            compact_body,
-            response_model_override=requested_slug,
-            upstream_model=upstream_model,
-            allow_byok_fallback=False,
-            collect_stream=True,
-        )
-        if not isinstance(response, web.Response) or response.status >= 400:
-            text = response.text if isinstance(response, web.Response) else ""
-            status = response.status if isinstance(response, web.Response) else None
-            _log_compaction_upstream_trace(
-                phase="summarization-fallback-error",
-                url="https://chatgpt.com/backend-api/codex/responses",
-                forwarded=compact_body,
-                status=status,
-                response_text=text,
-            )
-            return "", None, response
-        try:
-            payload = json.loads(response.text or "{}")
-        except json.JSONDecodeError:
-            return "", None, response
-        if not isinstance(payload, dict):
-            return "", None, response
-        summary = self._summary_from_compact_upstream_payload(payload)
-        if not summary.strip():
-            return "", None, response
-        usage = payload.get("usage") if isinstance(payload.get("usage"), dict) else None
-        _log_upstream_status(
-            "chatgpt-summarization-compact",
-            "https://chatgpt.com/backend-api/codex/responses",
-            response.status,
-            message=f"summary_chars={len(summary)}",
-        )
-        return summary, usage, None
-
-    async def _fetch_compaction_v2_byok_fallback_summary(
-        self,
-        request: web.Request,
-        body: dict[str, Any],
-        stripped_input: list[Any],
-        *,
-        requested_slug: str,
-        native_message: str,
-    ) -> tuple[str, dict[str, Any] | None, web.StreamResponse | web.Response | None]:
-        fallback_slug = self._passthrough_fallback_slug(requested_slug)
-        if not fallback_slug:
-            return "", None, None
-        print(
-            f"[fallback] {requested_slug} native compaction -> BYOK {fallback_slug}: "
-            f"{native_message[:200]}",
-            flush=True,
-        )
-        fallback_body = {**body, "input": stripped_input, "model": fallback_slug}
-        route = await self._route(fallback_body)
-        tool_types = responses_tool_type_map(body.get("tools"))
-        tool_resolve = responses_tool_resolve_map(body.get("tools"))
-        compact_body = _compact_request_body(fallback_body, route.model)
-        return await self._fetch_byok_compact_summary(
-            request,
-            route,
-            compact_body,
-            tool_types=tool_types,
-            tool_resolve=tool_resolve,
-        )
-
-    async def _fetch_cursor_compaction_v2_item(
-        self,
-        request: web.Request,
-        body: dict[str, Any],
-        stripped_input: list[Any],
-        *,
-        requested_slug: str,
-    ) -> tuple[dict[str, Any], dict[str, Any] | None, web.StreamResponse | web.Response | None]:
-        compact_body = _compact_request_body({**body, "input": stripped_input}, cursor_upstream_model(requested_slug))
-        compact_body["model"] = requested_slug
-        compact_body["instructions"] = (
-            f"{body.get('instructions') or ''}\n\nSummarize the conversation above into a compact "
-            "context window suitable for continuing the task."
-        ).strip()
-        response = await self._cursor_passthrough(
-            request,
-            compact_body,
-            response_model_override=requested_slug,
-            upstream_model=cursor_upstream_model(requested_slug),
-            force_non_stream=True,
-        )
-        if response.status >= 400:
-            return {}, None, response
-        try:
-            payload = json.loads(response.text or "{}")
-        except json.JSONDecodeError:
-            return {}, None, response
-        if not isinstance(payload, dict):
-            return {}, None, response
-        summary = compaction_summary_from_output(payload.get("output"))
-        usage = payload.get("usage") if isinstance(payload.get("usage"), dict) else None
-        return compaction_output_item(summary or "Compaction summary unavailable."), usage, None
+            return result.item, route.slug, result.usage, None
+        except CompactionOrchestratorError as exc:
+            slug = model or (route.slug if route else "unknown")
+            error_response = exc.error_response
+            if error_response is None:
+                error_response = web.json_response(
+                    _responses_error_payload(slug, "upstream_error", str(exc)),
+                    status=502,
+                )
+            return {}, slug, None, error_response
 
     async def _responses_compaction_v2(
         self,
@@ -1332,46 +1634,54 @@ class ShimServer:
         _log_incoming_request("/v1/responses/compact", body)
         body = await self._maybe_apply_auto_router(body)
         model = str(body.get("model") or "")
+        input_items = body.get("input") or []
+        if not isinstance(input_items, list):
+            input_items = [input_items] if input_items is not None else []
+
+        async def _compact_json_response(
+            *,
+            provider: Literal["chatgpt", "cursor", "byok"],
+            requested_slug: str,
+            upstream_model: str | None = None,
+            route: ShimModel | None = None,
+        ) -> web.StreamResponse | web.Response:
+            try:
+                result = await self._run_compaction_orchestrator(
+                    request,
+                    body,
+                    input_items,
+                    provider=provider,
+                    requested_slug=requested_slug,
+                    upstream_model=upstream_model,
+                    route=route,
+                    tool_types=responses_tool_type_map(body.get("tools")),
+                    tool_resolve=responses_tool_resolve_map(body.get("tools")),
+                    transport="legacy_compact",
+                )
+            except CompactionOrchestratorError as exc:
+                if exc.error_response is not None:
+                    return exc.error_response
+                raise
+            if result.legacy_payload is not None:
+                payload = copy.deepcopy(result.legacy_payload)
+                _rewrite_response_model(payload, requested_slug)
+                for output_item in payload.get("output") or []:
+                    if isinstance(output_item, dict) and "model" in output_item:
+                        output_item["model"] = requested_slug
+                return web.json_response(payload)
+            summary = decode_shim_compaction_summary(result.item.get("encrypted_content")) or ""
+            return web.json_response(compact_response_payload(requested_slug, summary, result.usage))
+
         if is_chatgpt_passthrough_slug(model):
-            upstream = chatgpt_upstream_model(model)
-            return await self._chatgpt_compact_passthrough(request, body, upstream_model=upstream)
+            return await _compact_json_response(
+                provider="chatgpt",
+                requested_slug=model,
+                upstream_model=chatgpt_upstream_model(model),
+            )
         if is_cursor_passthrough_slug(model):
-            compact_body = dict(body)
-            compact_body["input"] = body.get("input") or []
-            compact_body["instructions"] = (
-                f"{body.get('instructions') or ''}\n\nSummarize the conversation above into a compact "
-                "context window suitable for continuing the task."
-            ).strip()
-            return await self._cursor_passthrough(
-                request,
-                compact_body,
-                response_model_override=model,
-                upstream_model=cursor_upstream_model(model),
-                force_non_stream=True,
-            )
+            return await _compact_json_response(provider="cursor", requested_slug=model)
         route = await self._route(body)
-        tool_types = responses_tool_type_map(body.get("tools"))
-        tool_resolve = responses_tool_resolve_map(body.get("tools"))
-        compact_body = _compact_request_body(body, route.model)
-        compact_body = prepare_codex_byok_responses_body(compact_body, request.headers)
-        if route.is_openai_responses:
-            compact_body["stream"] = False
-            return await self._post_openai_responses(request, route, compact_body)
-        if route.is_openai_chat:
-            forwarded = responses_to_chat(compact_body, route.model)
-            forwarded["stream"] = False
-            response = await self._post_openai_chat(
-                request, route, forwarded, as_responses=True, tool_types=tool_types, tool_resolve=tool_resolve
-            )
-            return await _as_compact_response(response, route.slug)
-        if route.is_anthropic:
-            forwarded = responses_to_anthropic(compact_body, route.model, route.max_output_tokens)
-            forwarded["stream"] = False
-            response = await self._post_anthropic(
-                request, route, forwarded, as_responses=True, tool_types=tool_types, tool_resolve=tool_resolve
-            )
-            return await _as_compact_response(response, route.slug)
-        raise web.HTTPBadGateway(text=f"Unsupported model provider: {route.provider}")
+        return await _compact_json_response(provider="byok", requested_slug=route.slug, route=route)
 
     def _needs_image_gen(self, body: dict[str, Any]) -> bool:
         tools = body.get("tools") or []
@@ -1530,29 +1840,90 @@ class ShimServer:
             return str(content.get("text") or content.get("content") or "")
         return str(content)
 
+    def _expand_chatgpt_cached_input(
+        self,
+        *,
+        session_key: str,
+        previous_response_id: Any,
+        delta_input: list[Any],
+        context: str,
+    ) -> list[Any]:
+        if not _chatgpt_expand_continuations_enabled():
+            return delta_input
+        if not isinstance(previous_response_id, str) or not previous_response_id:
+            return delta_input
+        _, delta_summary = summarize_compaction_input_items(delta_input, tail=6)
+        cached = self._chatgpt_conversation_cache.get(session_key, previous_response_id)
+        if cached is None:
+            if context == "compaction":
+                log_compaction_cache_expansion(
+                    context=context,
+                    session_key=session_key,
+                    previous_response_id=previous_response_id,
+                    cached_items=None,
+                    delta_items=len(delta_input),
+                    total_items=None,
+                    delta_summary=delta_summary,
+                )
+            else:
+                print(
+                    f"[chatgpt-cache] {context} MISS session={session_key} "
+                    f"previous_response_id={previous_response_id} delta_items={len(delta_input)}",
+                    flush=True,
+                )
+            return delta_input
+        expanded = [*copy.deepcopy(cached), *copy.deepcopy(delta_input)]
+        if context == "compaction":
+            log_compaction_cache_expansion(
+                context=context,
+                session_key=session_key,
+                previous_response_id=previous_response_id,
+                cached_items=len(cached),
+                delta_items=len(delta_input),
+                total_items=len(expanded),
+                delta_summary=delta_summary,
+            )
+        else:
+            print(
+                f"[chatgpt-cache] {context} HIT session={session_key} "
+                f"previous_response_id={previous_response_id} cached={len(cached)} "
+                f"delta={len(delta_input)} total={len(expanded)}",
+                flush=True,
+            )
+        return expanded
+
+    def _expand_chatgpt_compaction_stripped_input(
+        self,
+        request: web.Request,
+        body: dict[str, Any],
+        stripped_input: list[Any],
+    ) -> list[Any]:
+        return self._expand_chatgpt_cached_input(
+            session_key=self._session_key(request),
+            previous_response_id=body.get("previous_response_id"),
+            delta_input=stripped_input,
+            context="compaction",
+        )
+
     def _prepare_chatgpt_passthrough_body(self, body: dict[str, Any], *, session_key: str) -> dict[str, Any]:
         previous_response_id = body.get("previous_response_id")
         expand = _chatgpt_expand_continuations_enabled()
         forwarded = _sanitize_chatgpt_passthrough_body(body, strip_previous_response_id=expand)
         if expand and isinstance(previous_response_id, str) and previous_response_id:
-            cached = self._chatgpt_conversation_cache.get(session_key, previous_response_id)
-            if cached is not None:
-                if _stream_log_enabled():
-                    print(
-                        f"[chatgpt-cache] session={session_key} previous_response_id={previous_response_id} hit=True",
-                        flush=True,
-                    )
-                forwarded["input"] = [*copy.deepcopy(cached), *_chatgpt_input_items(forwarded.get("input"))]
-            else:
+            delta_input = _chatgpt_input_items(forwarded.get("input"))
+            expanded = self._expand_chatgpt_cached_input(
+                session_key=session_key,
+                previous_response_id=previous_response_id,
+                delta_input=delta_input,
+                context="turn",
+            )
+            if expanded is not delta_input:
+                forwarded["input"] = expanded
+            elif _stream_log_enabled():
                 print(
-                    f"[chatgpt-cache] MISS session={session_key} previous_response_id={previous_response_id}",
+                    f"[chatgpt-cache] session={session_key} previous_response_id={previous_response_id} hit=False",
                     flush=True,
                 )
-                if _stream_log_enabled():
-                    print(
-                        f"[chatgpt-cache] session={session_key} previous_response_id={previous_response_id} hit=False",
-                        flush=True,
-                    )
         elif _stream_log_enabled() and isinstance(previous_response_id, str) and previous_response_id:
             print(
                 f"[chatgpt-cache] session={session_key} previous_response_id={previous_response_id} passthrough=True",
@@ -1871,56 +2242,39 @@ class ShimServer:
             raise web.HTTPUnauthorized(text="auth.json has no access_token")
         forwarded = _sanitize_chatgpt_compact_passthrough_body(body)
         original_model = str(forwarded.get("model") or "")
-        forwarded["model"] = upstream_model or CHATGPT_MODEL_SLUG
-        headers = _chatgpt_passthrough_upstream_headers(
+        response = await self._post_chatgpt_native_compact(
             request,
-            access_token=access_token,
-            account_id=account_id,
-            accept="application/json",
+            forwarded,
+            upstream_model=upstream_model or CHATGPT_MODEL_SLUG,
+            requested_slug=original_model or requested,
         )
-        url = "https://chatgpt.com/backend-api/codex/responses/compact"
-        _log_compaction_upstream_trace(phase="pre-native-compact", url=url, forwarded=forwarded)
-        log_upstream_request("chatgpt-compact", url, forwarded)
-        async with ClientSession(timeout=self._compact_timeout) as session:
-            upstream = await session.post(url, json=forwarded, headers=headers)
-            upstream_forward_headers = observe_upstream_response("chatgpt-compact-passthrough", upstream)
-            if upstream.status >= 400:
-                text = await upstream.text()
-                status = upstream.status
-                content_type = upstream.content_type or "text/plain"
-                code, message = parse_upstream_error(text, status)
-                print(f"[err] chatgpt-compact returned {status}: {message[:500]}", flush=True)
-                _log_compaction_upstream_trace(
-                    phase="native-compact-error",
-                    url=url,
-                    forwarded=forwarded,
-                    status=status,
-                    response_text=text,
-                )
-                log_upstream_response(
-                    "chatgpt-compact",
-                    url,
-                    status,
-                    text,
-                    request_body=forwarded,
-                )
-                upstream.release()
-                summarization = await self._chatgpt_summarization_compact_response(
+        if response.status >= 400:
+            text = response.text or ""
+            _, message = parse_upstream_error(text, response.status)
+            input_items = body.get("input") or []
+            if not isinstance(input_items, list):
+                input_items = [input_items] if input_items is not None else []
+            try:
+                result = await self._run_compaction_orchestrator(
                     request,
                     body,
+                    input_items,
+                    provider="chatgpt",
+                    requested_slug=original_model or requested,
                     upstream_model=upstream_model,
-                    response_slug=original_model or requested,
-                    native_message=message,
+                    transport="legacy_compact",
+                    skip_native=True,
+                    preset_native_message=message,
                 )
-                if summarization is not None:
-                    apply_upstream_headers_to_response(summarization, upstream_forward_headers)
-                    return summarization
+            except CompactionOrchestratorError as exc:
+                if exc.error_response is not None:
+                    return exc.error_response
                 fallback = await self._maybe_passthrough_byok_fallback(
                     request,
                     body,
                     requested=requested,
                     response_slug=original_model or requested,
-                    status=status,
+                    status=response.status,
                     detail=text,
                     compact=True,
                 )
@@ -1930,36 +2284,11 @@ class ShimServer:
                         response_slug=original_model or requested,
                         native_message=message,
                     )
-                return _upstream_text_response(
-                    status,
-                    text,
-                    content_type=content_type,
-                    upstream_headers=upstream_forward_headers,
-                )
-            payload = await upstream.json(content_type=None)
-        usage = payload.get("usage") if isinstance(payload, dict) else None
-        observe_upstream_response(
-            "chatgpt-compact-passthrough",
-            upstream,
-            usage=usage if isinstance(usage, dict) else None,
-        )
-        _log_upstream_status(
-            "chatgpt-compact",
-            url,
-            200,
-            message=f"output_items={len(payload.get('output') or []) if isinstance(payload, dict) else 0}",
-        )
-        log_upstream_response(
-            "chatgpt-compact",
-            url,
-            200,
-            json.dumps(payload, default=str)[:12_000] if isinstance(payload, dict) else "",
-            request_body=forwarded,
-        )
-        _rewrite_response_model(payload, original_model or None)
-        response = web.json_response(payload)
-        apply_upstream_headers_to_response(response, upstream_headers_from_response(upstream))
-        upstream.release()
+                return response
+            summary = decode_shim_compaction_summary(result.item.get("encrypted_content")) or ""
+            return web.json_response(
+                compact_response_payload(original_model or requested, summary, result.usage)
+            )
         return response
 
     async def _chatgpt_summarization_compact_response(
@@ -1974,25 +2303,30 @@ class ShimServer:
         input_items = body.get("input")
         if not isinstance(input_items, list):
             input_items = [input_items] if input_items is not None else []
-        summary, usage, error_response = await self._fetch_chatgpt_summarization_compact_summary(
-            request,
-            body,
-            input_items,
-            requested_slug=response_slug,
-            upstream_model=upstream_model or CHATGPT_MODEL_SLUG,
-        )
-        if error_response is not None or not summary.strip():
+        try:
+            result = await self._run_compaction_orchestrator(
+                request,
+                body,
+                input_items,
+                provider="chatgpt",
+                requested_slug=response_slug,
+                upstream_model=upstream_model or CHATGPT_MODEL_SLUG,
+                transport="legacy_compact",
+                skip_native=True,
+                preset_native_message=native_message,
+            )
+        except CompactionOrchestratorError:
+            return None
+        summary = decode_shim_compaction_summary(result.item.get("encrypted_content")) or ""
+        if not summary.strip():
             return None
         print(
             f"[fallback] {response_slug} native compaction -> ChatGPT summarization",
             flush=True,
         )
-        compacted = compact_response_payload(
-            response_slug,
-            apply_compaction_fallback_notice(summary, native_message),
-            usage,
+        return web.json_response(
+            compact_response_payload(response_slug, summary, result.usage)
         )
-        return web.json_response(compacted)
 
     def _apply_native_compaction_notice_to_compact_response(
         self,
@@ -5195,6 +5529,12 @@ def _summarize_compaction_input_items(input_items: Any) -> list[str]:
                 extra = f" role={role!r}"
         summary.append(f"{item_type}{extra}")
     return summary
+
+
+def _log_compaction_sanitization_warnings(warnings: list[str]) -> None:
+    for warning in warnings:
+        if warning:
+            print(f"[warn] compaction: {warning}", flush=True)
 
 
 def _log_compaction_upstream_trace(

@@ -51,6 +51,12 @@ from .settings import (
     usable_byok_models,
     byok_model_has_credentials,
 )
+from .compaction.config import (
+    CompactionSettings,
+    effective_compaction_output_token_reserve,
+    load_compaction_settings,
+)
+from .compaction.prompts import COMPACTION_PROMPT_VERSION
 from .opencode_go import (
     OPENCODE_GO_API_KEY_ENV,
     OPENCODE_GO_BASE_URL,
@@ -420,6 +426,35 @@ def _doctor_settings(settings_path: Path) -> list[DoctorCheck]:
             )
         else:
             checks.append(DoctorCheck(section, "INFO", f"auto router configured but disabled: {router_config.slug}"))
+    compaction = load_compaction_settings(settings_path)
+    checks.append(
+        DoctorCheck(
+            section,
+            "INFO",
+            f"compaction model: {compaction.model or '(thread model)'}",
+        )
+    )
+    checks.append(
+        DoctorCheck(
+            section,
+            "INFO",
+            f"compaction prompt: {COMPACTION_PROMPT_VERSION} cache_key={compaction.prompt_cache_key_version}",
+        )
+    )
+    checks.append(
+        DoctorCheck(
+            section,
+            "INFO",
+            f"compaction output reserve: {effective_compaction_output_token_reserve(compaction)} tokens",
+        )
+    )
+    checks.append(
+        DoctorCheck(
+            section,
+            "OK" if compaction.fallback_enabled else "WARN",
+            f"compaction fallback: {'enabled' if compaction.fallback_enabled else 'disabled'}",
+        )
+    )
     return checks
 
 

@@ -9,7 +9,7 @@ import pytest
 from aiohttp import ClientSession, WSMsgType, web
 from aiohttp.test_utils import TestClient, TestServer
 
-from codex_shim.compaction import decode_shim_compaction_summary
+from codex_shim.compaction import decode_shim_compaction_summary, encode_shim_compaction_summary
 from codex_shim import mcp_search
 from codex_shim import server as server_module
 from codex_shim.server import (
@@ -447,6 +447,101 @@ async def test_chatgpt_passthrough_expands_previous_response_id_by_default(
 
     assert "previous_response_id" not in captured[1]
     assert captured[1]["input"] == [*first_input, tool_call, tool_output]
+
+    await shim_client.close()
+
+
+async def test_chatgpt_compaction_expands_previous_response_id_from_cache(
+    monkeypatch, tmp_path, auth_present, chatgpt_cache_dir
+):
+    captured: dict[str, Any] = {}
+    session_headers = {"session-id": "test-session-compact-expand"}
+    first_input = [{"type": "message", "role": "user", "content": "run a command"}]
+    tool_call = {
+        "type": "function_call",
+        "id": "fc_1",
+        "call_id": "call_1",
+        "name": "exec_command",
+        "arguments": "{\"cmd\":\"printf ok\"}",
+    }
+    tool_output = {"type": "function_call_output", "call_id": "call_1", "output": "ok"}
+    tail_output = {"type": "function_call_output", "call_id": "call_2", "output": "tail"}
+
+    class FakeUpstream:
+        status = 200
+        content_type = "application/json"
+        headers = {}
+
+        def __init__(self, payload):
+            self.payload = payload
+
+        async def json(self, content_type=None):
+            return self.payload
+
+        async def text(self):
+            return json.dumps(self.payload)
+
+        def release(self):
+            pass
+
+    async def fake_post(self, url, json=None, headers=None):
+        if str(url).endswith("/responses/compact"):
+            captured["compact_input"] = (json or {}).get("input")
+            return FakeUpstream(
+                {
+                    "id": "resp_compact",
+                    "status": "completed",
+                    "output": [
+                        {
+                            "type": "compaction",
+                            "encrypted_content": encode_shim_compaction_summary("Expanded compact."),
+                        }
+                    ],
+                }
+            )
+        captured.setdefault("turn_calls", []).append(json)
+        if len(captured["turn_calls"]) == 1:
+            return FakeUpstream({"id": "resp_previous", "model": "gpt-5.5", "output": [tool_call]})
+        return FakeUpstream({"id": "resp_next", "model": "gpt-5.5", "output": []})
+
+    monkeypatch.setattr("codex_shim.server.ClientSession.post", fake_post)
+    settings = tmp_path / "settings.json"
+    settings.write_text("{}")
+    shim_client = TestClient(TestServer(ShimServer(settings).app()))
+    await shim_client.start_server()
+
+    first = await shim_client.post(
+        "/v1/responses",
+        json={"model": "codex-gpt-5-5", "input": first_input},
+        headers=session_headers,
+    )
+    assert first.status == 200
+
+    second = await shim_client.post(
+        "/v1/responses",
+        json={
+            "model": "codex-gpt-5-5",
+            "previous_response_id": "resp_previous",
+            "input": [tool_output],
+        },
+        headers=session_headers,
+    )
+    assert second.status == 200
+
+    compact = await shim_client.post(
+        "/v1/responses",
+        json={
+            "model": "codex-gpt-5-5",
+            "stream": True,
+            "previous_response_id": "resp_next",
+            "input": [tail_output, {"type": "compaction_trigger"}],
+        },
+        headers=session_headers,
+    )
+    assert compact.status == 200
+    compact_input = captured.get("compact_input")
+    assert isinstance(compact_input, list)
+    assert compact_input == [*first_input, tool_call, tool_output, tail_output]
 
     await shim_client.close()
 
@@ -2539,6 +2634,330 @@ async def test_chatgpt_compact_passthrough_falls_back_to_summarization_on_native
         assert "Compacted thread summary." in summary
         assert any(url.endswith("/responses/compact") for url in calls)
         assert any("/codex/responses" in url and not url.endswith("/compact") for url in calls)
+    finally:
+        await shim_client.close()
+
+
+async def test_chatgpt_compact_orphan_tool_output_preserves_tail_for_native_compact(
+    monkeypatch, tmp_path, auth_present, capsys
+):
+    captured: dict[str, Any] = {}
+
+    class CompactUpstream:
+        status = 200
+        content_type = "application/json"
+        headers = {"Content-Type": "application/json"}
+
+        async def json(self, content_type=None):
+            return {
+                "id": "resp_compact",
+                "status": "completed",
+                "output": [
+                    {
+                        "type": "compaction",
+                        "encrypted_content": encode_shim_compaction_summary("Compacted tail output."),
+                    }
+                ],
+            }
+
+        async def text(self):
+            return json.dumps(await self.json())
+
+        def release(self):
+            pass
+
+    async def fake_post(self, url, json=None, headers=None):
+        if str(url).endswith("/responses/compact"):
+            captured["compact_input"] = (json or {}).get("input")
+            return CompactUpstream()
+        raise AssertionError(f"unexpected upstream call: {url}")
+
+    monkeypatch.setattr("codex_shim.server.ClientSession.post", fake_post)
+
+    settings = tmp_path / "settings.json"
+    settings.write_text("{}")
+    shim_client = TestClient(TestServer(ShimServer(settings).app()))
+    await shim_client.start_server()
+    try:
+        resp = await shim_client.post(
+            "/v1/responses",
+            json={
+                "model": "codex-gpt-5-5",
+                "stream": True,
+                "input": [
+                    {
+                        "type": "function_call_output",
+                        "call_id": "call_orphan",
+                        "output": "truncated tool output",
+                    },
+                    {"type": "compaction_trigger"},
+                ],
+            },
+        )
+        assert resp.status == 200
+        events = _sse_events(await resp.text())
+        done = next(event for event in events if event.get("type") == "response.output_item.done")
+        summary = decode_shim_compaction_summary(done["item"]["encrypted_content"])
+        assert summary == "Compacted tail output."
+        compact_input = captured.get("compact_input")
+        assert isinstance(compact_input, list)
+        assert len(compact_input) == 1
+        assert compact_input[0]["call_id"] == "call_orphan"
+        captured_out = capsys.readouterr().out
+        assert "preserved" in captured_out
+    finally:
+        await shim_client.close()
+
+
+async def test_chatgpt_compact_drops_orphan_before_native_compact(
+    monkeypatch, tmp_path, auth_present, capsys
+):
+    captured: dict[str, Any] = {}
+
+    class CompactUpstream:
+        status = 200
+        content_type = "application/json"
+        headers = {"Content-Type": "application/json"}
+
+        async def json(self, content_type=None):
+            return {
+                "id": "resp_compact",
+                "status": "completed",
+                "output": [
+                    {
+                        "type": "message",
+                        "content": [{"type": "output_text", "text": "Native compact ok."}],
+                    }
+                ],
+            }
+
+        async def text(self):
+            return json.dumps(await self.json())
+
+        def release(self):
+            pass
+
+    async def fake_post(self, url, json=None, headers=None):
+        if str(url).endswith("/responses/compact"):
+            captured["compact_input"] = (json or {}).get("input")
+            return CompactUpstream()
+        raise AssertionError(f"unexpected url: {url}")
+
+    monkeypatch.setattr("codex_shim.server.ClientSession.post", fake_post)
+
+    settings = tmp_path / "settings.json"
+    settings.write_text("{}")
+    shim_client = TestClient(TestServer(ShimServer(settings).app()))
+    await shim_client.start_server()
+    try:
+        resp = await shim_client.post(
+            "/v1/responses",
+            json={
+                "model": "codex-gpt-5-5",
+                "stream": True,
+                "input": [
+                    {"type": "message", "role": "user", "content": "keep this thread"},
+                    {
+                        "type": "function_call_output",
+                        "call_id": "call_orphan",
+                        "output": "orphan",
+                    },
+                    {"type": "compaction_trigger"},
+                ],
+            },
+        )
+        assert resp.status == 200
+        compact_input = captured.get("compact_input")
+        assert isinstance(compact_input, list)
+        assert len(compact_input) == 1
+        assert compact_input[0]["type"] == "message"
+        captured_out = capsys.readouterr().out
+        assert "[warn] compaction:" in captured_out
+        assert "call_orphan" in captured_out
+    finally:
+        await shim_client.close()
+
+
+async def test_chatgpt_compact_upstream_orphan_error_routes_to_summarization_with_warnings(
+    monkeypatch, tmp_path, auth_present, capsys
+):
+    calls: list[str] = []
+
+    from codex_shim.compaction.input_audit import CompactionSanitizationAudit
+
+    monkeypatch.setattr(
+        "codex_shim.compaction.pipeline.sanitize_compaction_input_items",
+        lambda items: (items, [], CompactionSanitizationAudit(incoming_items=len(items), outgoing_items=len(items))),
+    )
+
+    class OrphanErrorCompactUpstream:
+        status = 400
+        content_type = "application/json"
+        headers = {"Content-Type": "application/json"}
+
+        async def text(self):
+            return (
+                '{"error":{"message":"No tool call found for function call output '
+                'with call_id call_VF4XLxSPXoTfOfVgV0jDqbXq."}}'
+            )
+
+        def release(self):
+            pass
+
+    class SummarizationUpstream:
+        status = 200
+        content_type = "text/event-stream"
+        headers = {"Content-Type": "text/event-stream"}
+
+        def __init__(self):
+            completed = {
+                "type": "response.completed",
+                "response": {
+                    "id": "resp_summarize",
+                    "model": "gpt-5.5",
+                    "status": "completed",
+                    "output": [
+                        {
+                            "type": "message",
+                            "role": "assistant",
+                            "content": [{"type": "output_text", "text": "Summarized after upstream orphan error."}],
+                        }
+                    ],
+                },
+            }
+            self.content = _FakeSseContent(
+                [
+                    b'data: {"type":"response.created","response":{"id":"resp_summarize","model":"gpt-5.5","status":"in_progress"}}\n\n',
+                    f"data: {json.dumps(completed)}\n\n".encode(),
+                    b"data: [DONE]\n\n",
+                ]
+            )
+
+        def release(self):
+            pass
+
+    async def fake_post(self, url, json=None, headers=None):
+        calls.append(str(url))
+        if str(url).endswith("/responses/compact"):
+            return OrphanErrorCompactUpstream()
+        if "chatgpt.com/backend-api/codex/responses" in str(url):
+            return SummarizationUpstream()
+        raise AssertionError(f"unexpected url: {url}")
+
+    monkeypatch.setattr("codex_shim.server.ClientSession.post", fake_post)
+
+    settings = tmp_path / "settings.json"
+    settings.write_text("{}")
+    shim_client = TestClient(TestServer(ShimServer(settings).app()))
+    await shim_client.start_server()
+    try:
+        resp = await shim_client.post(
+            "/v1/responses",
+            json={
+                "model": "codex-gpt-5-5",
+                "stream": True,
+                "input": [
+                    {"type": "message", "role": "user", "content": "keep this thread"},
+                    {
+                        "type": "function_call_output",
+                        "call_id": "call_VF4XLxSPXoTfOfVgV0jDqbXq",
+                        "output": "truncated",
+                    },
+                    {"type": "compaction_trigger"},
+                ],
+            },
+        )
+        assert resp.status == 200
+        events = _sse_events(await resp.text())
+        done = next(event for event in events if event.get("type") == "response.output_item.done")
+        summary = decode_shim_compaction_summary(done["item"]["encrypted_content"])
+        assert "fallback summarization" in summary
+        assert "Compaction warnings:" in summary
+        assert "upstream rejected orphaned tool output" in summary
+        assert "Summarized after upstream orphan error." in summary
+        assert any(url.endswith("/responses/compact") for url in calls)
+        assert any("/codex/responses" in url and not url.endswith("/compact") for url in calls)
+        captured = capsys.readouterr().out
+        assert "[fallback]" in captured
+        assert "[warn] compaction:" in captured
+    finally:
+        await shim_client.close()
+
+
+async def test_chatgpt_ws_compaction_orphan_only_preserves_tail_for_native_compact(
+    monkeypatch, tmp_path, auth_present, capsys
+):
+    captured: dict[str, Any] = {}
+
+    class CompactUpstream:
+        status = 200
+        content_type = "application/json"
+        headers = {"Content-Type": "application/json"}
+
+        async def json(self, content_type=None):
+            return {
+                "id": "resp_compact",
+                "status": "completed",
+                "output": [
+                    {
+                        "type": "compaction",
+                        "encrypted_content": encode_shim_compaction_summary("WS compacted tail."),
+                    }
+                ],
+            }
+
+        async def text(self):
+            return json.dumps(await self.json())
+
+        def release(self):
+            pass
+
+    async def fake_post(self, url, json=None, headers=None):
+        if str(url).endswith("/responses/compact"):
+            captured["compact_input"] = (json or {}).get("input")
+            return CompactUpstream()
+        raise AssertionError(f"unexpected upstream call: {url}")
+
+    monkeypatch.setattr("codex_shim.server.ClientSession.post", fake_post)
+
+    settings = tmp_path / "settings.json"
+    settings.write_text("{}")
+    shim_client = TestClient(TestServer(ShimServer(settings).app()))
+    await shim_client.start_server()
+    try:
+        ws = await shim_client.ws_connect("/v1/responses")
+        await ws.send_json(
+            {
+                "type": "response.create",
+                "model": "codex-gpt-5-5",
+                "stream": True,
+                "input": [
+                    {
+                        "type": "function_call_output",
+                        "call_id": "call_VF4XLxSPXoTfOfVgV0jDqbXq",
+                        "output": "truncated tool output",
+                    },
+                    {"type": "compaction_trigger"},
+                ],
+            }
+        )
+        events = []
+        while True:
+            msg = await ws.receive(timeout=2)
+            assert msg.type == WSMsgType.TEXT
+            payload = json.loads(msg.data)
+            events.append(payload)
+            if payload.get("type") == "response.completed":
+                break
+        done = next(event for event in events if event.get("type") == "response.output_item.done")
+        summary = decode_shim_compaction_summary(done["item"]["encrypted_content"])
+        assert summary == "WS compacted tail."
+        compact_input = captured.get("compact_input")
+        assert isinstance(compact_input, list)
+        assert compact_input[0]["call_id"] == "call_VF4XLxSPXoTfOfVgV0jDqbXq"
+        captured_out = capsys.readouterr().out
+        assert "preserved" in captured_out
+        await ws.close()
     finally:
         await shim_client.close()
 

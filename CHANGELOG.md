@@ -9,6 +9,12 @@ and this project does not yet follow semantic versioning (pre-1.0).
 
 ### Added
 
+- Unified compaction engine (`codex_shim/compaction/`): Codex-aligned input
+  preparation, OpenCode-style summarization prompts, provider-agnostic fallback
+  chain (native → summarization → tertiary BYOK), configurable compaction model,
+  and prompt-cache-friendly stable instruction prefixes. Cursor and BYOK routes
+  now use the same fallback path as ChatGPT when native compact fails.
+
 - ChatGPT passthrough conversation cache persistence: expansion snapshots are stored
   per Codex `session-id` (or `thread-id`) as immutable JSON files under
   `~/.codex-shim/chatgpt-conversations/` (`CODEX_SHIM_CHATGPT_CONVERSATIONS_DIR`).
@@ -24,6 +30,17 @@ and this project does not yet follow semantic versioning (pre-1.0).
 - Bridge live verification: end-to-end curl invoke from Composer 2.5 session (`create_goal`, `update_goal`) works; `codex-shim doctor` now includes conversation cache stats; injected suffix matches production usage in Cursor passthrough.
 
 ### Fixed
+
+- Compaction input budgeting now derives from the compaction model's context window
+  minus `compaction_output_token_reserve` (replacing the flat
+  `context_window_token_budget` input cap). Truncation and pruning run only when
+  estimated input exceeds that budget; if still over budget afterward the shim
+  logs a warning and continues with fallback compaction.
+
+- ChatGPT compaction v2 now expands `previous_response_id` deltas from the
+  conversation cache (same as normal turns) and preserves detached tail tool
+  outputs instead of dropping them as in-batch orphans. Fixes empty compaction
+  batches that produced thin summaries with no thread context.
 
 - WebSocket upstream passthrough for ChatGPT and BYOK `openai-responses` routes:
   Codex's `/v1/responses` WebSocket now proxies to upstream WSS (`wss://chatgpt.com/backend-api/codex/responses`
