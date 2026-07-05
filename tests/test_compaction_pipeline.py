@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from codex_shim.compaction.config import (
     CompactionSettings,
-    DEFAULT_COMPACTION_INSTRUCTION_TOKEN_OVERHEAD,
     compaction_prompt_cache_key,
     effective_compaction_output_token_reserve,
 )

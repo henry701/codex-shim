@@ -7,6 +7,11 @@ and this project does not yet follow semantic versioning (pre-1.0).
 
 ## Unreleased
 
+### Changed
+
+- Default `compaction_output_token_reserve` is now 20000 tokens (was
+  `summary_max_output_tokens` + 8192 instruction overhead).
+
 ### Added
 
 - Unified compaction engine (`codex_shim/compaction/`): Codex-aligned input

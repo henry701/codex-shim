@@ -901,8 +901,7 @@ Optional `compaction` block in `~/.codex-shim/models.json`:
 ```
 
 Compaction input shaping uses the compaction model's context window minus an
-output reserve. By default the reserve is `summary_max_output_tokens` plus
-8192 tokens of instruction/tool overhead, or an explicit
+output reserve. By default the reserve is 20000 tokens, or an explicit
 `compaction_output_token_reserve`. The shim char-truncates tool outputs only when
 estimated input exceeds that budget, then prunes oldest tool outputs if still
 over budget. If the history remains over budget after both steps, compaction

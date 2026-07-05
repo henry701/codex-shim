@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from codex_shim.compaction.config import (
     CompactionSettings,
-    DEFAULT_COMPACTION_INSTRUCTION_TOKEN_OVERHEAD,
+    DEFAULT_COMPACTION_OUTPUT_TOKEN_RESERVE,
     effective_compaction_output_token_reserve,
     load_compaction_settings,
 )
@@ -14,11 +14,9 @@ from codex_shim.compaction.context import (
 from codex_shim.settings import ShimModel
 
 
-def test_effective_output_reserve_defaults_to_summary_plus_overhead():
+def test_effective_output_reserve_defaults_to_20k():
     settings = CompactionSettings(summary_max_output_tokens=4096)
-    assert effective_compaction_output_token_reserve(settings) == (
-        4096 + DEFAULT_COMPACTION_INSTRUCTION_TOKEN_OVERHEAD
-    )
+    assert effective_compaction_output_token_reserve(settings) == DEFAULT_COMPACTION_OUTPUT_TOKEN_RESERVE
 
 
 def test_effective_output_reserve_honors_explicit_config():

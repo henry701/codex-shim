@@ -9,6 +9,7 @@ from ..settings import DEFAULT_SETTINGS
 
 # Estimated tokens for compaction instructions, tools, and summarization user template.
 DEFAULT_COMPACTION_INSTRUCTION_TOKEN_OVERHEAD = 8192
+DEFAULT_COMPACTION_OUTPUT_TOKEN_RESERVE = 20_000
 
 
 @dataclass(frozen=True)
@@ -31,7 +32,7 @@ class CompactionSettings:
 def effective_compaction_output_token_reserve(settings: CompactionSettings) -> int:
     if settings.compaction_output_token_reserve is not None:
         return max(0, settings.compaction_output_token_reserve)
-    return settings.summary_max_output_tokens + DEFAULT_COMPACTION_INSTRUCTION_TOKEN_OVERHEAD
+    return DEFAULT_COMPACTION_OUTPUT_TOKEN_RESERVE
 
 
 def _coerce_bool(value: Any, default: bool) -> bool:
