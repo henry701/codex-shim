@@ -29,9 +29,10 @@ class CompactionSanitizationAudit:
     outgoing_items: int = 0
     dropped: list[tuple[CompactionInputItemRef, str]] = field(default_factory=list)
     preserved: list[tuple[CompactionInputItemRef, str]] = field(default_factory=list)
+    synthesized: list[str] = field(default_factory=list)
 
     def warning_lines(self) -> list[str]:
-        warnings: list[str] = []
+        warnings = list(self.synthesized)
         for ref, _reason in self.dropped:
             detail = f"call_id={ref.call_id!r}" if ref.call_id else "missing call_id"
             warnings.append(f"dropped orphan {ref.item_type} ({detail})")

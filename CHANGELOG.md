@@ -9,6 +9,12 @@ and this project does not yet follow semantic versioning (pre-1.0).
 
 ### Changed
 
+- Compaction failures now return a chained error message to Codex (native,
+  summarization, and tertiary attempts) instead of only the first upstream error.
+  Each phase includes upstream route context, HTTP status, provider error code,
+  and a truncated raw upstream response body when available. Logs add
+  `summarization-fail`, `tertiary-fail`, and `tertiary-skip` phases.
+
 - Default `compaction_output_token_reserve` is now 20000 tokens (was
   `summary_max_output_tokens` + 8192 instruction overhead).
 
@@ -42,10 +48,15 @@ and this project does not yet follow semantic versioning (pre-1.0).
   estimated input exceeds that budget; if still over budget afterward the shim
   logs a warning and continues with fallback compaction.
 
+- Shared responses input pipeline (`responses_input_pipeline.py`): ChatGPT
+  conversation cache expansion now runs for all models (BYOK, compaction, WS),
+  not only ChatGPT passthrough. Orphan tool outputs synthesize a placeholder
+  `unknown_tool` call instead of being dropped, with WARN logging. Chat
+  translation gets the same safety net for deferred orphan tool messages.
+
 - ChatGPT compaction v2 now expands `previous_response_id` deltas from the
-  conversation cache (same as normal turns) and preserves detached tail tool
-  outputs instead of dropping them as in-batch orphans. Fixes empty compaction
-  batches that produced thin summaries with no thread context.
+  conversation cache (same as normal turns). Detached tail tool outputs are
+  repaired via synthetic tool calls when no matching call exists in the batch.
 
 - WebSocket upstream passthrough for ChatGPT and BYOK `openai-responses` routes:
   Codex's `/v1/responses` WebSocket now proxies to upstream WSS (`wss://chatgpt.com/backend-api/codex/responses`

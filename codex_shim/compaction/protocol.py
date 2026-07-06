@@ -5,7 +5,8 @@ import json
 import time
 from typing import Any
 
-from .input_audit import CompactionSanitizationAudit, compaction_input_item_ref
+from ..responses_input_pipeline import sanitize_compaction_input_with_pipeline
+from .input_audit import CompactionSanitizationAudit
 
 SHIM_COMPACTION_PREFIX = "codex-shim-compaction-v1:"
 
@@ -48,133 +49,16 @@ def _tool_item_call_id(item: dict[str, Any]) -> str | None:
 
 
 def drop_orphaned_tool_outputs(input_items: list[Any]) -> tuple[list[Any], list[str]]:
-    """Drop tool outputs with no preceding tool call for the same call_id."""
-    cleaned, audit = _drop_orphaned_tool_outputs_with_audit(input_items)
-    return cleaned, audit.warning_lines()
-
-
-def _drop_orphaned_tool_outputs_with_audit(
-    input_items: list[Any],
-) -> tuple[list[Any], CompactionSanitizationAudit]:
-    audit = CompactionSanitizationAudit(incoming_items=len(input_items))
-    if not input_items:
-        audit.outgoing_items = 0
-        return [], audit
-    cleaned: list[Any] = []
-    seen_call_ids: set[str] = set()
-    for index, raw in enumerate(input_items):
-        if not isinstance(raw, dict):
-            cleaned.append(raw)
-            continue
-        item_type = raw.get("type")
-        if item_type in _TOOL_CALL_ITEM_TYPES:
-            call_id = _tool_item_call_id(raw)
-            if call_id:
-                seen_call_ids.add(call_id)
-            cleaned.append(raw)
-            continue
-        if item_type in _TOOL_OUTPUT_ITEM_TYPES:
-            call_id = _tool_item_call_id(raw)
-            if call_id and call_id in seen_call_ids:
-                cleaned.append(raw)
-                continue
-            audit.dropped.append(
-                (
-                    compaction_input_item_ref(index, raw),
-                    _DROP_ORPHAN_IN_BATCH if call_id else "missing call_id",
-                )
-            )
-            continue
-        cleaned.append(raw)
-    audit.outgoing_items = len(cleaned)
-    return cleaned, audit
-
-
-def _last_tool_call_index(input_items: list[Any]) -> int | None:
-    last: int | None = None
-    for index, raw in enumerate(input_items):
-        if isinstance(raw, dict) and raw.get("type") in _TOOL_CALL_ITEM_TYPES:
-            last = index
-    return last
-
-
-_DROP_ORPHAN_IN_BATCH = "no in-batch function_call/custom_tool_call for call_id"
-_PRESERVE_DETACHED_TAIL = "detached compaction tail after last in-batch tool call"
-_PRESERVE_ORPHAN_ONLY_BATCH = "batch contained only tool outputs; preserving for compaction"
+    """Repair tool outputs with no preceding tool call by synthesizing placeholder calls."""
+    cleaned, warnings, _audit = sanitize_compaction_input_with_pipeline(input_items)
+    return cleaned, warnings
 
 
 def sanitize_compaction_input_items(
     input_items: list[Any],
 ) -> tuple[list[Any], list[str], CompactionSanitizationAudit]:
-    """Drop in-batch orphan tool outputs, but keep detached compaction tail items.
-
-    Codex compaction v2 often sends only truncated tail ``function_call_output``
-    items without their matching ``function_call`` in the same request. ChatGPT
-    passthrough should expand those deltas from the conversation cache first; any
-    tail outputs that still lack an in-batch call are preserved when they appear
-    after the last tool call in the batch.
-    """
-    audit = CompactionSanitizationAudit(incoming_items=len(input_items))
-    if not input_items:
-        audit.outgoing_items = 0
-        return [], [], audit
-
-    cleaned, drop_audit = _drop_orphaned_tool_outputs_with_audit(input_items)
-    audit.dropped.extend(drop_audit.dropped)
-
-    last_call_index = _last_tool_call_index(input_items)
-    recovered: list[dict[str, Any]] = []
-    kept_output_call_ids = {
-        _tool_item_call_id(item)
-        for item in cleaned
-        if isinstance(item, dict)
-        and item.get("type") in _TOOL_OUTPUT_ITEM_TYPES
-        and _tool_item_call_id(item)
-    }
-    for index, raw in enumerate(input_items):
-        if not isinstance(raw, dict):
-            continue
-        item_type = raw.get("type")
-        if item_type not in _TOOL_OUTPUT_ITEM_TYPES:
-            continue
-        call_id = _tool_item_call_id(raw)
-        if call_id and call_id in kept_output_call_ids:
-            continue
-        if last_call_index is None or index <= last_call_index:
-            continue
-        recovered.append(raw)
-        audit.preserved.append(
-            (
-                compaction_input_item_ref(index, raw),
-                _PRESERVE_DETACHED_TAIL,
-            )
-        )
-
-    if not recovered:
-        if cleaned:
-            audit.outgoing_items = len(cleaned)
-            return cleaned, audit.warning_lines(), audit
-        tool_outputs_only = bool(input_items) and all(
-            isinstance(item, dict) and item.get("type") in _TOOL_OUTPUT_ITEM_TYPES
-            for item in input_items
-        )
-        if tool_outputs_only:
-            for index, raw in enumerate(input_items):
-                if isinstance(raw, dict):
-                    recovered.append(raw)
-                    audit.preserved.append(
-                        (
-                            compaction_input_item_ref(index, raw),
-                            _PRESERVE_ORPHAN_ONLY_BATCH,
-                        )
-                    )
-        if not recovered:
-            audit.outgoing_items = len(cleaned)
-            return cleaned, audit.warning_lines(), audit
-
-    result = [*cleaned, *recovered]
-    audit.outgoing_items = len(result)
-    return result, audit.warning_lines(), audit
+    """Expand-safe compaction sanitization: synthesize missing tool calls for orphan outputs."""
+    return sanitize_compaction_input_with_pipeline(input_items)
 
 
 def is_orphan_tool_call_upstream_error(message: str) -> bool:

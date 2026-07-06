@@ -81,7 +81,10 @@ def log_compaction_sanitization(audit: CompactionSanitizationAudit) -> None:
         outgoing=audit.outgoing_items,
         dropped=len(audit.dropped),
         preserved=len(audit.preserved),
+        synthesized=len(audit.synthesized),
     )
+    for warning in audit.synthesized:
+        print(f"[compaction] sanitize SYNTH {warning}", flush=True)
     for ref, reason in audit.dropped:
         print(
             f"[compaction] sanitize DROP {ref.label()} reason={reason!r}",
@@ -92,9 +95,9 @@ def log_compaction_sanitization(audit: CompactionSanitizationAudit) -> None:
             f"[compaction] sanitize PRESERVE {ref.label()} reason={reason!r}",
             flush=True,
         )
-    if not audit.dropped and not audit.preserved:
+    if not audit.dropped and not audit.preserved and not audit.synthesized:
         print(
-            "[compaction] sanitize PASS no shim-side drops or preserves; input unchanged",
+            "[compaction] sanitize PASS no shim-side drops, preserves, or syntheses; input unchanged",
             flush=True,
         )
 

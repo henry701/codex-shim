@@ -60,7 +60,7 @@ def test_apply_compaction_fallback_notice_includes_warnings_for_model():
     assert "Keep going." in text
 
 
-def test_drop_orphaned_tool_outputs_removes_unmatched_outputs():
+def test_drop_orphaned_tool_outputs_synthesizes_unmatched_outputs():
     input_items = [
         {
             "type": "function_call_output",
@@ -80,10 +80,14 @@ def test_drop_orphaned_tool_outputs_removes_unmatched_outputs():
         },
     ]
     cleaned, warnings = drop_orphaned_tool_outputs(input_items)
-    assert len(cleaned) == 2
+    assert len(cleaned) == 4
     assert cleaned[0]["type"] == "function_call"
-    assert cleaned[1]["call_id"] == "call_ok"
+    assert cleaned[0]["call_id"] == "call_orphan"
+    assert cleaned[1]["call_id"] == "call_orphan"
+    assert cleaned[2]["type"] == "function_call"
+    assert cleaned[3]["call_id"] == "call_ok"
     assert len(warnings) == 1
+    assert "synthesized" in warnings[0]
     assert "call_orphan" in warnings[0]
 
 
@@ -106,8 +110,7 @@ def test_drop_orphaned_tool_outputs_keeps_matched_custom_tool_round_trip():
     assert warnings == []
 
 
-def test_drop_orphaned_tool_outputs_orphan_only_matches_truncated_compaction_input():
-    """Low-level orphan drop still removes detached outputs in isolation."""
+def test_drop_orphaned_tool_outputs_orphan_only_synthesizes_placeholder():
     input_items = [
         {
             "type": "function_call_output",
@@ -116,13 +119,15 @@ def test_drop_orphaned_tool_outputs_orphan_only_matches_truncated_compaction_inp
         },
     ]
     cleaned, warnings = drop_orphaned_tool_outputs(input_items)
-    assert cleaned == []
+    assert len(cleaned) == 2
+    assert cleaned[0]["type"] == "function_call"
+    assert cleaned[0]["call_id"] == "call_VF4XLxSPXoTfOfVgV0jDqbXq"
+    assert cleaned[1]["type"] == "function_call_output"
     assert len(warnings) == 1
-    assert "function_call_output" in warnings[0]
-    assert "call_VF4XLxSPXoTfOfVgV0jDqbXq" in warnings[0]
+    assert "synthesized" in warnings[0]
 
 
-def test_sanitize_compaction_input_items_preserves_detached_orphan_only_batch():
+def test_sanitize_compaction_input_items_synthesizes_detached_orphan_only_batch():
     input_items = [
         {
             "type": "function_call_output",
@@ -131,13 +136,14 @@ def test_sanitize_compaction_input_items_preserves_detached_orphan_only_batch():
         },
     ]
     cleaned, warnings, audit = sanitize_compaction_input_items(input_items)
-    assert len(cleaned) == 1
-    assert cleaned[0]["call_id"] == "call_VF4XLxSPXoTfOfVgV0jDqbXq"
-    assert len(audit.preserved) == 1
-    assert any("preserved" in warning for warning in warnings)
+    assert len(cleaned) == 2
+    assert cleaned[0]["type"] == "function_call"
+    assert cleaned[1]["call_id"] == "call_VF4XLxSPXoTfOfVgV0jDqbXq"
+    assert len(audit.synthesized) == 1
+    assert any("synthesized" in warning for warning in warnings)
 
 
-def test_sanitize_compaction_input_items_preserves_tail_outputs_after_expanded_history():
+def test_sanitize_compaction_input_items_synthesizes_tail_outputs_after_expanded_history():
     input_items = [
         {"type": "message", "role": "user", "content": "run"},
         {
@@ -150,16 +156,13 @@ def test_sanitize_compaction_input_items_preserves_tail_outputs_after_expanded_h
         {"type": "function_call_output", "call_id": "call_2", "output": "tail"},
     ]
     cleaned, warnings, audit = sanitize_compaction_input_items(input_items)
-    assert [item.get("call_id") for item in cleaned if item.get("type") == "function_call_output"] == [
-        "call_1",
-        "call_2",
-    ]
-    assert len(audit.preserved) == 1
-    assert audit.preserved[0][0].call_id == "call_2"
-    assert any("preserved" in warning for warning in warnings)
+    call_ids = [item.get("call_id") for item in cleaned if item.get("type") == "function_call_output"]
+    assert call_ids == ["call_1", "call_2"]
+    assert len(audit.synthesized) == 1
+    assert any("call_2" in warning for warning in audit.synthesized)
 
 
-def test_drop_orphaned_tool_outputs_drops_custom_tool_output_without_call():
+def test_drop_orphaned_tool_outputs_synthesizes_custom_tool_output_without_call():
     input_items = [
         {
             "type": "custom_tool_call_output",
@@ -168,12 +171,14 @@ def test_drop_orphaned_tool_outputs_drops_custom_tool_output_without_call():
         },
     ]
     cleaned, warnings = drop_orphaned_tool_outputs(input_items)
-    assert cleaned == []
+    assert len(cleaned) == 2
+    assert cleaned[0]["type"] == "custom_tool_call"
+    assert cleaned[1]["type"] == "custom_tool_call_output"
     assert len(warnings) == 1
-    assert "custom_tool_call_output" in warnings[0]
+    assert "synthesized" in warnings[0]
 
 
-def test_drop_orphaned_tool_outputs_drops_output_with_missing_call_id():
+def test_drop_orphaned_tool_outputs_leaves_output_with_missing_call_id():
     input_items = [
         {
             "type": "function_call_output",
@@ -181,9 +186,8 @@ def test_drop_orphaned_tool_outputs_drops_output_with_missing_call_id():
         },
     ]
     cleaned, warnings = drop_orphaned_tool_outputs(input_items)
-    assert cleaned == []
-    assert len(warnings) == 1
-    assert "missing call_id" in warnings[0]
+    assert cleaned == input_items
+    assert warnings == []
 
 
 def test_is_orphan_tool_call_upstream_error_detects_chatgpt_message():

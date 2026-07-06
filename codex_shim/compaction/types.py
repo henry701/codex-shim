@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
@@ -24,6 +25,8 @@ class CompactionRequest:
     preset_native_message: str = ""
     passthrough_fallback_slug: str | None = None
     compaction_model_context_window: int | None = None
+    route_fn: Callable[[dict[str, Any]], Any] | None = None
+    has_credentials_fn: Callable[[Any], bool] | None = None
 
 
 @dataclass
@@ -45,6 +48,7 @@ class NativeAttemptResult:
     native_status: int | None = None
     native_message: str = ""
     legacy_payload: dict[str, Any] | None = None
+    upstream_context: str = ""
 
 
 @dataclass
@@ -52,6 +56,7 @@ class SummarizationAttemptResult:
     summary: str = ""
     usage: dict[str, Any] | None = None
     error_response: Any = None
+    upstream_context: str = ""
 
 
 @dataclass

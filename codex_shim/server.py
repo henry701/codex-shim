@@ -26,8 +26,6 @@ from .compaction import (
     compaction_output_item,
     compaction_summary_from_output,
     decode_shim_compaction_summary,
-    drop_orphaned_tool_outputs,
-    is_orphan_tool_call_upstream_error,
     strip_terminal_compaction_trigger,
 )
 from .compaction.adapters import compaction_orchestrator_for, compaction_request_from_v2
@@ -36,6 +34,7 @@ from .compaction.logging import (
     log_compaction_input_snapshot,
     log_compaction_upstream_body,
 )
+from .compaction.errors import byok_upstream_context
 from .compaction.input_audit import summarize_compaction_input_items
 from .compaction.model_resolver import CompactionModelResolver
 from .compaction.orchestrator import (
@@ -74,6 +73,7 @@ from .cursor_passthrough import (
 )
 from .catalog import sort_catalog_entries
 from .chatgpt_conversation_cache import ChatgptConversationCache, session_key_from_headers
+from .responses_input_pipeline import apply_responses_input_pipeline_to_body
 from . import router as router_module
 from . import mcp_search
 from . import tool_translate
@@ -329,6 +329,10 @@ class ShimServer:
                 native_status=response.status,
                 native_message=message,
                 error_response=response,
+                upstream_context=(
+                    f"{request.requested_slug} → {upstream_model} @ "
+                    "https://chatgpt.com/backend-api/codex/responses/compact"
+                ),
             )
         try:
             payload = json.loads(response.text or "{}")
@@ -375,6 +379,10 @@ class ShimServer:
                 native_status=response.status,
                 native_message=message,
                 error_response=response,
+                upstream_context=(
+                    f"{request.requested_slug} → {cursor_upstream_model(request.requested_slug)} "
+                    "@ cursor-agent"
+                ),
             )
         try:
             payload = json.loads(response.text or "{}")
@@ -426,6 +434,7 @@ class ShimServer:
                 native_status=status,
                 native_message=message,
                 error_response=error_response,
+                upstream_context=byok_upstream_context(route),
             )
         if summary.strip():
             return NativeAttemptResult(item=compaction_output_item(summary), usage=usage)
@@ -603,7 +612,10 @@ class ShimServer:
             tool_resolve=tool_resolve,
         )
         if error_response is not None:
-            return SummarizationAttemptResult(error_response=error_response)
+            return SummarizationAttemptResult(
+                error_response=error_response,
+                upstream_context=byok_upstream_context(route),
+            )
         return SummarizationAttemptResult(summary=summary, usage=usage)
 
     async def _compaction_tertiary_byok(
@@ -641,7 +653,10 @@ class ShimServer:
             tool_resolve=tool_resolve,
         )
         if error_response is not None:
-            return SummarizationAttemptResult(error_response=error_response)
+            return SummarizationAttemptResult(
+                error_response=error_response,
+                upstream_context=byok_upstream_context(route),
+            )
         return SummarizationAttemptResult(summary=summary, usage=usage)
 
     async def _run_compaction_orchestrator(
@@ -1059,7 +1074,7 @@ class ShimServer:
                 {k: v for k, v in payload.items() if k != "type"},
                 request.headers,
             )
-            forwarded = dict(body)
+            forwarded = self._apply_responses_input_pipeline(body, request, context="turn")
             forwarded["model"] = route.model
             forwarded["stream"] = True
             headers = openai_responses_ws_upstream_headers(
@@ -1330,6 +1345,7 @@ class ShimServer:
         tool_types = responses_tool_type_map(body.get("tools"))
         tool_resolve = responses_tool_resolve_map(body.get("tools"))
         body = prepare_codex_byok_responses_body(body, request.headers)
+        body = self._apply_responses_input_pipeline(body, request, context="turn")
         if route.is_openai_responses:
             return await self._post_openai_responses(request, route, body)
         if route.is_openai_chat:
@@ -1427,10 +1443,11 @@ class ShimServer:
             previous_response_id=body.get("previous_response_id"),
         )
         if is_chatgpt_passthrough_slug(model):
-            stripped_input = self._expand_chatgpt_compaction_stripped_input(
+            stripped_input = self._expand_responses_stripped_input(
                 request,
                 body,
                 stripped_input,
+                context="compaction",
             )
         log_compaction_input_snapshot(
             "post-expand",
@@ -1481,12 +1498,7 @@ class ShimServer:
             return result.item, route.slug, result.usage, None
         except CompactionOrchestratorError as exc:
             slug = model or (route.slug if route else "unknown")
-            error_response = exc.error_response
-            if error_response is None:
-                error_response = web.json_response(
-                    _responses_error_payload(slug, "upstream_error", str(exc)),
-                    status=502,
-                )
+            error_response = _compaction_orchestrator_error_response(slug, exc)
             return {}, slug, None, error_response
 
     async def _responses_compaction_v2(
@@ -1549,6 +1561,11 @@ class ShimServer:
         tool_resolve: dict[str, tuple[str | None, str]] | None,
     ) -> tuple[str, dict[str, Any] | None, web.StreamResponse | web.Response | None]:
         compact_body = prepare_codex_byok_responses_body(compact_body, request.headers)
+        compact_body = self._apply_responses_input_pipeline(
+            compact_body,
+            request,
+            context="compaction",
+        )
         compact_body["stream"] = False
         _log_upstream_io_detail(
             surface="byok-compact",
@@ -1659,9 +1676,7 @@ class ShimServer:
                     transport="legacy_compact",
                 )
             except CompactionOrchestratorError as exc:
-                if exc.error_response is not None:
-                    return exc.error_response
-                raise
+                return _compaction_orchestrator_error_response(requested_slug, exc)
             if result.legacy_payload is not None:
                 payload = copy.deepcopy(result.legacy_payload)
                 _rewrite_response_model(payload, requested_slug)
@@ -1840,96 +1855,54 @@ class ShimServer:
             return str(content.get("text") or content.get("content") or "")
         return str(content)
 
-    def _expand_chatgpt_cached_input(
+    def _apply_responses_input_pipeline(
         self,
+        body: dict[str, Any],
+        request: web.Request,
         *,
-        session_key: str,
-        previous_response_id: Any,
-        delta_input: list[Any],
-        context: str,
-    ) -> list[Any]:
-        if not _chatgpt_expand_continuations_enabled():
-            return delta_input
-        if not isinstance(previous_response_id, str) or not previous_response_id:
-            return delta_input
-        _, delta_summary = summarize_compaction_input_items(delta_input, tail=6)
-        cached = self._chatgpt_conversation_cache.get(session_key, previous_response_id)
-        if cached is None:
-            if context == "compaction":
-                log_compaction_cache_expansion(
-                    context=context,
-                    session_key=session_key,
-                    previous_response_id=previous_response_id,
-                    cached_items=None,
-                    delta_items=len(delta_input),
-                    total_items=None,
-                    delta_summary=delta_summary,
-                )
-            else:
-                print(
-                    f"[chatgpt-cache] {context} MISS session={session_key} "
-                    f"previous_response_id={previous_response_id} delta_items={len(delta_input)}",
-                    flush=True,
-                )
-            return delta_input
-        expanded = [*copy.deepcopy(cached), *copy.deepcopy(delta_input)]
-        if context == "compaction":
-            log_compaction_cache_expansion(
-                context=context,
-                session_key=session_key,
-                previous_response_id=previous_response_id,
-                cached_items=len(cached),
-                delta_items=len(delta_input),
-                total_items=len(expanded),
-                delta_summary=delta_summary,
-            )
-        else:
-            print(
-                f"[chatgpt-cache] {context} HIT session={session_key} "
-                f"previous_response_id={previous_response_id} cached={len(cached)} "
-                f"delta={len(delta_input)} total={len(expanded)}",
-                flush=True,
-            )
-        return expanded
+        context: str = "turn",
+        strip_previous_response_id: bool = False,
+    ) -> dict[str, Any]:
+        return apply_responses_input_pipeline_to_body(
+            body,
+            cache=self._chatgpt_conversation_cache,
+            session_key=self._session_key(request),
+            expand_enabled=_chatgpt_expand_continuations_enabled(),
+            context=context,
+            strip_previous_response_id=strip_previous_response_id,
+        )
 
-    def _expand_chatgpt_compaction_stripped_input(
+    def _expand_responses_stripped_input(
         self,
         request: web.Request,
         body: dict[str, Any],
         stripped_input: list[Any],
+        *,
+        context: str,
     ) -> list[Any]:
-        return self._expand_chatgpt_cached_input(
+        from .responses_input_pipeline import prepare_responses_input_items
+
+        repaired, _warnings = prepare_responses_input_items(
+            cache=self._chatgpt_conversation_cache,
             session_key=self._session_key(request),
             previous_response_id=body.get("previous_response_id"),
-            delta_input=stripped_input,
-            context="compaction",
+            input_items=stripped_input,
+            expand_enabled=_chatgpt_expand_continuations_enabled(),
+            context=context,
         )
+        return repaired
 
     def _prepare_chatgpt_passthrough_body(self, body: dict[str, Any], *, session_key: str) -> dict[str, Any]:
-        previous_response_id = body.get("previous_response_id")
         expand = _chatgpt_expand_continuations_enabled()
-        forwarded = _sanitize_chatgpt_passthrough_body(body, strip_previous_response_id=expand)
-        if expand and isinstance(previous_response_id, str) and previous_response_id:
-            delta_input = _chatgpt_input_items(forwarded.get("input"))
-            expanded = self._expand_chatgpt_cached_input(
-                session_key=session_key,
-                previous_response_id=previous_response_id,
-                delta_input=delta_input,
-                context="turn",
-            )
-            if expanded is not delta_input:
-                forwarded["input"] = expanded
-            elif _stream_log_enabled():
-                print(
-                    f"[chatgpt-cache] session={session_key} previous_response_id={previous_response_id} hit=False",
-                    flush=True,
-                )
-        elif _stream_log_enabled() and isinstance(previous_response_id, str) and previous_response_id:
-            print(
-                f"[chatgpt-cache] session={session_key} previous_response_id={previous_response_id} passthrough=True",
-                flush=True,
-            )
-        return forwarded
+        sanitized = _sanitize_chatgpt_passthrough_body(body, strip_previous_response_id=False)
+        return apply_responses_input_pipeline_to_body(
+            sanitized,
+            cache=self._chatgpt_conversation_cache,
+            session_key=session_key,
+            expand_enabled=expand,
+            context="turn",
+            strip_previous_response_id=expand,
+        )
 
     def _store_chatgpt_passthrough_conversation(
         self,
@@ -2267,8 +2240,7 @@ class ShimServer:
                     preset_native_message=message,
                 )
             except CompactionOrchestratorError as exc:
-                if exc.error_response is not None:
-                    return exc.error_response
+                enriched = _compaction_orchestrator_error_response(original_model or requested, exc)
                 fallback = await self._maybe_passthrough_byok_fallback(
                     request,
                     body,
@@ -2284,7 +2256,7 @@ class ShimServer:
                         response_slug=original_model or requested,
                         native_message=message,
                     )
-                return response
+                return enriched
             summary = decode_shim_compaction_summary(result.item.get("encrypted_content")) or ""
             return web.json_response(
                 compact_response_payload(original_model or requested, summary, result.usage)
@@ -2659,6 +2631,7 @@ class ShimServer:
         tool_types = responses_tool_type_map(body.get("tools"))
         tool_resolve = responses_tool_resolve_map(body.get("tools"))
         body = prepare_codex_byok_responses_body(body, request.headers)
+        body = self._apply_responses_input_pipeline(body, request, context="turn")
         if route.is_openai_responses:
             return await self._post_openai_responses(request, route, body)
         if route.is_openai_chat:
@@ -2698,6 +2671,11 @@ class ShimServer:
         tool_resolve = responses_tool_resolve_map(body.get("tools"))
         compact_body = _compact_request_body(body, route.model)
         compact_body = prepare_codex_byok_responses_body(compact_body, request.headers)
+        compact_body = self._apply_responses_input_pipeline(
+            compact_body,
+            request,
+            context="compaction",
+        )
         if route.is_openai_responses:
             compact_body["stream"] = False
             return await self._post_openai_responses(request, route, compact_body)
@@ -5672,6 +5650,24 @@ async def _as_compact_response(response: web.StreamResponse, model: str) -> web.
     summary = compaction_summary_from_output(output)
     compacted = compact_response_payload(model, summary, payload.get("usage") if isinstance(payload, dict) else None)
     return web.json_response(compacted)
+
+
+def _compaction_orchestrator_error_response(
+    slug: str,
+    exc: CompactionOrchestratorError,
+) -> web.Response:
+    status = 502
+    code = "compaction_failed"
+    if exc.error_response is not None:
+        status = getattr(exc.error_response, "status", 502)
+        text = getattr(exc.error_response, "text", "") or ""
+        parsed_code, _ = parse_upstream_error(text, status)
+        if parsed_code:
+            code = parsed_code
+    return web.json_response(
+        _responses_error_payload(slug, code, str(exc)),
+        status=status,
+    )
 
 
 def parse_upstream_error(body: str, http_status: int) -> tuple[str, str]:

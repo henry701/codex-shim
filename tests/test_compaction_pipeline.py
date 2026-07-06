@@ -34,7 +34,7 @@ def _tool_heavy_history(*, output_chars: int) -> list[dict]:
     ]
 
 
-def test_prepare_compaction_input_preserves_detached_orphan_only_tail():
+def test_prepare_compaction_input_synthesizes_detached_orphan_only_tail():
     items = [
         {
             "type": "function_call_output",
@@ -43,12 +43,13 @@ def test_prepare_compaction_input_preserves_detached_orphan_only_tail():
         },
     ]
     prepared = prepare_compaction_input(items, CompactionSettings())
-    assert len(prepared.native_input) == 1
-    assert prepared.native_input[0]["call_id"] == "call_tail"
-    assert any("preserved" in warning for warning in prepared.warnings)
+    assert len(prepared.native_input) == 2
+    assert prepared.native_input[0]["type"] == "function_call"
+    assert prepared.native_input[1]["call_id"] == "call_tail"
+    assert any("synthesized" in warning for warning in prepared.warnings)
 
 
-def test_prepare_compaction_input_drops_orphans_and_splits_summarization_input():
+def test_prepare_compaction_input_synthesizes_orphans_and_splits_summarization_input():
     settings = CompactionSettings(tail_turns=1, tool_output_max_chars=10)
     items = [
         {"type": "function_call_output", "call_id": "orphan", "output": "x" * 20},
@@ -56,9 +57,9 @@ def test_prepare_compaction_input_drops_orphans_and_splits_summarization_input()
         {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "new"}]},
     ]
     prepared = prepare_compaction_input(items, settings, compaction_model_context_window=128_000)
-    assert len(prepared.native_input) == 2
-    assert any("dropped orphan" in warning for warning in prepared.warnings)
-    assert len(prepared.summarization_input) == 1
+    assert len(prepared.native_input) == 4
+    assert any("synthesized" in warning for warning in prepared.warnings)
+    assert len(prepared.summarization_input) == 3
 
 
 def test_extract_previous_summary_reads_shim_compaction_item():

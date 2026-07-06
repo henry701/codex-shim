@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
+from ..settings import byok_model_has_credentials
 from .config import load_compaction_settings
 from .context import (
     compaction_budget_slug,
@@ -87,6 +88,8 @@ def compaction_request_from_v2(
         preset_native_message=preset_native_message,
         passthrough_fallback_slug=server._passthrough_fallback_slug(requested_slug),
         compaction_model_context_window=compaction_model_context_window,
+        route_fn=server._route,
+        has_credentials_fn=byok_model_has_credentials,
     )
 
 

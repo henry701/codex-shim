@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from .errors import describe_upstream_error, format_compaction_failure_detail, upstream_error_message
 from .logging import log_compaction_fallback, log_compaction_phase, log_compaction_path, log_compaction_warnings
 from .model_resolver import CompactionModelResolver
 from .pipeline import PreparedInput, prepare_compaction_input
@@ -99,7 +100,11 @@ class CompactionOrchestrator:
                     phase="native",
                     legacy_payload=native.legacy_payload,
                 )
-            native_message = native.native_message or "native compaction failed"
+            native_message = describe_upstream_error(
+                native.error_response,
+                context=native.upstream_context or None,
+                fallback=native.native_message or "native compaction failed",
+            )
 
         if not native_message:
             native_message = "native compaction failed"
@@ -143,6 +148,18 @@ class CompactionOrchestrator:
                 phase="summarization",
             )
 
+        summarization_message = describe_upstream_error(
+            summary_result.error_response,
+            context=summary_result.upstream_context or None,
+            fallback="returned empty summary",
+        )
+        log_compaction_phase(
+            "summarization-fail",
+            provider=request.provider,
+            slug=request.requested_slug,
+            message=summarization_message,
+        )
+
         tertiary = await self._try_tertiary(request, prepared, native_message)
         if tertiary.summary.strip():
             log_compaction_path(
@@ -170,10 +187,59 @@ class CompactionOrchestrator:
                 phase="tertiary",
             )
 
-        raise CompactionOrchestratorError(
-            native_message,
-            error_response=native.error_response,
+        tertiary_message = describe_upstream_error(
+            tertiary.error_response,
+            context=tertiary.upstream_context or None,
+            fallback="returned empty summary",
         )
+        tertiary_slug = self._resolved_tertiary_slug(request)
+        if tertiary_slug:
+            log_compaction_phase(
+                "tertiary-fail",
+                provider=request.provider,
+                slug=request.requested_slug,
+                tertiary_slug=tertiary_slug,
+                message=tertiary_message,
+            )
+        else:
+            log_compaction_phase(
+                "tertiary-skip",
+                provider=request.provider,
+                slug=request.requested_slug,
+                reason="no tertiary_fallback_slug configured",
+            )
+
+        detail = format_compaction_failure_detail(
+            slug=request.requested_slug,
+            provider=request.provider,
+            native_message=native_message,
+            summarization_message=summarization_message,
+            summarization_attempted=True,
+            tertiary_slug=tertiary_slug,
+            tertiary_message=tertiary_message if tertiary_slug else None,
+            tertiary_attempted=bool(tertiary_slug),
+        )
+        last_error_response = (
+            tertiary.error_response
+            or summary_result.error_response
+            or native.error_response
+        )
+        raise CompactionOrchestratorError(
+            detail,
+            error_response=last_error_response,
+        )
+
+    def _resolved_tertiary_slug(self, request: CompactionRequest) -> str | None:
+        resolver = CompactionModelResolver(
+            request.settings,
+            route_fn=request.route_fn,
+            has_credentials_fn=request.has_credentials_fn,
+        )
+        return resolver.resolve(
+            requested_slug=request.requested_slug,
+            body=request.body,
+            passthrough_fallback_slug=request.passthrough_fallback_slug,
+        ).tertiary_slug
 
     async def _try_native(
         self,
@@ -214,8 +280,8 @@ class CompactionOrchestrator:
     ) -> SummarizationAttemptResult:
         resolver = CompactionModelResolver(
             request.settings,
-            route_fn=None,
-            has_credentials_fn=None,
+            route_fn=request.route_fn,
+            has_credentials_fn=request.has_credentials_fn,
         )
         resolved = resolver.resolve(
             requested_slug=request.requested_slug,

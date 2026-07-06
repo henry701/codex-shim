@@ -274,6 +274,7 @@ def prepare_compaction_input(
     warnings.extend(orphan_warnings)
     stats["sanitization_dropped"] = len(sanitization_audit.dropped)
     stats["sanitization_preserved"] = len(sanitization_audit.preserved)
+    stats["sanitization_synthesized"] = len(sanitization_audit.synthesized)
 
     instructions_chars = len((client_instructions or "").strip())
     working = cleaned

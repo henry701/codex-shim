@@ -221,6 +221,34 @@ def test_responses_to_chat_sanitizes_and_merges_strict_provider_messages():
     ]
 
 
+def test_responses_to_chat_synthesizes_unknown_tool_call_for_orphan_output():
+    body = {
+        "model": "slug",
+        "input": [
+            {
+                "type": "function_call_output",
+                "call_id": "call_orphan",
+                "output": "result without preceding call",
+            },
+        ],
+    }
+    out = responses_to_chat(body, "real-model")
+    assert out["messages"] == [
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "call_orphan",
+                    "type": "function",
+                    "function": {"name": "unknown_tool", "arguments": "{}"},
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call_orphan", "content": "result without preceding call"},
+    ]
+
+
 def test_responses_function_tools_convert_to_chat_shape():
     body = {
         "model": "slug",

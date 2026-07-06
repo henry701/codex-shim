@@ -10,6 +10,7 @@ from aiohttp import ClientSession, WSMsgType, web
 from aiohttp.test_utils import TestClient, TestServer
 
 from codex_shim.compaction import decode_shim_compaction_summary, encode_shim_compaction_summary
+from codex_shim.responses_input_pipeline import UNKNOWN_FUNCTION_TOOL_NAME
 from codex_shim import mcp_search
 from codex_shim import server as server_module
 from codex_shim.server import (
@@ -541,7 +542,13 @@ async def test_chatgpt_compaction_expands_previous_response_id_from_cache(
     assert compact.status == 200
     compact_input = captured.get("compact_input")
     assert isinstance(compact_input, list)
-    assert compact_input == [*first_input, tool_call, tool_output, tail_output]
+    synth_call_2 = {
+        "type": "function_call",
+        "call_id": "call_2",
+        "name": UNKNOWN_FUNCTION_TOOL_NAME,
+        "arguments": "{}",
+    }
+    assert compact_input == [*first_input, tool_call, tool_output, synth_call_2, tail_output]
 
     await shim_client.close()
 
@@ -2638,7 +2645,7 @@ async def test_chatgpt_compact_passthrough_falls_back_to_summarization_on_native
         await shim_client.close()
 
 
-async def test_chatgpt_compact_orphan_tool_output_preserves_tail_for_native_compact(
+async def test_chatgpt_compact_orphan_tool_output_synthesizes_call_for_native_compact(
     monkeypatch, tmp_path, auth_present, capsys
 ):
     captured: dict[str, Any] = {}
@@ -2701,15 +2708,17 @@ async def test_chatgpt_compact_orphan_tool_output_preserves_tail_for_native_comp
         assert summary == "Compacted tail output."
         compact_input = captured.get("compact_input")
         assert isinstance(compact_input, list)
-        assert len(compact_input) == 1
+        assert len(compact_input) == 2
+        assert compact_input[0]["type"] == "function_call"
         assert compact_input[0]["call_id"] == "call_orphan"
+        assert compact_input[1]["call_id"] == "call_orphan"
         captured_out = capsys.readouterr().out
-        assert "preserved" in captured_out
+        assert "synthesized" in captured_out
     finally:
         await shim_client.close()
 
 
-async def test_chatgpt_compact_drops_orphan_before_native_compact(
+async def test_chatgpt_compact_synthesizes_orphan_before_native_compact(
     monkeypatch, tmp_path, auth_present, capsys
 ):
     captured: dict[str, Any] = {}
@@ -2769,10 +2778,13 @@ async def test_chatgpt_compact_drops_orphan_before_native_compact(
         assert resp.status == 200
         compact_input = captured.get("compact_input")
         assert isinstance(compact_input, list)
-        assert len(compact_input) == 1
+        assert len(compact_input) == 3
         assert compact_input[0]["type"] == "message"
+        assert compact_input[1]["type"] == "function_call"
+        assert compact_input[1]["call_id"] == "call_orphan"
+        assert compact_input[2]["call_id"] == "call_orphan"
         captured_out = capsys.readouterr().out
-        assert "[warn] compaction:" in captured_out
+        assert "synthesized" in captured_out
         assert "call_orphan" in captured_out
     finally:
         await shim_client.close()
@@ -2884,7 +2896,7 @@ async def test_chatgpt_compact_upstream_orphan_error_routes_to_summarization_wit
         await shim_client.close()
 
 
-async def test_chatgpt_ws_compaction_orphan_only_preserves_tail_for_native_compact(
+async def test_chatgpt_ws_compaction_orphan_only_synthesizes_call_for_native_compact(
     monkeypatch, tmp_path, auth_present, capsys
 ):
     captured: dict[str, Any] = {}
@@ -2954,9 +2966,12 @@ async def test_chatgpt_ws_compaction_orphan_only_preserves_tail_for_native_compa
         assert summary == "WS compacted tail."
         compact_input = captured.get("compact_input")
         assert isinstance(compact_input, list)
+        assert len(compact_input) == 2
+        assert compact_input[0]["type"] == "function_call"
         assert compact_input[0]["call_id"] == "call_VF4XLxSPXoTfOfVgV0jDqbXq"
+        assert compact_input[1]["call_id"] == "call_VF4XLxSPXoTfOfVgV0jDqbXq"
         captured_out = capsys.readouterr().out
-        assert "preserved" in captured_out
+        assert "synthesized" in captured_out
         await ws.close()
     finally:
         await shim_client.close()
@@ -3000,7 +3015,9 @@ async def test_chatgpt_compact_passthrough_reports_error_when_all_fallbacks_fail
         assert resp.status == 200
         events = _sse_events(await resp.text())
         failed = next(event for event in events if event.get("type") == "response.failed")
-        assert failed["response"]["error"]["message"] == "Bad Request"
+        message = failed["response"]["error"]["message"]
+        assert "Compaction failed for codex-gpt-5-5" in message
+        assert "Bad Request" in message
     finally:
         await shim_client.close()
 

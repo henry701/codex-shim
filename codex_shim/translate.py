@@ -7,6 +7,7 @@ from typing import Any
 
 from . import mcp_search
 from .compaction import decode_shim_compaction_summary
+from .responses_input_pipeline import UNKNOWN_FUNCTION_TOOL_NAME
 from .tool_translate import mcp_namespace
 
 
@@ -962,7 +963,23 @@ def _responses_input_to_messages(value: Any) -> list[dict[str, Any]]:
                 }
             )
     flush_pending_assistant_tool_calls()
-    for deferred in deferred_tool_outputs.values():
+    for call_id, deferred in deferred_tool_outputs.items():
+        messages.append(
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": call_id,
+                        "type": "function",
+                        "function": {
+                            "name": UNKNOWN_FUNCTION_TOOL_NAME,
+                            "arguments": "{}",
+                        },
+                    }
+                ],
+            }
+        )
         messages.extend(deferred)
     return messages
 
