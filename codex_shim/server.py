@@ -73,7 +73,7 @@ from .cursor_passthrough import (
 )
 from .catalog import sort_catalog_entries
 from .chatgpt_conversation_cache import ChatgptConversationCache, session_key_from_headers
-from .responses_input_pipeline import apply_responses_input_pipeline_to_body
+from .responses_input_pipeline import apply_responses_input_pipeline_to_body, responses_input_items
 from . import router as router_module
 from . import mcp_search
 from . import tool_translate
@@ -1351,12 +1351,24 @@ class ShimServer:
         if route.is_openai_chat:
             forwarded = responses_to_chat(body, route.model)
             return await self._post_openai_chat(
-                request, route, forwarded, as_responses=True, tool_types=tool_types, tool_resolve=tool_resolve
+                request,
+                route,
+                forwarded,
+                as_responses=True,
+                tool_types=tool_types,
+                tool_resolve=tool_resolve,
+                responses_body=body,
             )
         if route.is_anthropic:
             forwarded = responses_to_anthropic(body, route.model, route.max_output_tokens)
             return await self._post_anthropic(
-                request, route, forwarded, as_responses=True, tool_types=tool_types, tool_resolve=tool_resolve
+                request,
+                route,
+                forwarded,
+                as_responses=True,
+                tool_types=tool_types,
+                tool_resolve=tool_resolve,
+                responses_body=body,
             )
         raise web.HTTPBadGateway(text=f"Unsupported model provider: {route.provider}")
 
@@ -1936,6 +1948,26 @@ class ShimServer:
             )
         else:
             self._chatgpt_conversation_cache.put(session_key, response_id, items, terminal=False)
+
+    def _store_responses_turn_conversation(
+        self,
+        request: web.Request,
+        responses_body: dict[str, Any],
+        response_id: str | None,
+        output_items: list[Any],
+    ) -> None:
+        if not _chatgpt_expand_continuations_enabled():
+            return
+        if not response_id or not output_items:
+            return
+        input_items = responses_input_items(responses_body.get("input"))
+        if not input_items:
+            return
+        self._store_chatgpt_passthrough_conversation(
+            self._session_key(request),
+            response_id,
+            [*input_items, *copy.deepcopy(output_items)],
+        )
 
     async def _chatgpt_passthrough(
         self,
@@ -2644,6 +2676,7 @@ class ShimServer:
                 response_slug=client_slug,
                 tool_types=tool_types,
                 tool_resolve=tool_resolve,
+                responses_body=body,
             )
         if route.is_anthropic:
             forwarded = responses_to_anthropic(body, route.model, route.max_output_tokens)
@@ -2655,6 +2688,7 @@ class ShimServer:
                 response_slug=client_slug,
                 tool_types=tool_types,
                 tool_resolve=tool_resolve,
+                responses_body=body,
             )
         raise web.HTTPBadGateway(text=f"Unsupported model provider: {route.provider}")
 
@@ -2881,6 +2915,7 @@ class ShimServer:
         response_slug: str | None = None,
         tool_types: dict[str, str] | None = None,
         tool_resolve: dict[str, tuple[str | None, str]] | None = None,
+        responses_body: dict[str, Any] | None = None,
     ) -> web.StreamResponse:
         client_slug = response_slug or route.slug
         url = _join_url(route.base_url, "/chat/completions")
@@ -2894,6 +2929,7 @@ class ShimServer:
                 response_slug=client_slug,
                 tool_types=tool_types,
                 tool_resolve=tool_resolve,
+                responses_body=responses_body,
             )
         async with ClientSession(timeout=self.timeout) as session:
             upstream, err = await self._post_openai_chat_completions(session, route, body, request.headers)
@@ -2927,6 +2963,14 @@ class ShimServer:
                 payload, client_slug, tool_types, tool_resolve
             )
             response_payload = await mcp_search.augment_response_with_tool_search(response_payload)
+            if responses_body is not None:
+                output = response_payload.get("output")
+                self._store_responses_turn_conversation(
+                    request,
+                    responses_body,
+                    str(response_payload.get("id") or ""),
+                    output if isinstance(output, list) else [],
+                )
             response = web.json_response(response_payload)
             apply_upstream_headers_to_response(response, upstream_response_headers)
             return response
@@ -2945,6 +2989,7 @@ class ShimServer:
         tool_types: dict[str, str] | None = None,
         tool_resolve: dict[str, tuple[str | None, str]] | None = None,
         max_turns: int = 6,
+        responses_body: dict[str, Any] | None = None,
     ) -> web.StreamResponse:
         client_slug = response_slug or route.slug
         response: web.StreamResponse | None = None
@@ -3030,6 +3075,17 @@ class ShimServer:
                     break
             if as_responses and state is not None and not state.failed:
                 await state.finish(response, upstream_saw_done=upstream_saw_done)
+                if (
+                    upstream_saw_done
+                    and responses_body is not None
+                    and not state._has_open_incomplete_items()
+                ):
+                    self._store_responses_turn_conversation(
+                        request,
+                        responses_body,
+                        state.response_id,
+                        state.output_items(),
+                    )
             elif upstream_saw_done:
                 await _safe_write(response, b"data: [DONE]\n\n")
         except asyncio.CancelledError:
@@ -3120,6 +3176,7 @@ class ShimServer:
         response_slug: str | None = None,
         tool_types: dict[str, str] | None = None,
         tool_resolve: dict[str, tuple[str | None, str]] | None = None,
+        responses_body: dict[str, Any] | None = None,
     ) -> web.StreamResponse:
         client_slug = response_slug or route.slug
         url = _join_url(route.base_url, "/messages")
@@ -3175,14 +3232,22 @@ class ShimServer:
                     response_slug=client_slug,
                     tool_types=tool_types,
                     tool_resolve=tool_resolve,
+                    responses_body=responses_body,
                 )
             payload = await upstream.json(content_type=None)
             upstream_response_headers = upstream_headers_from_response(upstream)
             upstream.release()
         if as_responses:
-            response = web.json_response(
-                anthropic_to_response(payload, client_slug, tool_types, tool_resolve)
-            )
+            response_payload = anthropic_to_response(payload, client_slug, tool_types, tool_resolve)
+            if responses_body is not None:
+                output = response_payload.get("output")
+                self._store_responses_turn_conversation(
+                    request,
+                    responses_body,
+                    str(response_payload.get("id") or ""),
+                    output if isinstance(output, list) else [],
+                )
+            response = web.json_response(response_payload)
             apply_upstream_headers_to_response(response, upstream_response_headers)
             return response
         response = web.json_response(anthropic_to_chat_response(payload, client_slug))
@@ -3226,6 +3291,7 @@ class ShimServer:
         response_slug: str | None = None,
         tool_types: dict[str, str] | None = None,
         tool_resolve: dict[str, tuple[str | None, str]] | None = None,
+        responses_body: dict[str, Any] | None = None,
     ) -> web.StreamResponse:
         client_slug = response_slug or route.slug
         response = prepare_downstream_sse_response(upstream)
@@ -3234,6 +3300,8 @@ class ShimServer:
             state = ResponsesStreamState(
                 client_slug, tool_types=tool_types, tool_resolve=tool_resolve
             )
+        else:
+            state = None
         upstream_saw_done = False
         try:
             if as_responses:
@@ -3272,6 +3340,17 @@ class ShimServer:
                     )
             if as_responses and not state.failed:
                 await state.finish(response, upstream_saw_done=upstream_saw_done)
+                if (
+                    upstream_saw_done
+                    and responses_body is not None
+                    and not state._has_open_incomplete_items()
+                ):
+                    self._store_responses_turn_conversation(
+                        request,
+                        responses_body,
+                        state.response_id,
+                        state.output_items(),
+                    )
             elif upstream_saw_done:
                 await _safe_write(response, b"data: [DONE]\n\n")
         except asyncio.CancelledError:
@@ -4932,6 +5011,9 @@ class ResponsesStreamState:
         elif final:
             payload["usage"] = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
         return payload
+
+    def output_items(self) -> list[dict[str, Any]]:
+        return self._response("completed", final=True)["output"]
 
     def _message_item_for_turn(self, turn: dict[str, Any], status: str) -> dict[str, Any]:
         return {

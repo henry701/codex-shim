@@ -8,6 +8,8 @@ import pytest
 
 from codex_shim.chatgpt_conversation_cache import (
     ChatgptConversationCache,
+    max_cache_bytes,
+    parse_cache_byte_limit,
     sanitize_path_segment,
     sanitize_response_filename,
     session_key_from_headers,
@@ -117,3 +119,23 @@ def test_reader_cache_populated_on_disk_read(tmp_path: Path):
     assert reader.stats()["read_cache_entries"] == 1
     assert reader.get("sess-1", "resp_1") == items
     assert reader.stats()["read_cache_entries"] == 1
+
+
+def test_parse_cache_byte_limit_accepts_suffixes():
+    assert parse_cache_byte_limit("512M") == 512 * 1024 * 1024
+    assert parse_cache_byte_limit("1g") == 1024**3
+
+
+def test_global_size_eviction_removes_oldest_across_sessions(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("CODEX_SHIM_CHATGPT_CACHE_MAX_BYTES", "200")
+    cache = ChatgptConversationCache(tmp_path)
+    cache.put("sess-a", "resp_a", [{"content": "a" * 80}], terminal=True)
+    time.sleep(0.01)
+    cache.put("sess-b", "resp_b", [{"content": "b" * 80}], terminal=True)
+    time.sleep(0.01)
+    cache.put("sess-c", "resp_c", [{"content": "c" * 80}], terminal=True)
+    remaining = list(tmp_path.rglob("*.json"))
+    total = sum(path.stat().st_size for path in remaining)
+    assert total <= max_cache_bytes()
+    assert cache.get("sess-a", "resp_a") is None
+    assert cache.get("sess-c", "resp_c") is not None

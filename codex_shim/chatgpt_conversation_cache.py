@@ -11,6 +11,8 @@ from typing import Any, Mapping
 _MAX_PATH_SEGMENT_LEN = 200
 _CACHE_VERSION = 1
 _MAX_CACHED_RESPONSES_PER_SESSION = 1024
+_DEFAULT_MAX_CACHE_BYTES = 512 * 1024 * 1024
+_BYTE_SUFFIX_MULTIPLIERS = {"k": 1024, "m": 1024**2, "g": 1024**3}
 
 _UNSAFE_SEGMENT = re.compile(r"[^\w.\-]+")
 _UNSCOPED_SESSION_KEY = "_unscoped"
@@ -45,6 +47,25 @@ def sanitize_path_segment(value: str) -> str:
 
 def sanitize_response_filename(response_id: str) -> str:
     return f"{sanitize_path_segment(response_id)}.json"
+
+
+def parse_cache_byte_limit(raw: str) -> int | None:
+    value = raw.strip()
+    if not value:
+        return None
+    lower = value.lower()
+    for suffix, multiplier in _BYTE_SUFFIX_MULTIPLIERS.items():
+        if lower.endswith(suffix):
+            return int(float(lower[:-1]) * multiplier)
+    return int(value)
+
+
+def max_cache_bytes() -> int:
+    raw = os.environ.get("CODEX_SHIM_CHATGPT_CACHE_MAX_BYTES", "").strip()
+    if not raw:
+        return _DEFAULT_MAX_CACHE_BYTES
+    parsed = parse_cache_byte_limit(raw)
+    return parsed if parsed is not None and parsed > 0 else _DEFAULT_MAX_CACHE_BYTES
 
 
 class ChatgptConversationCache:
@@ -100,6 +121,7 @@ class ChatgptConversationCache:
         tmp.write_text(data)
         os.replace(tmp, path)
         self._evict_if_needed(session_key)
+        self._evict_global_by_size_if_needed()
 
     def stats(self) -> dict[str, int]:
         session_dirs = 0
@@ -118,10 +140,12 @@ class ChatgptConversationCache:
                         total_bytes += path.stat().st_size
                     except OSError:
                         pass
+        limit = max_cache_bytes()
         return {
             "session_dirs": session_dirs,
             "file_count": file_count,
             "total_bytes": total_bytes,
+            "max_bytes": limit,
             "read_cache_entries": len(self._read_cache),
         }
 
@@ -143,7 +167,50 @@ class ChatgptConversationCache:
                 path.unlink()
             except OSError:
                 pass
-            self._read_cache.pop((session_key, self._response_id_from_filename(path.name)), None)
+            self._evict_read_cache_for_path(path)
+
+    def _list_disk_entries(self) -> list[tuple[Path, float, int]]:
+        entries: list[tuple[Path, float, int]] = []
+        if not self.root.is_dir():
+            return entries
+        for session_dir in self.root.iterdir():
+            if not session_dir.is_dir():
+                continue
+            for path in session_dir.glob("*.json"):
+                if not path.is_file():
+                    continue
+                try:
+                    stat = path.stat()
+                except OSError:
+                    continue
+                entries.append((path, stat.st_mtime, stat.st_size))
+        return entries
+
+    def _evict_global_by_size_if_needed(self) -> None:
+        limit = max_cache_bytes()
+        entries = self._list_disk_entries()
+        total_bytes = sum(size for _, _, size in entries)
+        if total_bytes <= limit:
+            return
+        entries.sort(key=lambda entry: entry[1])
+        for path, _, size in entries:
+            if total_bytes <= limit:
+                break
+            try:
+                path.unlink()
+            except OSError:
+                continue
+            self._evict_read_cache_for_path(path)
+            total_bytes -= size
+
+    def _evict_read_cache_for_path(self, path: Path) -> None:
+        resolved = path.resolve()
+        stale: list[tuple[str, str]] = []
+        for session_key, response_id in self._read_cache:
+            if self._entry_path(session_key, response_id).resolve() == resolved:
+                stale.append((session_key, response_id))
+        for key in stale:
+            self._read_cache.pop(key, None)
 
     @staticmethod
     def _response_id_from_filename(name: str) -> str:

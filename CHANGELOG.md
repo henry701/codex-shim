@@ -20,6 +20,14 @@ and this project does not yet follow semantic versioning (pre-1.0).
 
 ### Added
 
+- BYOK routes now persist Responses turn snapshots to the conversation cache so
+  `previous_response_id` delta continuations expand correctly (fixes blank-message
+  regressions on chat-completions providers).
+
+- Global byte cap for the expansion cache (`CODEX_SHIM_CHATGPT_CACHE_MAX_BYTES`,
+  default 512M). Oldest entries are evicted FIFO across all sessions when over
+  limit; per-session count cap (1024) still applies.
+
 - Unified compaction engine (`codex_shim/compaction/`): Codex-aligned input
   preparation, OpenCode-style summarization prompts, provider-agnostic fallback
   chain (native → summarization → tertiary BYOK), configurable compaction model,

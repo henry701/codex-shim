@@ -1315,6 +1315,115 @@ async def test_streaming_openai_chat_response_completed_includes_usage(tmp_path)
     await upstream_client.close()
 
 
+async def test_responses_stream_state_output_items_collects_assistant_message():
+    class FakeResponse:
+        async def write(self, data: bytes):
+            return None
+
+    downstream = FakeResponse()
+    state = ResponsesStreamState("test-model")
+    await state.start(downstream)
+    await state.write_chat_delta(
+        downstream,
+        {"choices": [{"delta": {"content": "hello"}}]},
+    )
+    await state.finish(downstream, upstream_saw_done=True)
+    output = state.output_items()
+    assert len(output) == 1
+    assert output[0]["type"] == "message"
+    assert output[0]["role"] == "assistant"
+    assert output[0]["content"][0]["text"] == "hello"
+
+
+async def test_byok_stream_stores_conversation_cache_for_delta_expansion(tmp_path, monkeypatch):
+    monkeypatch.setenv("CODEX_SHIM_CHATGPT_EXPAND_CONTINUATIONS", "1")
+    captured_requests: list[dict[str, Any]] = []
+
+    async def chat(request):
+        captured_requests.append(await request.json())
+        response = web.StreamResponse(headers={"Content-Type": "text/event-stream"})
+        await response.prepare(request)
+        if len(captured_requests) == 1:
+            await response.write(
+                b'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"exec_command","arguments":"{}"}}]}}]}\n\n'
+            )
+            await response.write(b'data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}\n\n')
+        else:
+            await response.write(b'data: {"choices":[{"delta":{"content":"done"}}]}\n\n')
+            await response.write(b'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n')
+        await response.write(b"data: [DONE]\n\n")
+        await response.write_eof()
+        return response
+
+    upstream = web.Application()
+    upstream.router.add_post("/v1/chat/completions", chat)
+    upstream_client = TestClient(TestServer(upstream))
+    await upstream_client.start_server()
+
+    cache_dir = tmp_path / "conversations"
+    monkeypatch.setenv("CODEX_SHIM_CHATGPT_CONVERSATIONS_DIR", str(cache_dir))
+
+    settings = tmp_path / "settings.json"
+    settings.write_text(
+        json.dumps(
+            {
+                "customModels": [
+                    {
+                        "model": "byok-test",
+                        "displayName": "BYOK Test",
+                        "provider": "openai",
+                        "baseUrl": str(upstream_client.make_url("/v1")),
+                        "apiKey": "secret",
+                    }
+                ]
+            }
+        )
+    )
+    shim_client = TestClient(TestServer(ShimServer(settings).app()))
+    await shim_client.start_server()
+    headers = {"session-id": "sess-byok-cache"}
+
+    first = await shim_client.post(
+        "/v1/responses",
+        json={
+            "model": "byok-test",
+            "input": [{"type": "message", "role": "user", "content": "fix ci"}],
+            "stream": True,
+            "tools": [{"type": "function", "name": "exec_command"}],
+        },
+        headers=headers,
+    )
+    assert first.status == 200
+    events = _sse_events(await first.text())
+    completed = [event for event in events if event.get("type") == "response.completed"][-1]
+    response_id = completed["response"]["id"]
+
+    second = await shim_client.post(
+        "/v1/responses",
+        json={
+            "model": "byok-test",
+            "previous_response_id": response_id,
+            "input": [{"type": "function_call_output", "call_id": "call_1", "output": "ok"}],
+            "stream": True,
+            "tools": [{"type": "function", "name": "exec_command"}],
+        },
+        headers=headers,
+    )
+    assert second.status == 200
+    assert len(captured_requests) == 2
+    second_messages = captured_requests[1].get("messages") or []
+    roles = [msg.get("role") for msg in second_messages]
+    assert "user" in roles
+    assert any(
+        "fix ci" in str(msg.get("content") or "")
+        for msg in second_messages
+        if msg.get("role") == "user"
+    )
+
+    await shim_client.close()
+    await upstream_client.close()
+
+
 async def test_sse_lines_closes_upstream_when_client_disconnects(tmp_path):
     upstream_state = {"sent": 0}
 

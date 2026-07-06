@@ -673,6 +673,7 @@ Debug env knobs:
 | `CODEX_SHIM_WS_PASSTHROUGH=0` | Force legacy HTTP+SSE upstream for ChatGPT/BYOK WS routes (default: on) |
 | `CODEX_SHIM_CHATGPT_EXPAND_CONTINUATIONS=0` | Disable delta replay (ChatGPT 400s on native `previous_response_id`) |
 | `CODEX_SHIM_CHATGPT_CONVERSATIONS_DIR` | Root for persisted expansion cache (default: `~/.codex-shim/chatgpt-conversations`) |
+| `CODEX_SHIM_CHATGPT_CACHE_MAX_BYTES` | Global disk cap for expansion cache; oldest entries evicted FIFO (default: `512M`) |
 
 Live smoke test (alternate port, `codex exec` with tool call + cache check):
 
@@ -682,7 +683,7 @@ SMOKE_PORT=8766 bash scripts/smoke_chatgpt_passthrough.sh
 
 **Two different caches:** ChatGPT **prefix cache** (`cached_tokens` in upstream usage) is
 server-side and keyed by stable session/thread headers the shim forwards. The shim
-**conversation cache** (1024 responses per session, JSON on disk under
+**conversation cache** (1024 responses per session, global byte cap default 512M, JSON on disk under
 `~/.codex-shim/chatgpt-conversations/`) replays delta continuations because
 ChatGPT's OAuth backend rejects `previous_response_id` (HTTP 400). Expansion is on by
 default and required for multi-turn tool calls; it does not block prefix cache —

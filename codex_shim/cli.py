@@ -491,10 +491,21 @@ def _doctor_chatgpt_conversation_cache() -> list[DoctorCheck]:
         DoctorCheck(section, "OK", f"root: {root}"),
         DoctorCheck(section, "INFO", f"session dirs: {stats['session_dirs']}"),
         DoctorCheck(section, "INFO", f"cached responses: {stats['file_count']}"),
-        DoctorCheck(section, "INFO", f"disk bytes: {stats['total_bytes']}"),
+        DoctorCheck(section, "INFO", f"disk bytes: {stats['total_bytes']} / {stats['max_bytes']}"),
         DoctorCheck(section, "INFO", f"in-memory read entries: {stats['read_cache_entries']}"),
     ]
     if stats["file_count"] > 0:
+        usage_pct = (stats["total_bytes"] * 100) // max(stats["max_bytes"], 1)
+        if usage_pct >= 90:
+            checks.append(
+                DoctorCheck(
+                    section,
+                    "WARN",
+                    f"cache near size limit ({usage_pct}% of max)",
+                    "Oldest entries are evicted FIFO when over "
+                    "CODEX_SHIM_CHATGPT_CACHE_MAX_BYTES (default 512M).",
+                )
+            )
         checks.append(
             DoctorCheck(
                 section,
