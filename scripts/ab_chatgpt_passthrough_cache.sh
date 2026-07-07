@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# A/B: ChatGPT passthrough with shim conversation expansion ON vs OFF.
+# A/B: ChatGPT Codex WS native passthrough vs forced cache expansion on reused connection.
 # Measures upstream cached_tokens and codex turn.completed usage per arm.
 set -euo pipefail
 
@@ -29,10 +29,13 @@ trap cleanup EXIT
 start_shim() {
   local port="$1"
   local log="$2"
-  local expand_env="$3"
+  local force_expand="$3"
   : >"${log}"
   (
-    export CODEX_SHIM_CHATGPT_EXPAND_CONTINUATIONS="${expand_env}"
+    unset CODEX_SHIM_CHATGPT_WS_FORCE_EXPAND
+    if [[ "${force_expand}" == "1" ]]; then
+      export CODEX_SHIM_CHATGPT_WS_FORCE_EXPAND=1
+    fi
     cd "${ROOT}"
     exec codex-shim --port "${port}" run
   ) >>"${log}" 2>&1 &
@@ -97,8 +100,8 @@ echo "=== A/B ChatGPT passthrough cache ==="
 echo "Prompt: ${PROMPT}"
 echo
 
-echo ">>> Arm A: EXPAND_CONTINUATIONS=1 (default, port ${PORT_A})"
-start_shim "${PORT_A}" "${LOG_A}" "1"
+echo ">>> Arm A: native Codex WS passthrough (default, port ${PORT_A})"
+start_shim "${PORT_A}" "${LOG_A}" "0"
 MARK_A="ab-a-$(date +%s)"
 echo "${MARK_A}" >>"${LOG_A}"
 RC_A=0
@@ -108,8 +111,8 @@ summarize_log "${LOG_A}"
 summarize_jsonl "${JSON_A}"
 echo
 
-echo ">>> Arm B: EXPAND_CONTINUATIONS=0 (native previous_response_id, port ${PORT_B})"
-start_shim "${PORT_B}" "${LOG_B}" "0"
+echo ">>> Arm B: CODEX_SHIM_CHATGPT_WS_FORCE_EXPAND=1 (port ${PORT_B})"
+start_shim "${PORT_B}" "${LOG_B}" "1"
 MARK_B="ab-b-$(date +%s)"
 echo "${MARK_B}" >>"${LOG_B}"
 RC_B=0
@@ -120,8 +123,8 @@ summarize_jsonl "${JSON_B}"
 echo
 
 echo "=== Summary ==="
-printf "Arm A (expand ON):  exit=%s\n" "${RC_A}"
-printf "Arm B (expand OFF): exit=%s\n" "${RC_B}"
+printf "Arm A (native WS):     exit=%s\n" "${RC_A}"
+printf "Arm B (force expand):  exit=%s\n" "${RC_B}"
 
 python3 <<PY
 import json, re, pathlib
@@ -175,7 +178,7 @@ def fmt_arm(name, rc, log, jsonl):
     else:
         print("  turn.completed: (missing)")
 
-fmt_arm("A expand ON", ${RC_A}, "${LOG_A}", "${JSON_A}")
+fmt_arm("A native WS", ${RC_A}, "${LOG_A}", "${JSON_A}")
 print()
-fmt_arm("B expand OFF", ${RC_B}, "${LOG_B}", "${JSON_B}")
+fmt_arm("B force expand", ${RC_B}, "${LOG_B}", "${JSON_B}")
 PY

@@ -671,7 +671,7 @@ Debug env knobs:
 | `CODEX_SHIM_PASSTHROUGH_TRACE=1` | Log forwarded client headers per ChatGPT request |
 | `CODEX_SHIM_STREAM_LOG=1` | Log SSE/WS event types |
 | `CODEX_SHIM_WS_PASSTHROUGH=0` | Force legacy HTTP+SSE upstream for ChatGPT/BYOK WS routes (default: on) |
-| `CODEX_SHIM_CHATGPT_EXPAND_CONTINUATIONS=0` | Disable delta replay (ChatGPT 400s on native `previous_response_id`) |
+| `CODEX_SHIM_CHATGPT_WS_FORCE_EXPAND=1` | Force cache expansion on ChatGPT Codex WS (default: native passthrough on reused upstream WS) |
 | `CODEX_SHIM_CHATGPT_CONVERSATIONS_DIR` | Root for persisted expansion cache (default: `~/.codex-shim/chatgpt-conversations`) |
 | `CODEX_SHIM_CHATGPT_CACHE_MAX_BYTES` | Global disk cap for expansion cache; oldest entries evicted FIFO (default: `512M`) |
 
@@ -684,12 +684,18 @@ SMOKE_PORT=8766 bash scripts/smoke_chatgpt_passthrough.sh
 **Two different caches:** ChatGPT **prefix cache** (`cached_tokens` in upstream usage) is
 server-side and keyed by stable session/thread headers the shim forwards. The shim
 **conversation cache** (1024 responses per session, global byte cap default 512M, JSON on disk under
-`~/.codex-shim/chatgpt-conversations/`) replays delta continuations because
-ChatGPT's OAuth backend rejects `previous_response_id` (HTTP 400). Expansion is on by
-default and required for multi-turn tool calls; it does not block prefix cache —
-continuation turns often show ~95%+ `cached_tokens` when thread metadata is stable.
-Set `CODEX_SHIM_CHATGPT_EXPAND_CONTINUATIONS=0` only for debugging; continuations
-fail with `Unsupported parameter: previous_response_id`.
+`~/.codex-shim/chatgpt-conversations/`) replays delta continuations when upstream cannot
+accept native `previous_response_id`.
+
+**Expansion policy (transport-aware):**
+
+| Surface | Routes | Behavior |
+|---------|--------|----------|
+| HTTP | ChatGPT Codex, BYOK, Cursor, compaction | Always expand + strip `previous_response_id` |
+| WS | BYOK `openai-responses` | Always expand |
+| WS | ChatGPT Codex OAuth | Native `previous_response_id` on **reused** upstream connection; expand on new connect or upstream prev_id error |
+
+Cache writes are unconditional so a Codex WS turn can be replayed over HTTP (compaction, fallback, model switch). Orphan tool-call synthesis runs on every route.
 
 It binds stdin closed (`</dev/null`) so `codex exec` does not hang waiting for
 stdin when stdout is captured.

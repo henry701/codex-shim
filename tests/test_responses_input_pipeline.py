@@ -16,6 +16,23 @@ class _FakeCache:
         return self._items
 
 
+def test_prepare_responses_input_items_skips_orphan_synthesis_when_disabled():
+    from codex_shim.responses_input_pipeline import prepare_responses_input_items
+
+    tool_output = {"type": "function_call_output", "call_id": "call_1", "output": "ok"}
+    repaired, warnings = prepare_responses_input_items(
+        cache=None,
+        session_key="s",
+        previous_response_id="resp_1",
+        input_items=[tool_output],
+        expand_enabled=False,
+        context="turn",
+        orphan_synthesis=False,
+    )
+    assert repaired == [tool_output]
+    assert warnings == []
+
+
 def test_synthesize_orphan_tool_calls_inserts_placeholder_before_output():
     input_items = [
         {"type": "function_call_output", "call_id": "call_orphan", "output": "x"},

@@ -9,6 +9,14 @@ and this project does not yet follow semantic versioning (pre-1.0).
 
 ### Changed
 
+- Transport-aware continuation expansion: HTTP, BYOK (HTTP+WS), Cursor passthrough,
+  and compaction always expand `previous_response_id` from the conversation cache.
+  Only ChatGPT Codex OAuth WebSocket passthrough forwards native `previous_response_id`
+  on a reused upstream connection (expand on new connect or upstream prev_id error).
+  Cache writes are unconditional on all routes. Removed deprecated
+  `CODEX_SHIM_CHATGPT_EXPAND_CONTINUATIONS` behavior (use `CODEX_SHIM_CHATGPT_WS_FORCE_EXPAND`
+  to force Codex WS expansion).
+
 - Compaction failures now return a chained error message to Codex (native,
   summarization, and tertiary attempts) instead of only the first upstream error.
   Each phase includes upstream route context, HTTP status, provider error code,

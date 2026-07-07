@@ -343,7 +343,7 @@ async def test_chatgpt_passthrough_requests_advertise_zstd_encoding(monkeypatch,
     await shim_client.close()
 
 
-async def test_chatgpt_passthrough_strips_previous_response_id_when_expand_disabled(
+async def test_chatgpt_passthrough_http_always_expands_even_when_expand_env_disabled(
     monkeypatch, tmp_path, auth_present
 ):
     monkeypatch.setenv("CODEX_SHIM_CHATGPT_EXPAND_CONTINUATIONS", "0")
@@ -379,12 +379,20 @@ async def test_chatgpt_passthrough_strips_previous_response_id_when_expand_disab
     )
 
     assert resp.status == 200
-    assert captured["body"]["previous_response_id"] == "resp_previous"
+    assert "previous_response_id" not in captured["body"]
     assert captured["headers"]["session_id"] == "sess-abc"
-    assert captured["headers"]["x-codex-turn-state"] == "running"
     assert resp.headers["x-request-id"] == "req_1"
 
     await shim_client.close()
+
+
+async def test_chatgpt_passthrough_strips_previous_response_id_when_expand_disabled(
+    monkeypatch, tmp_path, auth_present
+):
+    """Legacy test name; HTTP always expands regardless of CODEX_SHIM_CHATGPT_EXPAND_CONTINUATIONS."""
+    await test_chatgpt_passthrough_http_always_expands_even_when_expand_env_disabled(
+        monkeypatch, tmp_path, auth_present
+    )
 
 
 async def test_chatgpt_passthrough_expands_previous_response_id_by_default(
@@ -4332,8 +4340,8 @@ async def test_chatgpt_ws_passthrough_multi_create_same_connection(monkeypatch, 
             assert msg.type == WSMsgType.TEXT
 
         assert len(upstream_state.received_frames) == 2
-        assert "previous_response_id" not in upstream_state.received_frames[1]
-        assert upstream_state.received_frames[1]["input"] == [*first_input, tool_call, tool_output]
+        assert upstream_state.received_frames[1]["previous_response_id"] == "resp_previous"
+        assert upstream_state.received_frames[1]["input"] == [tool_output]
         await ws.close()
     finally:
         await shim_client.close()

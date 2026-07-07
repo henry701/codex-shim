@@ -374,7 +374,11 @@ def cursor_passthrough_entries() -> list[dict[str, Any]]:
 
 
 def build_cursor_prompt(body: dict[str, Any]) -> str:
-    """Convert a Codex Responses payload into a cursor-agent prompt."""
+    """Convert a Codex Responses payload into a cursor-agent prompt.
+
+    Callers must run the continuation expansion pipeline on ``body`` first when
+    ``previous_response_id`` is set — cursor-agent has no native Responses chaining.
+    """
     chat = responses_to_chat(body, cursor_upstream_model(str(body.get("model") or "")))
     sections: list[str] = []
     for message in chat.get("messages") or []:

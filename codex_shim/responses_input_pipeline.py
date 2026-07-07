@@ -1,3 +1,13 @@
+"""Responses API input preparation: cache expansion and orphan tool repair.
+
+**Expansion** replays ``previous_response_id`` deltas from the session cache and
+strips the field before upstream HTTP (or WS after a new connect / prev_id error).
+
+**Orphan synthesis** runs when expanding or on stateless surfaces. It is skipped for
+native ChatGPT Codex WS deltas (reused connection + ``previous_response_id``) because
+the upstream connection already holds the prior tool call.
+"""
+
 from __future__ import annotations
 
 import copy
@@ -159,6 +169,7 @@ def prepare_responses_input_items(
     input_items: list[Any],
     expand_enabled: bool,
     context: str,
+    orphan_synthesis: bool = True,
 ) -> tuple[list[Any], list[str]]:
     expanded = expand_cached_responses_input(
         cache=cache,
@@ -168,6 +179,8 @@ def prepare_responses_input_items(
         expand_enabled=expand_enabled,
         context=context,
     )
+    if not orphan_synthesis:
+        return expanded, []
     return synthesize_orphan_tool_calls(expanded)
 
 
@@ -185,6 +198,7 @@ def apply_responses_input_pipeline_to_body(
     expand_enabled: bool,
     context: str,
     strip_previous_response_id: bool = False,
+    orphan_synthesis: bool = True,
 ) -> dict[str, Any]:
     prepared = dict(body)
     raw_input = prepared.get("input")
@@ -196,6 +210,7 @@ def apply_responses_input_pipeline_to_body(
             input_items=responses_input_items(raw_input),
             expand_enabled=expand_enabled,
             context=context,
+            orphan_synthesis=orphan_synthesis,
         )
         _log_pipeline_warnings(warnings)
         prepared["input"] = repaired

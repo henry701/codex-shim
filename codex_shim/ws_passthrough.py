@@ -46,13 +46,20 @@ class WsPassthroughConnectError(Exception):
 
 @dataclass
 class WsPassthroughSession:
+    """Proxies client ``response.create`` frames to an upstream Responses WebSocket.
+
+    The Codex OAuth backend treats ``previous_response_id`` as **connection-scoped**:
+    chaining works only while ``upstream_ws`` stays open. A fresh upstream connect
+    requires cache expansion instead of native continuation.
+    """
+
     client_session: ClientSession
     client_ws: web.WebSocketResponse
     upstream_ws: ClientWebSocketResponse | None = None
 
-    async def connect_upstream(self, url: str, headers: dict[str, str]) -> dict[str, str]:
+    async def connect_upstream(self, url: str, headers: dict[str, str]) -> tuple[dict[str, str], bool]:
         if self.upstream_ws is not None and not self.upstream_ws.closed:
-            return {}
+            return {}, True
         try:
             self.upstream_ws = await self.client_session.ws_connect(url, headers=headers)
         except Exception as exc:
@@ -60,7 +67,7 @@ class WsPassthroughSession:
             raise WsPassthroughConnectError(str(exc), status=status) from exc
         upgrade_headers = forwardable_ws_upgrade_headers(upstream_headers_from_response(self.upstream_ws))
         print(f"[ws-passthrough] connected upstream url={url}", flush=True)
-        return upgrade_headers
+        return upgrade_headers, False
 
     async def send_response_create(self, body: dict[str, Any]) -> None:
         if self.upstream_ws is None or self.upstream_ws.closed:
@@ -76,9 +83,11 @@ class WsPassthroughSession:
         on_event: Callable[[dict[str, Any]], None] | None = None,
         rewrite_model: Callable[[Any, str | None], None] | None = None,
         write_event: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
-    ) -> None:
+    ) -> dict[str, Any] | None:
         if self.upstream_ws is None or self.upstream_ws.closed:
             raise WsPassthroughConnectError("upstream websocket is not connected")
+
+        terminal_event: dict[str, Any] | None = None
 
         async def _write_event(event: dict[str, Any]) -> None:
             if write_event is not None:
@@ -109,9 +118,11 @@ class WsPassthroughSession:
                     )
                 await _write_event(event)
                 if event.get("type") in _TERMINAL_EVENT_TYPES:
+                    terminal_event = event
                     break
             elif msg.type in {WSMsgType.CLOSE, WSMsgType.CLOSED, WSMsgType.ERROR}:
                 break
+        return terminal_event
 
     async def close_upstream(self) -> None:
         if self.upstream_ws is not None and not self.upstream_ws.closed:
