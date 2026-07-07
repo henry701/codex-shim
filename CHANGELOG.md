@@ -17,6 +17,10 @@ and this project does not yet follow semantic versioning (pre-1.0).
   `CODEX_SHIM_CHATGPT_EXPAND_CONTINUATIONS` behavior (use `CODEX_SHIM_CHATGPT_WS_FORCE_EXPAND`
   to force Codex WS expansion).
 
+- ChatGPT Codex WS `previous_response_id` error retry closes and reconnects upstream
+  before the expanded retry. Conversation cache persists only at turn completion
+  (no mid-stream disk writes). Terminal `put` replaces existing on-disk entries.
+
 - Compaction failures now return a chained error message to Codex (native,
   summarization, and tertiary attempts) instead of only the first upstream error.
   Each phase includes upstream route context, HTTP status, provider error code,

@@ -205,6 +205,7 @@ async def test_chatgpt_ws_retries_with_expansion_on_prev_id_error(
         assert retry["input"][0] == first_input[0]
         assert retry["input"][1]["call_id"] == "call_1"
         assert retry["input"][2] == tool_output
+        assert len(upstream_state.handshakes) == 2
         await ws.close()
     finally:
         await shim_client.close()

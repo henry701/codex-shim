@@ -1143,15 +1143,6 @@ class ShimServer:
 
             def on_event(event: dict[str, Any], *, _collector: ChatgptPassthroughResponseCollector = collector) -> None:
                 _collector.record(event)
-                if _collector.response_id and _should_cache_chatgpt_passthrough_event(event):
-                    items = self._build_turn_cache_items(request, raw_body, _collector.output_items())
-                    if items:
-                        self._store_chatgpt_passthrough_conversation(
-                            session_key,
-                            _collector.response_id,
-                            items,
-                            terminal=False,
-                        )
 
             client_ws = passthrough.client_ws
 
@@ -1173,8 +1164,28 @@ class ShimServer:
                 and raw_body.get("previous_response_id")
                 and not force_expand
             ):
-                print("[chatgpt-ws] prev_id upstream error; retrying with cache expansion", flush=True)
+                print(
+                    "[chatgpt-ws] prev_id upstream error; reconnecting and retrying with cache expansion",
+                    flush=True,
+                )
                 force_expand = True
+                connection_reused = False
+                await passthrough.close_upstream()
+                try:
+                    _, connection_reused = await passthrough.connect_upstream(upstream_url, headers)
+                except WsPassthroughConnectError as exc:
+                    print(
+                        f"[ws-passthrough] reconnect after prev_id error failed; http-fallback url={upstream_url} err={exc}",
+                        flush=True,
+                    )
+                    await self._handle_chatgpt_response_create_websocket_http(
+                        request,
+                        passthrough.client_ws,
+                        payload,
+                        target,
+                        http_session=passthrough.client_session,
+                    )
+                    return True
                 continue
             break
 
@@ -1245,9 +1256,6 @@ class ShimServer:
                 ws,
                 response_model_override=target.response_model_override,
                 collector=collector,
-                cache_collected=lambda rid, items, *, terminal=False: cache_store(
-                    rid, collector.output_items(), terminal=terminal
-                ),
                 upstream_forward_headers=upstream_forward_headers,
             )
         finally:
@@ -2276,18 +2284,6 @@ class ShimServer:
             await response.prepare(request)
             collector = ChatgptPassthroughResponseCollector(forwarded)
 
-            def _cache_stream_progress() -> None:
-                if not collector.response_id or not collector.output_items():
-                    return
-                items = self._build_turn_cache_items(request, raw_body, collector.output_items())
-                if items:
-                    self._store_chatgpt_passthrough_conversation(
-                        session_key,
-                        collector.response_id,
-                        items,
-                        terminal=False,
-                    )
-
             try:
                 async for line in _sse_lines(upstream, request):
                     if line == "[DONE]":
@@ -2299,8 +2295,6 @@ class ShimServer:
                         await _safe_write(response, f"data: {line}\n\n".encode())
                         continue
                     collector.record(payload)
-                    if _should_cache_chatgpt_passthrough_event(payload):
-                        _cache_stream_progress()
                     if response_model_override:
                         _rewrite_response_model(payload, response_model_override)
                     if payload.get("type") == "response.completed":
@@ -3582,13 +3576,6 @@ class ChatgptPassthroughResponseCollector:
 
     def output_items(self) -> list[Any]:
         return copy.deepcopy(self._output)
-
-
-def _should_cache_chatgpt_passthrough_event(event: dict[str, Any]) -> bool:
-    if event.get("type") in {"response.output_item.done", "response.completed"}:
-        return True
-    response = event.get("response")
-    return isinstance(response, dict) and bool(response.get("output"))
 
 
 def _sanitize_chatgpt_passthrough_body(body: dict[str, Any], *, strip_previous_response_id: bool = False) -> dict[str, Any]:
@@ -5494,7 +5481,6 @@ async def _relay_sse_response_to_ws(
     *,
     response_model_override: str | None = None,
     collector: ChatgptPassthroughResponseCollector | None = None,
-    cache_collected: Any = None,
     upstream_forward_headers: dict[str, str] | None = None,
 ) -> None:
     _ = upstream_forward_headers
@@ -5508,8 +5494,6 @@ async def _relay_sse_response_to_ws(
             continue
         if collector is not None:
             collector.record(event)
-            if cache_collected is not None and _should_cache_chatgpt_passthrough_event(event):
-                cache_collected(collector.response_id, collector.conversation_items(), terminal=False)
         if response_model_override:
             _rewrite_response_model(event, response_model_override)
         if event.get("type") == "response.completed":

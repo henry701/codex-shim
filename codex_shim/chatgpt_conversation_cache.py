@@ -110,11 +110,11 @@ class ChatgptConversationCache:
         self._read_cache[key] = copy.deepcopy(items)
         if not terminal:
             return
+        self._write_disk_entry(session_key, response_id, items)
+
+    def _write_disk_entry(self, session_key: str, response_id: str, items: list[Any]) -> None:
         path = self._entry_path(session_key, response_id)
         path.parent.mkdir(parents=True, exist_ok=True)
-        if path.exists():
-            self._evict_if_needed(session_key)
-            return
         tmp = path.with_suffix(path.suffix + ".tmp")
         payload = {"version": _CACHE_VERSION, "items": copy.deepcopy(items)}
         data = json.dumps(payload, separators=(",", ":"))

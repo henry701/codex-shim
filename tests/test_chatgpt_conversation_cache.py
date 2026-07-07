@@ -63,14 +63,14 @@ def test_terminal_true_writes_disk(tmp_path: Path):
     assert payload["items"] == items
 
 
-def test_second_terminal_put_does_not_overwrite_file(tmp_path: Path):
+def test_second_terminal_put_overwrites_disk(tmp_path: Path):
     cache = ChatgptConversationCache(tmp_path)
     first = [{"type": "message", "role": "user", "content": "first"}]
     second = [{"type": "message", "role": "user", "content": "second"}]
     cache.put("sess-1", "resp_1", first, terminal=True)
     cache.put("sess-1", "resp_1", second, terminal=True)
     path = tmp_path / sanitize_path_segment("sess-1") / sanitize_response_filename("resp_1")
-    assert json.loads(path.read_text())["items"] == first
+    assert json.loads(path.read_text())["items"] == second
     assert cache.get("sess-1", "resp_1") == second
 
 
