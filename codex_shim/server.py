@@ -448,7 +448,7 @@ class ShimServer:
     ) -> SummarizationAttemptResult:
         upstream_model = request.upstream_model or chatgpt_upstream_model(request.requested_slug)
         resolver = CompactionModelResolver(request.settings)
-        resolved = resolver.resolve(requested_slug=request.requested_slug, body=request.body)
+        resolved = await resolver.resolve(requested_slug=request.requested_slug, body=request.body)
         summarization_slug = resolved.summarization_slug
         compact_body = build_summarization_compact_body(
             prepared,
@@ -529,7 +529,7 @@ class ShimServer:
         native_message: str,
     ) -> SummarizationAttemptResult:
         resolver = CompactionModelResolver(request.settings)
-        resolved = resolver.resolve(requested_slug=request.requested_slug, body=request.body)
+        resolved = await resolver.resolve(requested_slug=request.requested_slug, body=request.body)
         summarization_slug = resolved.summarization_slug
         compact_body = build_summarization_compact_body(
             prepared,
@@ -575,7 +575,7 @@ class ShimServer:
             route_fn=self._route,
             has_credentials_fn=byok_model_has_credentials,
         )
-        resolved = resolver.resolve(requested_slug=request.requested_slug, body=request.body)
+        resolved = await resolver.resolve(requested_slug=request.requested_slug, body=request.body)
         summarization_slug = resolved.summarization_slug
         fallback_body = {**request.body, "model": summarization_slug}
         route = await self._route(fallback_body)

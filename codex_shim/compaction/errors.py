@@ -153,6 +153,8 @@ def format_compaction_failure_detail(
     tertiary_slug: str | None = None,
     tertiary_message: str | None = None,
     tertiary_attempted: bool = False,
+    tertiary_skip_reason: str | None = None,
+    tertiary_configured_slug: str | None = None,
 ) -> str:
     lines = [f"Compaction failed for {slug} ({provider})."]
     lines.append(f"Native compact: {native_message}")
@@ -166,10 +168,26 @@ def format_compaction_failure_detail(
             f"Tertiary fallback ({target}): {tertiary_message or 'returned empty summary'}"
         )
     elif tertiary_slug is None:
-        lines.append(
-            "Tertiary fallback: not configured "
-            "(set compaction.tertiary_fallback_slug or passthrough_error_fallback for this model)."
-        )
+        if tertiary_skip_reason == "not_configured":
+            lines.append(
+                "Tertiary fallback: not configured "
+                "(set compaction.tertiary_fallback_slug for compaction BYOK fallback)."
+            )
+        elif tertiary_skip_reason == "no_credentials":
+            target = tertiary_configured_slug or "tertiary"
+            lines.append(
+                f"Tertiary fallback ({target}): skipped because the BYOK route has no API key."
+            )
+        elif tertiary_skip_reason == "route_error":
+            target = tertiary_configured_slug or "tertiary"
+            lines.append(f"Tertiary fallback ({target}): route resolution failed.")
+        elif tertiary_configured_slug:
+            lines.append(f"Tertiary fallback ({tertiary_configured_slug}): skipped.")
+        else:
+            lines.append(
+                "Tertiary fallback: not configured "
+                "(set compaction.tertiary_fallback_slug for compaction BYOK fallback)."
+            )
     return " ".join(lines)
 
 

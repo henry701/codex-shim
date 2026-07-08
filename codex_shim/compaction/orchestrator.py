@@ -4,7 +4,7 @@ from typing import Any
 
 from .errors import describe_upstream_error, format_compaction_failure_detail, upstream_error_message
 from .logging import log_compaction_fallback, log_compaction_phase, log_compaction_path, log_compaction_warnings
-from .model_resolver import CompactionModelResolver
+from .model_resolver import CompactionModelResolver, ResolvedCompactionModels
 from .pipeline import PreparedInput, prepare_compaction_input
 from .protocol import (
     apply_compaction_fallback_notice,
@@ -160,7 +160,8 @@ class CompactionOrchestrator:
             message=summarization_message,
         )
 
-        tertiary = await self._try_tertiary(request, prepared, native_message)
+        tertiary_models = await self._resolve_models(request)
+        tertiary = await self._try_tertiary(request, prepared, native_message, tertiary_models)
         if tertiary.summary.strip():
             log_compaction_path(
                 "tertiary",
@@ -192,7 +193,7 @@ class CompactionOrchestrator:
             context=tertiary.upstream_context or None,
             fallback="returned empty summary",
         )
-        tertiary_slug = self._resolved_tertiary_slug(request)
+        tertiary_slug = tertiary_models.tertiary_slug
         if tertiary_slug:
             log_compaction_phase(
                 "tertiary-fail",
@@ -202,12 +203,14 @@ class CompactionOrchestrator:
                 message=tertiary_message,
             )
         else:
-            log_compaction_phase(
-                "tertiary-skip",
-                provider=request.provider,
-                slug=request.requested_slug,
-                reason="no tertiary_fallback_slug configured",
-            )
+            skip_fields: dict[str, object] = {
+                "provider": request.provider,
+                "slug": request.requested_slug,
+                "reason": tertiary_models.tertiary_skip_reason or "not_configured",
+            }
+            if tertiary_models.tertiary_configured_slug:
+                skip_fields["configured"] = tertiary_models.tertiary_configured_slug
+            log_compaction_phase("tertiary-skip", **skip_fields)
 
         detail = format_compaction_failure_detail(
             slug=request.requested_slug,
@@ -218,6 +221,8 @@ class CompactionOrchestrator:
             tertiary_slug=tertiary_slug,
             tertiary_message=tertiary_message if tertiary_slug else None,
             tertiary_attempted=bool(tertiary_slug),
+            tertiary_skip_reason=tertiary_models.tertiary_skip_reason,
+            tertiary_configured_slug=tertiary_models.tertiary_configured_slug,
         )
         last_error_response = (
             tertiary.error_response
@@ -229,17 +234,17 @@ class CompactionOrchestrator:
             error_response=last_error_response,
         )
 
-    def _resolved_tertiary_slug(self, request: CompactionRequest) -> str | None:
+    async def _resolve_models(self, request: CompactionRequest) -> ResolvedCompactionModels:
         resolver = CompactionModelResolver(
             request.settings,
             route_fn=request.route_fn,
             has_credentials_fn=request.has_credentials_fn,
         )
-        return resolver.resolve(
+        return await resolver.resolve(
             requested_slug=request.requested_slug,
             body=request.body,
             passthrough_fallback_slug=request.passthrough_fallback_slug,
-        ).tertiary_slug
+        )
 
     async def _try_native(
         self,
@@ -277,17 +282,8 @@ class CompactionOrchestrator:
         request: CompactionRequest,
         prepared: PreparedInput,
         native_message: str,
+        resolved: ResolvedCompactionModels,
     ) -> SummarizationAttemptResult:
-        resolver = CompactionModelResolver(
-            request.settings,
-            route_fn=request.route_fn,
-            has_credentials_fn=request.has_credentials_fn,
-        )
-        resolved = resolver.resolve(
-            requested_slug=request.requested_slug,
-            body=request.body,
-            passthrough_fallback_slug=request.passthrough_fallback_slug,
-        )
         if not resolved.tertiary_slug:
             return SummarizationAttemptResult()
         log_compaction_fallback(

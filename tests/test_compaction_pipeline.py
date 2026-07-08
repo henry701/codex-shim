@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+
 from codex_shim.compaction.config import (
     CompactionSettings,
     compaction_prompt_cache_key,
@@ -8,6 +10,7 @@ from codex_shim.compaction.config import (
 from codex_shim.compaction.model_resolver import CompactionModelResolver
 from codex_shim.compaction.pipeline import (
     STILL_OVER_BUDGET_WARNING,
+    collapse_consecutive_duplicate_user_messages,
     estimate_input_tokens,
     extract_previous_summary,
     prepare_compaction_input,
@@ -223,12 +226,101 @@ def test_stable_summarization_instruction_prefix_is_stable():
 
 def test_compaction_model_resolver_prefers_configured_model():
     settings = CompactionSettings(model="gpt-5.4-mini", override_current_model=True)
-    resolved = CompactionModelResolver(settings).resolve(
-        requested_slug="codex-gpt-5-5",
-        body={"model": "codex-gpt-5-5"},
-    )
+
+    async def _run():
+        return await CompactionModelResolver(settings).resolve(
+            requested_slug="codex-gpt-5-5",
+            body={"model": "codex-gpt-5-5"},
+        )
+
+    resolved = asyncio.run(_run())
     assert resolved.summarization_slug == "gpt-5.4-mini"
     assert resolved.native_slug == "codex-gpt-5-5"
+
+
+def test_compaction_model_resolver_async_route_fn_resolves_tertiary():
+    settings = CompactionSettings()
+
+    class Route:
+        slug = "or-free-router"
+        api_key = "secret"
+
+    async def route_fn(body):
+        assert body["model"] == "or-free-router"
+        return Route()
+
+    async def _run():
+        return await CompactionModelResolver(
+            settings,
+            route_fn=route_fn,
+            has_credentials_fn=lambda route: bool(route.api_key),
+        ).resolve(
+            requested_slug="codex-gpt-5-4-mini",
+            body={"model": "codex-gpt-5-4-mini"},
+            passthrough_fallback_slug="or-free-router",
+        )
+
+    resolved = asyncio.run(_run())
+    assert resolved.tertiary_slug == "or-free-router"
+    assert resolved.tertiary_skip_reason is None
+
+
+def test_compaction_model_resolver_async_route_fn_no_credentials():
+    settings = CompactionSettings()
+
+    class Route:
+        slug = "or-free-router"
+        api_key = ""
+
+    async def route_fn(body):
+        return Route()
+
+    async def _run():
+        return await CompactionModelResolver(
+            settings,
+            route_fn=route_fn,
+            has_credentials_fn=lambda route: bool(route.api_key),
+        ).resolve(
+            requested_slug="codex-gpt-5-4-mini",
+            body={},
+            passthrough_fallback_slug="or-free-router",
+        )
+
+    resolved = asyncio.run(_run())
+    assert resolved.tertiary_slug is None
+    assert resolved.tertiary_skip_reason == "no_credentials"
+    assert resolved.tertiary_configured_slug == "or-free-router"
+
+
+def test_compaction_model_resolver_not_configured_skip_reason():
+    async def _run():
+        return await CompactionModelResolver(CompactionSettings()).resolve(
+            requested_slug="codex-gpt-5-4-mini",
+            body={},
+        )
+
+    resolved = asyncio.run(_run())
+    assert resolved.tertiary_slug is None
+    assert resolved.tertiary_skip_reason == "not_configured"
+
+
+def test_collapse_consecutive_duplicate_user_messages():
+    dup = {"type": "message", "role": "user", "content": "same"}
+    items = [dup, dup, dup, {"type": "message", "role": "user", "content": "other"}, dup]
+    collapsed, count = collapse_consecutive_duplicate_user_messages(items)
+    assert count == 2
+    assert len(collapsed) == 3
+    assert collapsed[0]["content"] == "same"
+    assert collapsed[1]["content"] == "other"
+    assert collapsed[2]["content"] == "same"
+
+
+def test_prepare_compaction_input_dedupes_consecutive_user_messages():
+    dup = {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "x"}]}
+    items = [dup, dup, dup]
+    prepared = prepare_compaction_input(items, CompactionSettings())
+    assert prepared.stats["deduped_user_messages"] == 2
+    assert len(prepared.native_input) == 1
 
 
 def test_compaction_prompt_cache_key_versioned():

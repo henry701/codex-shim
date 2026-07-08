@@ -252,6 +252,47 @@ def _fit_compaction_input_to_budget(
     return working
 
 
+def _message_content_key(item: dict[str, Any]) -> str | None:
+    if item.get("type") != "message":
+        return None
+    if item.get("role") != "user":
+        return None
+    content = item.get("content")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        try:
+            return json.dumps(content, sort_keys=True, default=str)
+        except Exception:
+            return str(content)
+    if content is None:
+        return ""
+    return str(content)
+
+
+def collapse_consecutive_duplicate_user_messages(items: list[Any]) -> tuple[list[Any], int]:
+    """Drop consecutive duplicate user messages (client compaction retry artifact)."""
+    if not items:
+        return items, 0
+    collapsed: list[Any] = []
+    deduped = 0
+    previous_key: str | None = None
+    for raw in items:
+        if isinstance(raw, dict):
+            key = _message_content_key(raw)
+            if key is not None and key == previous_key:
+                deduped += 1
+                continue
+            if key is not None:
+                previous_key = key
+            else:
+                previous_key = None
+        else:
+            previous_key = None
+        collapsed.append(raw)
+    return collapsed, deduped
+
+
 def prepare_compaction_input(
     stripped_input: list[Any],
     settings: CompactionSettings,
@@ -265,7 +306,16 @@ def prepare_compaction_input(
         "rewritten_tool_outputs": 0,
         "truncated_tool_outputs": 0,
         "chars_truncated_from_tool_outputs": 0,
+        "deduped_user_messages": 0,
     }
+
+    stripped_input, deduped = collapse_consecutive_duplicate_user_messages(stripped_input)
+    stats["deduped_user_messages"] = deduped
+    if deduped > 0:
+        print(
+            f"[compaction] dedupe collapsed={deduped} consecutive duplicate user messages",
+            flush=True,
+        )
 
     log_compaction_input_snapshot("pre-sanitize", stripped_input)
 

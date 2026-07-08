@@ -879,7 +879,10 @@ Codex can compact long sessions through compaction v2 (`compaction_trigger` on
 the `codex_shim.compaction` orchestrator: prepare input (orphan sanitization,
 optional tool-output rewrite, optional recent-user-turn exclusion for
 summarization), native compact, then OpenCode-style summarization fallback, then
-optional BYOK tertiary fallback.
+optional BYOK tertiary fallback (`compaction.tertiary_fallback_slug` in
+`models.json`). Turn-level `passthrough_error_fallback` is separate: it only
+applies when ChatGPT/Cursor passthrough turns fail, not to compaction phases.
+Compaction summarization always stays on the passthrough route for ChatGPT/Cursor.
 
 ChatGPT passthrough expands compaction requests from the conversation cache when
 `previous_response_id` is set, and preserves detached tail tool outputs Codex
@@ -906,6 +909,10 @@ Optional `compaction` block in `~/.codex-shim/models.json`:
   }
 }
 ```
+
+`tertiary_fallback_slug` is independent of `passthrough_error_fallback`. When
+native compact and summarization both fail, tertiary runs a BYOK compact on that
+slug if route credentials are available.
 
 Compaction input shaping uses the compaction model's context window minus an
 output reserve. By default the reserve is 20000 tokens, or an explicit

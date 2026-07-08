@@ -7,7 +7,18 @@ and this project does not yet follow semantic versioning (pre-1.0).
 
 ## Unreleased
 
+### Fixed
+
+- Compaction tertiary fallback resolver now awaits async `route_fn` (fixes
+  `tertiary-skip` when `compaction.tertiary_fallback_slug` or
+  `passthrough_error_fallback` target had valid credentials). Skip logging reports
+  `not_configured`, `no_credentials`, or `route_error` instead of a generic
+  message.
+
 ### Changed
+
+- Compaction prep collapses consecutive duplicate `message(role=user)` items
+  before sanitization (client compaction retry artifact).
 
 - Transport-aware continuation expansion: HTTP, BYOK (HTTP+WS), Cursor passthrough,
   and compaction always expand `previous_response_id` from the conversation cache.

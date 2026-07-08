@@ -57,6 +57,32 @@ def test_format_compaction_failure_detail_chains_native_and_summarization():
     assert "upstream_body=" in detail
     assert "Summarization fallback:" in detail
     assert "Tertiary fallback: not configured" in detail
+    assert "compaction.tertiary_fallback_slug" in detail
+
+
+def test_format_compaction_failure_detail_tertiary_skip_reasons():
+    no_creds = format_compaction_failure_detail(
+        slug="codex-gpt-5-4-mini",
+        provider="chatgpt",
+        native_message="native failed",
+        summarization_attempted=True,
+        summarization_message="summarization failed",
+        tertiary_skip_reason="no_credentials",
+        tertiary_configured_slug="or-free-router",
+    )
+    assert "or-free-router" in no_creds
+    assert "no API key" in no_creds
+
+    route_err = format_compaction_failure_detail(
+        slug="codex-gpt-5-4-mini",
+        provider="chatgpt",
+        native_message="native failed",
+        summarization_attempted=True,
+        summarization_message="summarization failed",
+        tertiary_skip_reason="route_error",
+        tertiary_configured_slug="missing-slug",
+    )
+    assert "route resolution failed" in route_err
 
 
 def test_format_compaction_failure_detail_includes_tertiary_attempt():
