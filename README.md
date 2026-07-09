@@ -37,7 +37,7 @@ multi-provider local catalog that stays in sync with Codex Desktop.
 | **Auto-discovery** | `codex-shim discover` lists models pulled from provider APIs/CLIs: OpenCode Zen (free + paid), OpenRouter `:free` models, NVIDIA Integrate, and local OpenAI-compatible endpoints. `discover --refresh` busts cached Cursor catalog metadata. |
 | **Provider-prefixed slugs** | Discovered routes get stable prefixes (`or-`, `zen-`, `nvidia-`, `oc-free-`, …) so hundreds of models stay identifiable in the picker and logs. |
 | **`sync-desktop`** | Writes `~/.codex/custom_model_catalog.json` only. Does **not** change `~/.codex/config.toml` — use `codex-shim enable` (or `app`) to wire OpenAI-provider shim routing. |
-| **systemd user service** | `codex-shim install-service` installs a user unit that runs `sync-desktop` then `run` in the foreground (catalog refresh only; CLI config stays untouched until `enable`). Targets `graphical-session.target` and, when present, a local `network-ready-user.service` drop-in so model refresh waits for NM + DNS. |
+| **systemd user service** | `codex-shim install-service` installs a user unit that runs `sync-desktop` then `run` in the foreground (catalog refresh only; CLI config stays untouched until `enable`). Targets `graphical-session.target` and, when present, a local `network-ready-user.service` drop-in so model refresh waits for NM + DNS. Also installs an hourly user logrotate timer for `~/.codex-shim/shim.log` (30M, keep 10 compressed). |
 | **Namespace tools (dot notation)** | Responses `type: "namespace"` tools (including `multi_agent_v1` / multi-agent V2) expand to `namespace.tool` on BYOK chat/anthropic routes and round-trip back to `namespace` + `name` on responses and streams. MCP refs accept `mcp__srv__tool` and `mcp__srv.tool`. |
 | **`openai-responses` provider** | Raw passthrough to upstream `/v1/responses` (no chat-completions translation) for providers that speak the Responses API natively. |
 | **BYOK agent-loop parity** | Codex-native `tool_search_call` / deferred MCP, namespaced MCP `function_call` items, streaming narration before tool calls, and fuller tool-output round-trips on BYOK routes (see changelog for the full fix list). |
@@ -51,6 +51,7 @@ codex-shim discover --refresh           # preview auto-discovered routes
 codex-shim sync-desktop                 # refresh ~/.codex catalog (config unchanged)
 codex-shim enable                       # wire OpenAI-provider shim routing into ~/.codex/config.toml + start daemon
 codex-shim install-service              # optional: user systemd unit at graphical login
+codex-shim install-logrotate            # optional: rotate ~/.codex-shim/shim.log at 30M (keep 10)
 ```
 
 On Linux, pair with [CodexDesktop-Rebuild](https://github.com/henry701/CodexDesktop-Rebuild) and
@@ -1102,6 +1103,7 @@ codex-shim discover --refresh
 codex-shim start             regenerate catalog and start local shim daemon
 codex-shim run               run shim in foreground (systemd / debugging)
 codex-shim install-service   fork: install+enable user systemd unit
+codex-shim install-logrotate fork: user logrotate for ~/.codex-shim/shim.log (30M/10)
 codex-shim enable            start daemon; write managed ~/.codex/config.toml (model, provider, feature flags)
 codex-shim status            health check + model count
 codex-shim doctor            read-only diagnostics for settings, daemon, passthrough, and Codex config

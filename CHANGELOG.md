@@ -7,6 +7,13 @@ and this project does not yet follow semantic versioning (pre-1.0).
 
 ## Unreleased
 
+### Added
+
+- User logrotate for `~/.codex-shim/shim.log`: rotate at 30M, keep 10 compressed
+  archives (`copytruncate`), via `codex-shim install-logrotate` and an hourly
+  systemd user timer. `install-service` installs it automatically and restores
+  `StandardOutput`/`StandardError` append to the service log path.
+
 ### Fixed
 
 - Compaction tertiary fallback resolver now awaits async `route_fn` (fixes

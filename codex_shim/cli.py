@@ -139,6 +139,15 @@ def main(argv: list[str] | None = None) -> int:
         "install-service",
         help="Install and enable a systemd user service so the shim starts at login/boot.",
     )
+    logrotate_parser = sub.add_parser(
+        "install-logrotate",
+        help="Install user logrotate config+timer for ~/.codex-shim/shim.log (30M, keep 10).",
+    )
+    logrotate_parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Force a rotation pass immediately after installing the timer.",
+    )
     sub.add_parser("status")
     sub.add_parser("doctor", help="Print a read-only local diagnostics report.")
     sub.add_parser("patch-app", help="Patch Codex Desktop picker/sidebar handling for custom shim models.")
@@ -204,6 +213,8 @@ def main(argv: list[str] | None = None) -> int:
         return sync_desktop(args.settings, args.port)
     if args.command == "install-service":
         return install_service(args.settings, args.port)
+    if args.command == "install-logrotate":
+        return install_logrotate(force_rotate=args.force)
     if args.command == "status":
         return status(args.port)
     if args.command == "doctor":
@@ -917,6 +928,15 @@ def run_foreground(settings_path: Path, port: int) -> int:
 
 
 SYSTEMD_USER_UNIT = Path.home() / ".config/systemd/user/codex-shim.service"
+# Production service log path (home runtime), distinct from repo-local LOG_PATH used by `start`.
+SERVICE_LOG_PATH = Path.home() / ".codex-shim" / "shim.log"
+LOGROTATE_CONF_PATH = Path.home() / ".config" / "logrotate.d" / "codex-shim"
+LOGROTATE_STATE_DIR = Path.home() / ".local" / "state" / "codex-shim"
+LOGROTATE_STATE_PATH = LOGROTATE_STATE_DIR / "logrotate.status"
+LOGROTATE_SERVICE_UNIT = Path.home() / ".config/systemd/user/codex-shim-logrotate.service"
+LOGROTATE_TIMER_UNIT = Path.home() / ".config/systemd/user/codex-shim-logrotate.timer"
+LOGROTATE_SIZE = "30M"
+LOGROTATE_COUNT = 10
 
 
 def _systemd_shell_command(codex_shim_bin: str, common_args: str, subcommand: str) -> str:
@@ -931,11 +951,13 @@ def _systemd_unit_content(
     codex_shim_bin: str,
     settings_path: Path,
     port: int,
+    log_path: Path | None = None,
 ) -> str:
     settings = Path(settings_path).expanduser()
     common_args = f"--settings {settings} --port {port}"
     sync_cmd = _systemd_shell_command(codex_shim_bin, common_args, "sync-desktop")
     run_cmd = _systemd_shell_command(codex_shim_bin, common_args, "run")
+    log = Path(log_path or SERVICE_LOG_PATH).expanduser()
     return f"""[Unit]
 Description=Codex BYOK shim
 
@@ -945,9 +967,53 @@ ExecStartPre={sync_cmd}
 ExecStart={run_cmd}
 Restart=on-failure
 RestartSec=3
+StandardOutput=append:{log}
+StandardError=append:{log}
 
 [Install]
 WantedBy=graphical-session.target
+"""
+
+
+def _logrotate_conf_content(*, log_path: Path | None = None) -> str:
+    log = Path(log_path or SERVICE_LOG_PATH).expanduser()
+    return f"""{log} {{
+    size {LOGROTATE_SIZE}
+    rotate {LOGROTATE_COUNT}
+    compress
+    missingok
+    notifempty
+    copytruncate
+    dateext
+    dateformat -%Y%m%d-%H%M%S
+}}
+"""
+
+
+def _logrotate_service_unit_content() -> str:
+    conf = LOGROTATE_CONF_PATH
+    state = LOGROTATE_STATE_PATH
+    return f"""[Unit]
+Description=Rotate codex-shim shim.log
+Documentation=man:logrotate(8)
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/logrotate -s {state} {conf}
+"""
+
+
+def _logrotate_timer_unit_content() -> str:
+    return """[Unit]
+Description=Hourly rotation check for codex-shim shim.log
+
+[Timer]
+OnCalendar=hourly
+Persistent=true
+RandomizedDelaySec=5m
+
+[Install]
+WantedBy=timers.target
 """
 
 
@@ -969,6 +1035,55 @@ After=network-ready-user.service
 Wants=network-ready-user.service
 """
     )
+
+
+def install_logrotate(*, force_rotate: bool = False) -> int:
+    """Install user logrotate config + hourly timer for ~/.codex-shim/shim.log."""
+    if os.name == "nt":
+        print("logrotate is not supported on Windows.", file=sys.stderr)
+        return 1
+    if not shutil.which("logrotate"):
+        print("logrotate not found on PATH; install logrotate first.", file=sys.stderr)
+        return 1
+    LOGROTATE_CONF_PATH.parent.mkdir(parents=True, exist_ok=True)
+    LOGROTATE_STATE_DIR.mkdir(parents=True, exist_ok=True)
+    LOGROTATE_SERVICE_UNIT.parent.mkdir(parents=True, exist_ok=True)
+    SERVICE_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    LOGROTATE_CONF_PATH.write_text(_logrotate_conf_content())
+    LOGROTATE_SERVICE_UNIT.write_text(_logrotate_service_unit_content())
+    LOGROTATE_TIMER_UNIT.write_text(_logrotate_timer_unit_content())
+    for cmd in (
+        ["systemctl", "--user", "daemon-reload"],
+        ["systemctl", "--user", "enable", "--now", "codex-shim-logrotate.timer"],
+    ):
+        result = subprocess.run(cmd, check=False)
+        if result.returncode != 0:
+            print(f"Command failed: {' '.join(cmd)}", file=sys.stderr)
+            return result.returncode
+    print(f"Installed {LOGROTATE_CONF_PATH}")
+    print(f"Installed {LOGROTATE_TIMER_UNIT} (hourly size check, {LOGROTATE_SIZE}, keep {LOGROTATE_COUNT})")
+    over_size = SERVICE_LOG_PATH.is_file() and SERVICE_LOG_PATH.stat().st_size >= 30 * 1024 * 1024
+    if force_rotate or over_size:
+        # Prefer -f so an already-oversized file rotates on first install even if
+        # the size check would otherwise wait for the next hourly timer tick.
+        rotate = subprocess.run(
+            [
+                "logrotate",
+                "-f",
+                "-s",
+                str(LOGROTATE_STATE_PATH),
+                str(LOGROTATE_CONF_PATH),
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if rotate.returncode != 0:
+            detail = (rotate.stderr or rotate.stdout or "").strip()
+            print(f"logrotate run failed: {detail or rotate.returncode}", file=sys.stderr)
+            return rotate.returncode
+        print(f"Rotated {SERVICE_LOG_PATH}")
+    return 0
 
 
 def install_service(settings_path: Path, port: int) -> int:
@@ -1011,6 +1126,9 @@ def install_service(settings_path: Path, port: int) -> int:
         )
     print(f"Installed {SYSTEMD_USER_UNIT}")
     print("codex-shim.service is enabled and running.")
+    logrotate_rc = install_logrotate(force_rotate=False)
+    if logrotate_rc != 0:
+        print("Warning: logrotate install failed; shim service is still running.", file=sys.stderr)
     return 0
 
 
