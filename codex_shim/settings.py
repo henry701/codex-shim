@@ -2,12 +2,15 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import json
+import logging
 import os
 from pathlib import Path
 import re
 from typing import Any
 
 from .catalog_slugs import CHATGPT_CATALOG_SLUG, CHATGPT_UPSTREAM_DEFAULT, codex_catalog_slug
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_SETTINGS = Path.home() / ".codex-shim" / "models.json"
 DEFAULT_CHATGPT_CONVERSATIONS_DIR = Path.home() / ".codex-shim" / "chatgpt-conversations"
@@ -167,28 +170,54 @@ def _codex_passthrough_entry(
 
 
 def load_chatgpt_passthrough_catalog_models(cache_path: Path | None = None) -> list[dict[str, Any]]:
-    from .discover import discover_chatgpt_model_ids_from_openai_api
+    """Build ChatGPT passthrough catalog entries.
+
+    Preference order:
+      1. Live ``chatgpt.com/backend-api/codex/models`` (Codex OAuth token)
+      2. Local ``~/.codex/models_cache.json`` (with a warning — often stale when
+         Codex is pointed at the shim via ``openai_base_url``)
+      3. Hardcoded ``FALLBACK_CHATGPT_PASSTHROUGH_SLUGS``
+    """
+    from .discover import fetch_chatgpt_codex_backend_models
     from .naming import display_name_from_slug
 
-    by_upstream: dict[str, dict[str, Any]] = {}
-    for upstream in discover_chatgpt_model_ids_from_openai_api():
-        by_upstream.setdefault(
-            upstream,
-            _codex_passthrough_entry(
-                upstream,
-                FALLBACK_CHATGPT_DISPLAY_NAMES.get(upstream, display_name_from_slug(upstream)),
-            ),
-        )
-    for entry in _load_chatgpt_cache_catalog_models(cache_path):
-        upstream = str(entry.get("slug") or "").strip()
-        if upstream:
+    backend_models = fetch_chatgpt_codex_backend_models()
+    if backend_models:
+        by_upstream: dict[str, dict[str, Any]] = {}
+        for entry in backend_models:
+            upstream = str(entry.get("slug") or "").strip()
+            if not upstream:
+                continue
             by_upstream[upstream] = _codex_passthrough_entry(
                 upstream,
-                str(entry.get("display_name") or upstream),
+                str(entry.get("display_name") or FALLBACK_CHATGPT_DISPLAY_NAMES.get(upstream, display_name_from_slug(upstream))),
                 cache_entry=entry,
             )
-    if by_upstream:
-        return sorted(by_upstream.values(), key=lambda entry: str(entry.get("slug") or ""))
+        if by_upstream:
+            return sorted(by_upstream.values(), key=lambda entry: str(entry.get("slug") or ""))
+
+    cache_models = _load_chatgpt_cache_catalog_models(cache_path)
+    if cache_models:
+        logger.warning(
+            "ChatGPT Codex backend /models unavailable; falling back to local models_cache.json "
+            "(often stale when Codex openai_base_url points at the shim)"
+        )
+        by_upstream = {}
+        for entry in cache_models:
+            upstream = str(entry.get("slug") or "").strip()
+            if upstream:
+                by_upstream[upstream] = _codex_passthrough_entry(
+                    upstream,
+                    str(entry.get("display_name") or upstream),
+                    cache_entry=entry,
+                )
+        if by_upstream:
+            return sorted(by_upstream.values(), key=lambda entry: str(entry.get("slug") or ""))
+
+    logger.warning(
+        "ChatGPT Codex backend /models unavailable and models_cache.json empty/missing; "
+        "using hardcoded FALLBACK_CHATGPT_PASSTHROUGH_SLUGS"
+    )
     return [
         _codex_passthrough_entry(
             upstream,

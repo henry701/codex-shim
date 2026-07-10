@@ -17,6 +17,7 @@ def _disable_model_discovery_by_default(monkeypatch, request):
     monkeypatch.setattr("codex_shim.discover.fetch_local_openai_models", lambda *_args, **_kwargs: [])
     monkeypatch.setattr("codex_shim.discover.discover_chatgpt_models_from_cursor", lambda: [])
     monkeypatch.setattr("codex_shim.discover.discover_chatgpt_model_ids_from_openai_api", lambda: [])
+    monkeypatch.setattr("codex_shim.discover.fetch_chatgpt_codex_backend_models", lambda **_kwargs: [])
 
 
 @pytest.fixture(autouse=True)

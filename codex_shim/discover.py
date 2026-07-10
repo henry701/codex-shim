@@ -3,22 +3,29 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 import ipaddress
 import json
+import logging
 import os
 import re
 import shutil
 import subprocess
+import time
 from typing import Any
-from urllib.error import URLError
+from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
+from pathlib import Path
 
 from .naming import description_for_route, display_name_from_slug
 from .settings import ShimModel, slugify
+
+logger = logging.getLogger(__name__)
 
 ZEN_MODELS_URL = "https://opencode.ai/zen/v1/models"
 MODELS_DEV_API_URL = "https://models.dev/api.json"
 MODELS_DEV_OPENCODE_PROVIDER = "opencode"
 OPENAI_MODELS_URL = "https://api.openai.com/v1/models"
+CHATGPT_CODEX_MODELS_URL = "https://chatgpt.com/backend-api/codex/models"
+DEFAULT_CHATGPT_CODEX_CLIENT_VERSION = "0.144.1"
 DISCOVER_INDEX_BASE = 10_000
 
 _NVIDIA_SKIP_RE = re.compile(
@@ -278,7 +285,16 @@ def merge_discovered_models(explicit: list[ShimModel], discovered: list[ShimMode
     return merged
 
 
-def fetch_http_json(url: str, *, headers: dict[str, str] | None = None, timeout: float = 20.0) -> Any:
+def fetch_http_json(
+    url: str,
+    *,
+    headers: dict[str, str] | None = None,
+    timeout: float = 20.0,
+    retries: int = 1,
+    backoff_base: float = 0.5,
+    backoff_factor: float = 2.0,
+) -> Any:
+    """GET JSON with optional retries and exponential backoff (stdlib urllib)."""
     merged = {
         "User-Agent": "codex-shim/1.0 (+https://github.com/henry701/codex-shim)",
         "Accept": "application/json",
@@ -286,8 +302,119 @@ def fetch_http_json(url: str, *, headers: dict[str, str] | None = None, timeout:
     if headers:
         merged.update(headers)
     request = Request(url, headers=merged)
-    with urlopen(request, timeout=timeout) as response:
-        return json.loads(response.read().decode("utf-8"))
+    attempts = max(1, int(retries))
+    last_error: BaseException | None = None
+    for attempt in range(attempts):
+        try:
+            with urlopen(request, timeout=timeout) as response:
+                return json.loads(response.read().decode("utf-8"))
+        except HTTPError as exc:
+            last_error = exc
+            # Retry transient upstream / gateway failures only.
+            if exc.code not in {408, 425, 429, 500, 502, 503, 504} or attempt + 1 >= attempts:
+                raise
+        except (OSError, URLError, TimeoutError, json.JSONDecodeError) as exc:
+            last_error = exc
+            if attempt + 1 >= attempts:
+                raise
+        delay = backoff_base * (backoff_factor**attempt)
+        logger.warning(
+            "HTTP GET %s failed (attempt %s/%s): %s; retrying in %.2fs",
+            url,
+            attempt + 1,
+            attempts,
+            last_error,
+            delay,
+        )
+        time.sleep(delay)
+    assert last_error is not None
+    raise last_error
+
+
+def _load_codex_auth_tokens(auth_path: Any | None = None) -> tuple[str, str] | None:
+    from .settings import DEFAULT_CODEX_AUTH
+
+    expanded = Path(auth_path if auth_path is not None else DEFAULT_CODEX_AUTH).expanduser()
+    if not expanded.exists():
+        return None
+    try:
+        data = json.loads(expanded.read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+    tokens = data.get("tokens") if isinstance(data, dict) else None
+    if not isinstance(tokens, dict):
+        return None
+    access_token = str(tokens.get("access_token") or "").strip()
+    if not access_token:
+        return None
+    account_id = str(tokens.get("account_id") or "").strip()
+    return access_token, account_id
+
+
+def _parse_chatgpt_codex_models_payload(payload: Any) -> list[dict[str, Any]]:
+    if not isinstance(payload, dict):
+        return []
+    rows = payload.get("models")
+    if not isinstance(rows, list):
+        return []
+    models: list[dict[str, Any]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        slug = str(row.get("slug") or "").strip()
+        if not slug:
+            continue
+        if row.get("visibility") == "hidden":
+            continue
+        lower = slug.lower()
+        if not (lower.startswith("gpt-") or lower.startswith("codex-")):
+            continue
+        models.append(dict(row))
+    return models
+
+
+def fetch_chatgpt_codex_backend_models(
+    *,
+    client_version: str | None = None,
+    auth_path: Any | None = None,
+    timeout: float = 20.0,
+    retries: int = 3,
+    backoff_base: float = 0.5,
+    backoff_factor: float = 2.0,
+) -> list[dict[str, Any]]:
+    """List ChatGPT Codex models from chatgpt.com/backend-api/codex/models.
+
+    Uses the Codex OAuth token in ``~/.codex/auth.json``. Retries transient HTTP
+    failures with exponential backoff. Returns ``[]`` when auth is missing or
+    the request ultimately fails.
+    """
+    auth = _load_codex_auth_tokens(auth_path)
+    if auth is None:
+        return []
+    access_token, account_id = auth
+    version = (client_version or os.environ.get("CODEX_SHIM_CHATGPT_MODELS_CLIENT_VERSION") or DEFAULT_CHATGPT_CODEX_CLIENT_VERSION).strip()
+    url = f"{CHATGPT_CODEX_MODELS_URL}?client_version={version}"
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Accept": "application/json",
+        "User-Agent": f"codex_cli_rs/{version}",
+        "originator": "codex_cli_rs",
+    }
+    if account_id:
+        headers["ChatGPT-Account-Id"] = account_id
+    try:
+        payload = fetch_http_json(
+            url,
+            headers=headers,
+            timeout=timeout,
+            retries=retries,
+            backoff_base=backoff_base,
+            backoff_factor=backoff_factor,
+        )
+    except (OSError, URLError, HTTPError, TimeoutError, json.JSONDecodeError, ValueError) as exc:
+        logger.warning("ChatGPT Codex /models fetch failed after retries: %s", exc)
+        return []
+    return _parse_chatgpt_codex_models_payload(payload)
 
 
 def _parse_openai_model_list(payload: Any) -> list[str]:

@@ -338,8 +338,10 @@ codex-shim disable
 ```
 
 After this, Codex Desktop sees every entry from `~/.codex-shim/models.json`,
-plus the `GPT-5.5` ChatGPT passthrough slug if (and only if) `~/.codex/auth.json`
-holds a valid `tokens.access_token`.
+plus ChatGPT passthrough models listed from
+`chatgpt.com/backend-api/codex/models` when `~/.codex/auth.json` holds a valid
+`tokens.access_token` (falls back to `~/.codex/models_cache.json` / hardcoded
+slugs only if that listing fails).
 
 If your Codex Desktop's model picker only shows `default` and refuses to render
 the catalog entries, apply the macOS picker patch below.
@@ -1174,7 +1176,10 @@ server is reachable.
   them.
 - Request logs are summary-level by default and avoid full prompt/API-key dumps.
 - ChatGPT passthrough reads `~/.codex/auth.json` at request time and forwards
-  the access token only to ChatGPT's Codex endpoint.
+  the access token only to ChatGPT's Codex endpoint. Catalog generation uses the
+  same token to call `chatgpt.com/backend-api/codex/models` (with retries) so
+  new GPT models appear even when Codex `openai_base_url` points at the shim
+  and `models_cache.json` is stale.
 - If you put a prompt-catching proxy in front of the shim, that proxy controls
   what it logs. Redact or hash large/private prompt bodies there.
 

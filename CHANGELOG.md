@@ -9,6 +9,13 @@ and this project does not yet follow semantic versioning (pre-1.0).
 
 ### Added
 
+- ChatGPT passthrough catalog prefers live
+  `https://chatgpt.com/backend-api/codex/models?client_version=…` using the Codex
+  OAuth token in `~/.codex/auth.json` (retries with exponential backoff via
+  stdlib `urllib`). Falls back to `~/.codex/models_cache.json` or hardcoded
+  slugs only when the backend listing is unavailable, with a warning log —
+  breaks the circular dependency when Codex `openai_base_url` points at the shim.
+
 - User logrotate for `~/.codex-shim/shim.log`: rotate at 30M, keep 10 compressed
   archives (`copytruncate`), via `codex-shim install-logrotate` and an hourly
   systemd user timer. `install-service` installs it automatically and restores

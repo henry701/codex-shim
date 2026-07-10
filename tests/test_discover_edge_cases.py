@@ -215,7 +215,7 @@ def test_resolved_api_key_expands_env_placeholder(monkeypatch):
     assert _resolved_api_key("literal") == "literal"
 
 
-def test_chatgpt_catalog_uses_codex_prefix_and_prefers_cache(monkeypatch, tmp_path):
+def test_chatgpt_catalog_uses_codex_prefix_from_cache_when_backend_empty(monkeypatch, tmp_path):
     cache = tmp_path / "models_cache.json"
     cache.write_text(
         json.dumps(
@@ -224,21 +224,18 @@ def test_chatgpt_catalog_uses_codex_prefix_and_prefers_cache(monkeypatch, tmp_pa
                     {
                         "slug": "gpt-5.5",
                         "display_name": "GPT-5.5 Cached",
+                        "visibility": "list",
                         "context_window": 272000,
                     }
                 ]
             }
         )
     )
-    monkeypatch.setattr(
-        "codex_shim.discover.discover_chatgpt_model_ids_from_openai_api",
-        lambda: ["gpt-5.5", "gpt-5.2"],
-    )
+    monkeypatch.setattr("codex_shim.discover.fetch_chatgpt_codex_backend_models", lambda **_kwargs: [])
     entries = load_chatgpt_passthrough_catalog_models(cache)
     by_slug = {entry["slug"]: entry for entry in entries}
     assert by_slug["codex-gpt-5-5"]["display_name"] == "GPT-5.5 Cached"
     assert by_slug["codex-gpt-5-5"]["_upstream_model"] == "gpt-5.5"
-    assert by_slug["codex-gpt-5-2"]["_upstream_model"] == "gpt-5.2"
 
 
 def test_write_catalog_includes_discovered_zen_public(tmp_path, monkeypatch, auth_missing):
