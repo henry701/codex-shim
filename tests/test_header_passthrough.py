@@ -92,6 +92,43 @@ def test_client_headers_for_upstream_drops_websocket_upgrade_headers():
     assert merged == {"session-id": "sess-1"}
 
 
+def test_client_headers_for_upstream_drops_content_encoding():
+    """Desktop may zstd-compress the body to the shim with Content-Encoding.
+
+    The shim decompresses, mutates JSON, then re-POSTs plain JSON via
+    ``ClientSession.post(..., json=...)``. Forwarding Content-Encoding makes
+    ChatGPT try to decompress uncompressed bytes and return bare Bad Request.
+    """
+    merged = client_headers_for_upstream(
+        {
+            "Content-Type": "application/json",
+            "Content-Encoding": "zstd",
+            "session-id": "sess-1",
+            "originator": "Codex Desktop",
+        }
+    )
+    assert "Content-Encoding" not in merged
+    assert merged["session-id"] == "sess-1"
+    assert merged["originator"] == "Codex Desktop"
+
+
+def test_chatgpt_passthrough_upstream_headers_drop_content_encoding():
+    merged = chatgpt_passthrough_upstream_headers(
+        {
+            "Content-Encoding": "zstd",
+            "originator": "Codex Desktop",
+            "x-codex-beta-features": "memories,prevent_idle_sleep,remote_compaction_v2",
+        },
+        access_token="token",
+        account_id="acct",
+        accept="text/event-stream",
+    )
+    assert "Content-Encoding" not in merged
+    assert merged["Authorization"] == "Bearer token"
+    assert merged["originator"] == "Codex Desktop"
+    assert merged["x-codex-beta-features"] == "memories,prevent_idle_sleep,remote_compaction_v2"
+
+
 def test_openai_upstream_headers_preserves_client_accept_encoding():
     merged = openai_upstream_headers(
         {"Accept-Encoding": "zstd, gzip"},

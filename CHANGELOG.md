@@ -23,6 +23,12 @@ and this project does not yet follow semantic versioning (pre-1.0).
 
 ### Fixed
 
+- ChatGPT/BYOK upstream forwarding no longer relays client `Content-Encoding`.
+  Desktop may zstd-compress the body to the shim; after decompress + JSON rewrite
+  the shim POSTs plain JSON, so a leftover `Content-Encoding: zstd` made ChatGPT
+  return a bare `{"detail":"Bad Request"}` (especially on large full-history
+  resumes where request compression is used).
+
 - Compaction tertiary fallback resolver now awaits async `route_fn` (fixes
   `tertiary-skip` when `compaction.tertiary_fallback_slug` or
   `passthrough_error_fallback` target had valid credentials). Skip logging reports

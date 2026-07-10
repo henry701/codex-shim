@@ -687,6 +687,7 @@ async def test_zstd_compressed_responses_request_reaches_handler(monkeypatch, tm
 
     async def fake_post(self, url, json=None, headers=None):
         captured["body"] = json
+        captured["headers"] = headers
         return FakeUpstream()
 
     monkeypatch.setattr("codex_shim.server.ClientSession.post", fake_post)
@@ -704,6 +705,7 @@ async def test_zstd_compressed_responses_request_reaches_handler(monkeypatch, tm
 
     assert resp.status == 200
     assert captured["body"]["model"] == "gpt-5.5"
+    assert "Content-Encoding" not in (captured.get("headers") or {})
 
     await shim_client.close()
 

@@ -19,6 +19,8 @@ _HOP_BY_HOP_REQUEST = frozenset(
         "upgrade",
         "host",
         "content-length",
+        # Client→shim body may be zstd/gzip; we re-serialize plain JSON upstream.
+        "content-encoding",
     }
 )
 _SHIM_INTERNAL_REQUEST = frozenset({"x-codex-shim-picker-token"})
