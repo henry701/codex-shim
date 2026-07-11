@@ -48,6 +48,7 @@ from .compaction.strategies.bodies import (
     build_native_compact_body,
     build_summarization_compact_body,
 )
+from .prompt_cache import format_prompt_cache_req_suffix
 from .compaction.types import CompactionRequest, NativeAttemptResult, SummarizationAttemptResult
 from .cursor_bridge import (
     BridgeError,
@@ -3591,6 +3592,7 @@ _CHATGPT_UNSUPPORTED_REQUEST_KEYS = (
     "max_output_tokens",
     "max_tokens",
     "service_tier",
+    # Prompt cache fields (see prompt_cache.PROMPT_CACHE_BODY_KEYS) are forwarded as-is.
 )
 
 
@@ -5579,11 +5581,13 @@ def _log_client_request(endpoint: str, body: dict[str, Any], *, transport: str =
                     names.append(str(name))
         tail = 12 if _input_has_compaction_trigger(body.get("input")) else 6
         input_count, input_summary = _summarize_input_items(body.get("input"), tail=tail)
+        cache_suffix = format_prompt_cache_req_suffix(body)
         print(
             f"[req] {endpoint} transport={transport} model={body.get('model')!r} stream={body.get('stream')!r} "
             f"previous_response_id={body.get('previous_response_id')!r} "
             f"tools={len(tools)} ({names[:8]}) "
-            f"input={input_count} ({input_summary})",
+            f"input={input_count} ({input_summary})"
+            f"{cache_suffix}",
             flush=True,
         )
     except Exception as exc:
