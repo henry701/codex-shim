@@ -4935,15 +4935,7 @@ class ResponsesStreamState:
             await self._close_message(response)
         output_index = self.next_output_index
         self.next_output_index += 1
-        # Determine output item type based on original tool type.
-        # Freeform tools (apply_patch with no schema) emit custom_tool_call
-        # so Codex Desktop knows not to validate against a fixed enum.
-        original_type = self.tool_types.get(name, "")
-        output_type = "function_call"
-        if original_type == "apply_patch":
-            output_type = "custom_tool_call"
-        elif original_type.startswith("web_search"):
-            output_type = "web_search_call"
+        output_type = _responses_output_type_for_tool(name, self.tool_types)
         state: dict[str, Any] = {
             "id": call_id,
             "call_id": call_id,
@@ -4951,9 +4943,8 @@ class ResponsesStreamState:
             "namespace": namespace,
             "arguments": "",
             "output_index": output_index,
-            "output_type": _responses_output_type_for_tool(name, self.tool_types),
-            "closed": False,
             "output_type": output_type,
+            "closed": False,
         }
         self.tool_calls[key] = state
         item = _stream_tool_added_item(state)
