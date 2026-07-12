@@ -156,6 +156,38 @@ def test_modifier_can_opt_into_router_tier_via_write_path():
     assert updated["context_window"] == 200000
 
 
+def test_pattern_override_beats_modifier_for_56_while_55_gets_modifier():
+    settings = load_catalog_context_settings(
+        {
+            "catalog_context": {
+                "modifier": 0.9,
+                "apply_to_tiers": ["chatgpt"],
+                "override_patterns": {"codex-gpt-5-6-*": {"context_window": 240000}},
+            }
+        }
+    )
+    assert settings is not None
+    terra = apply_catalog_context_to_entry(
+        {"slug": "codex-gpt-5-6-terra", "context_window": 372000, "max_context_window": 372000},
+        tier=CATALOG_TIER_CHATGPT,
+        settings=settings,
+    )
+    sol = apply_catalog_context_to_entry(
+        {"slug": "codex-gpt-5-6-sol", "context_window": 372000, "max_context_window": 372000},
+        tier=CATALOG_TIER_CHATGPT,
+        settings=settings,
+    )
+    gpt55 = apply_catalog_context_to_entry(
+        {"slug": "codex-gpt-5-5", "context_window": 272000, "max_context_window": 272000},
+        tier=CATALOG_TIER_CHATGPT,
+        settings=settings,
+    )
+    assert terra["context_window"] == 240000
+    assert terra["auto_compact_token_limit"] == 192000
+    assert sol["context_window"] == 240000
+    assert gpt55["context_window"] == 244800
+
+
 def test_write_catalog_applies_chatgpt_modifier_not_byok(tmp_path, monkeypatch):
     cache = tmp_path / "models-cache.json"
     cache.write_text(

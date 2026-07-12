@@ -69,17 +69,6 @@ separate field in `~/.codex/config.toml`.
   "catalog_context": {
     "$comment": "Tiers: chatgpt | cursor | byok | router — see table below. $comment keys are ignored.",
     "modifier": 0.9,
-    "apply_to_tiers": ["chatgpt"]
-  }
-}
-```
-
-Optional per-slug caps (beat `modifier`):
-
-```json
-{
-  "catalog_context": {
-    "modifier": 0.9,
     "apply_to_tiers": ["chatgpt"],
     "override_patterns": {
       "codex-gpt-5-6-*": { "context_window": 240000 }
@@ -87,6 +76,9 @@ Optional per-slug caps (beat `modifier`):
   }
 }
 ```
+
+`override_patterns` beat `modifier`. GPT-5.6 models cap at 240K (under the API
+272K long-context billing cliff); other ChatGPT passthrough models still get 0.9×.
 
 | Field | Meaning |
 | --- | --- |
