@@ -57,7 +57,60 @@ codex-shim install-logrotate            # optional: rotate ~/.codex-shim/shim.lo
 On Linux, pair with [CodexDesktop-Rebuild](https://github.com/henry701/CodexDesktop-Rebuild) and
 `USE_SHIM_MODEL_PICKER=1` if Desktop's Statsig allowlist hides shim catalog entries.
 
-Discovery can be tuned in `~/.codex-shim/models.json`:
+### Catalog context headroom (`catalog_context`)
+
+Tune Codex's advertised context window when the shim refreshes
+`~/.codex/custom_model_catalog.json` (`generate`, `sync-desktop`, or service
+startup). Codex reads these limits from `model_catalog_json`, not from a
+separate field in `~/.codex/config.toml`.
+
+```json
+{
+  "catalog_context": {
+    "$comment": "Tiers: chatgpt | cursor | byok | router — see table below. $comment keys are ignored.",
+    "modifier": 0.9,
+    "apply_to_tiers": ["chatgpt"]
+  }
+}
+```
+
+Optional per-slug caps (beat `modifier`):
+
+```json
+{
+  "catalog_context": {
+    "modifier": 0.9,
+    "apply_to_tiers": ["chatgpt"],
+    "override_patterns": {
+      "codex-gpt-5-6-*": { "context_window": 240000 }
+    }
+  }
+}
+```
+
+| Field | Meaning |
+| --- | --- |
+| `modifier` | Multiply the upstream `context_window` (e.g. `0.9` → 10% headroom). Only for tiers in `apply_to_tiers`. |
+| `apply_to_tiers` | Closed set of catalog discovery tiers (default: `["chatgpt"]`). Unknown names are dropped. |
+| `override_patterns` | Glob slug overrides (fnmatch). Beat `modifier`. |
+| `overrides` | Exact slug overrides. Beat patterns and `modifier`. |
+| `$comment` / `$comments` | Documentation only; ignored when loading. |
+
+**Catalog tiers** (assigned by the shim when building the catalog; not OpenAI plan tiers):
+
+| Tier | Models | How they appear |
+| --- | --- | --- |
+| `chatgpt` | ChatGPT subscription passthrough (`codex-gpt-*`) | `codex login` + backend `/models` cache |
+| `cursor` | Cursor subscription passthrough | Cursor auth bridge. **Usually omit from `apply_to_tiers`** — cursor-agent enforces its own context limits. |
+| `byok` | Local / OpenRouter / Zen / NVIDIA / custom `models[]` | `discover` flags + `models[]`. Prefer per-model `max_context_limit` over the global modifier. |
+| `router` | Shim auto-router entry | `router` block in `models.json` |
+
+Priority: exact `overrides` > glob `override_patterns` > tier `modifier`. Slug
+overrides apply across tiers; `modifier` is tier-gated. Applied fields:
+`context_window`, `max_context_window`, `auto_compact_token_limit`, and
+`truncation_policy.limit`.
+
+Provider discovery:
 
 ```jsonc
 {
@@ -1008,7 +1061,25 @@ tail -f .codex-shim/shim.log
 ```
 
 The log is intentionally summary-level so it does not dump API keys or full
-prompt bodies by default.
+prompt bodies by default. `[req]` lines include `prompt_cache_key` and other
+cache fields when present.
+
+### Quota / usage dashboard
+
+Summarize cache hit rate, long-context turns (>272K input tokens), model mix,
+tool-loop volume, and estimated Codex credits from rotated logs:
+
+```bash
+codex-shim quota-report
+codex-shim quota-report --since 2026-07-10 --until 2026-07-12
+codex-shim quota-report --json
+python scripts/quota_dashboard.py --log-dir ~/.codex-shim --since 2026-07-10
+```
+
+Reads `shim.log`, `shim.log.1.gz`, and other `shim.log*` files under
+`~/.codex-shim`. Date filters use each file's modification time (individual log
+lines usually have no timestamps). Gzip archives from `install-logrotate` are
+supported automatically.
 
 ### 2. Local prompt-catching proxy in front of this shim
 

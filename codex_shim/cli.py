@@ -183,6 +183,15 @@ def main(argv: list[str] | None = None) -> int:
     app_parser.add_argument("-m", "--model", dest="model_slug")
     app_parser.add_argument("path", nargs="?", default=".")
 
+    quota_parser = sub.add_parser(
+        "quota-report",
+        help="Summarize shim.log usage, cache hits, and estimated credits.",
+    )
+    quota_parser.add_argument("--log-dir", type=Path, default=None)
+    quota_parser.add_argument("--since", default=None, help="YYYY-MM-DD (log file mtime filter)")
+    quota_parser.add_argument("--until", default=None, help="YYYY-MM-DD (log file mtime filter)")
+    quota_parser.add_argument("--json", action="store_true")
+
     args = parser.parse_args(argv)
     if args.command == "generate":
         generate(args.settings, args.port)
@@ -225,6 +234,19 @@ def main(argv: list[str] | None = None) -> int:
         return restore_codex_app_bundle()
     if args.command == "migrate-threads":
         return migrate_threads_command(dry_run=args.dry_run)
+    if args.command == "quota-report":
+        from .quota_dashboard import main as quota_main
+
+        argv = []
+        if args.log_dir is not None:
+            argv.extend(["--log-dir", str(args.log_dir)])
+        if args.since:
+            argv.extend(["--since", args.since])
+        if args.until:
+            argv.extend(["--until", args.until])
+        if args.json:
+            argv.append("--json")
+        return quota_main(argv)
     if args.command == "opencode-go":
         if args.opencode_go_command == "refresh":
             return refresh_opencode_go(args.settings, args.api_key_env, args.base_url, args.prefer, args.timeout)
@@ -283,8 +305,9 @@ def _active_router(models, settings_path: Path):
     return None
 
 
-def _publish_catalog(models, router_config) -> Path:
-    write_catalog(models, CATALOG_PATH, router_config=router_config)
+def _publish_catalog(models, router_config, settings_path: Path) -> Path:
+    settings_data = _load_settings_data(settings_path)
+    write_catalog(models, CATALOG_PATH, router_config=router_config, settings_data=settings_data)
     DESKTOP_CATALOG_PATH.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(CATALOG_PATH, DESKTOP_CATALOG_PATH)
     return DESKTOP_CATALOG_PATH
@@ -298,7 +321,7 @@ def _refresh_published_catalog(settings_path: Path, port: int) -> Path | None:
     except ValueError:
         return None
     router_config = router_module.load_router_config(Path(settings_path).expanduser())
-    desktop_catalog = _publish_catalog(models, router_config)
+    desktop_catalog = _publish_catalog(models, router_config, settings_path)
     write_config(models, CONFIG_PATH, CATALOG_PATH, port)
     return desktop_catalog
 
@@ -310,7 +333,7 @@ def generate(settings_path: Path, port: int) -> None:
     except ValueError as exc:
         raise SystemExit(str(exc)) from exc
     router_config = router_module.load_router_config(Path(settings_path).expanduser())
-    _publish_catalog(models, router_config)
+    _publish_catalog(models, router_config, settings_path)
     write_config(models, CONFIG_PATH, CATALOG_PATH, port)
     discovered_count = sum(1 for model in models if model.raw.get("discovered"))
     print(f"Generated {len(models)} model entries ({discovered_count} auto-discovered):")
@@ -724,7 +747,7 @@ def sync_desktop(settings_path: Path, port: int, model_slug: str | None = None, 
     except ValueError as exc:
         raise SystemExit(str(exc)) from exc
     router_config = router_module.load_router_config(Path(settings_path).expanduser())
-    desktop_catalog = _publish_catalog(models, router_config)
+    desktop_catalog = _publish_catalog(models, router_config, settings_path)
     write_config(models, CONFIG_PATH, CATALOG_PATH, port)
     if install_config:
         install_codex_config(settings_path, port, model_slug)
