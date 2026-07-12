@@ -336,6 +336,44 @@ def test_responses_to_chat_preserves_input_images_for_vision_models():
     ]
 
 
+def test_responses_to_chat_normalises_original_image_detail():
+    """Codex Desktop sends `detail: "original"` on input_image items, but
+    "original" is not a valid OpenAI Chat Completions value. Providers like
+    Kimi K2.6 (via Ark) reject it with:
+
+    The parameter `messages.content.image_url.detail` specified in the
+    request are not valid: invalid value: `original`, supported values
+    are: `low`, `high`, `xhigh`, and `auto`.
+
+    The shim must translate ``original`` to ``high`` (the closest standard
+    OpenAI value — "full resolution") rather than passing it through verbatim.
+    """
+    body = {
+        "model": "slug",
+        "input": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": "Describe the screenshot"},
+                    {"type": "input_image", "image_url": "data:image/png;base64,ZZZ", "detail": "original"},
+                ],
+            }
+        ],
+    }
+
+    out = responses_to_chat(body, "vision-model")
+
+    assert out["messages"] == [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "Describe the screenshot"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,ZZZ", "detail": "high"}},
+            ],
+        }
+    ]
+
+
 def test_computer_call_output_screenshot_reaches_openai_chat_vision():
     body = {
         "model": "slug",

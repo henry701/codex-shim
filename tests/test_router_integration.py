@@ -554,7 +554,11 @@ async def test_candidate_without_credentials_is_skipped(tmp_path):
 # ---------------------------------------------------------------------------
 async def test_switch_model_accepts_auto_slug(tmp_path, monkeypatch):
     captured = {}
-    monkeypatch.setattr(server_module, "_set_active_model", lambda slug, display=None: captured.update({"slug": slug, "display": display}))
+    monkeypatch.setattr(
+        server_module,
+        "_set_active_model",
+        lambda slug, display=None: captured.update({"slug": slug, "display": display}),
+    )
     state = {}
     upstream = await make_upstream(state)
     server = ShimServer(_settings(tmp_path, str(upstream.make_url("/v1"))))

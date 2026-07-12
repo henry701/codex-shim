@@ -97,15 +97,27 @@ APP_ASAR_BACKUP_NAME = "app.asar.before-codex-shim-model-picker-patch"
 INFO_PLIST_BACKUP_NAME = "Info.plist.before-codex-shim-model-picker-patch"
 SYSTEM_CODEX_APP = Path("/Applications/Codex.app")
 USER_CODEX_APP = Path.home() / "Applications" / "Codex.app"
-MODEL_PICKER_NEEDLE = "let u=c.useHiddenModels&&o!==`amazonBedrock`,d;"
-MODEL_PICKER_REPLACEMENT = "let u=!1,d;"
-SIDEBAR_RECENT_THREADS_NEEDLE = (
-    "listRecentThreads({cursor:e,limit:t}){return this.params.requestClient.sendRequest(`thread/list`,"
-    "{limit:t,cursor:e,sortKey:this.recentConversationSortKey,modelProviders:null,archived:!1,sourceKinds:ke})}"
+MODEL_PICKER_NEEDLE = re.compile(
+    r"(?P<lhs>(?:let )?\w+=)"
+    r"(?:\w+\.useHiddenModels|\w+)"
+    r"&&\w+!==`amazonBedrock`"
+    r"(?P<sep>[,;])"
+)
+MODEL_PICKER_REPLACEMENT = r"\g<lhs>!1\g<sep>"
+MODEL_PICKER_APPLIED = re.compile(
+    r"(?:let )?\w+=!1[,;][^\n]{0,300}\.forEach"
+)
+
+SIDEBAR_RECENT_THREADS_NEEDLE = re.compile(
+    r"listRecentThreads\(\{cursor:e,limit:t(?:,useStateDbOnly:\w+(?:=!\d)?)?\}\)\{return this\.params\.requestClient\.sendRequest\(`thread/list`,"
+    r"\{limit:t,cursor:e,sortKey:this\.recentConversationSortKey,modelProviders:null,archived:!1,sourceKinds:(\w+)(?:,useStateDbOnly:\w+)?\}\)\}"
 )
 SIDEBAR_RECENT_THREADS_REPLACEMENT = (
-    "listRecentThreads({cursor:e,limit:t}){return this.params.requestClient.sendRequest(`thread/list`,"
-    "{limit:t,cursor:e,sortKey:this.recentConversationSortKey,modelProviders:[],archived:!1,sourceKinds:ke})}"
+    r"listRecentThreads({cursor:e,limit:t}){return this.params.requestClient.sendRequest(`thread/list`,"
+    r"{limit:t,cursor:e,sortKey:this.recentConversationSortKey,modelProviders:[],archived:!1,sourceKinds:\1})}"
+)
+SIDEBAR_RECENT_THREADS_APPLIED = re.compile(
+    r"\.recentConversationSortKey,modelProviders:\[\],archived:!1,sourceKinds:\w+"
 )
 
 
@@ -1475,24 +1487,30 @@ def _patch_codex_desktop_bundles(workdir: Path) -> bool | None:
     patches = [
         (
             "model picker allowlist filter",
-            ["model-queries-*.js", "*.js"],
+            [
+                "models-and-reasoning-efforts-*.js",
+                "model-queries-*.js",
+                "*.js",
+            ],
             MODEL_PICKER_NEEDLE,
             MODEL_PICKER_REPLACEMENT,
+            MODEL_PICKER_APPLIED,
         ),
         (
             "shim-mode sidebar provider filter",
             ["app-server-manager-signals-*.js", "*.js"],
             SIDEBAR_RECENT_THREADS_NEEDLE,
             SIDEBAR_RECENT_THREADS_REPLACEMENT,
+            SIDEBAR_RECENT_THREADS_APPLIED,
         ),
     ]
     changed = False
-    for label, globs, needle, replacement in patches:
-        bundle_file = _find_js_bundle(workdir, globs, needle, replacement)
+    for label, globs, needle, replacement, applied in patches:
+        bundle_file = _find_js_bundle(workdir, globs, needle, applied)
         if bundle_file is None:
             print(f"Could not find the expected {label} in Codex Desktop.", file=sys.stderr)
             return None
-        result = _replace_once(bundle_file, needle, replacement)
+        result = _replace_once(bundle_file, needle, replacement, applied)
         if result is None:
             print(f"Could not patch the expected {label} in Codex Desktop.", file=sys.stderr)
             return None
@@ -1504,7 +1522,12 @@ def _patch_codex_desktop_bundles(workdir: Path) -> bool | None:
     return changed
 
 
-def _find_js_bundle(workdir: Path, globs: list[str], needle: str, replacement: str) -> Path | None:
+def _find_js_bundle(
+    workdir: Path,
+    globs: list[str],
+    needle: re.Pattern[str],
+    applied: re.Pattern[str],
+) -> Path | None:
     assets_dir = workdir / "webview" / "assets"
     if not assets_dir.exists():
         return None
@@ -1513,19 +1536,26 @@ def _find_js_bundle(workdir: Path, globs: list[str], needle: str, replacement: s
         candidates.extend(p for p in sorted(assets_dir.glob(pattern)) if p not in candidates)
     for path in candidates:
         text = _read_text_lossy(path)
-        if needle in text or replacement in text:
+        if needle.search(text) or applied.search(text):
             return path
     return None
 
 
-def _replace_once(path: Path, needle: str, replacement: str) -> bool | None:
+def _replace_once(
+    path: Path,
+    needle: re.Pattern[str],
+    replacement: str,
+    applied: re.Pattern[str],
+) -> bool | None:
     text = _read_text_lossy(path)
-    if replacement in text:
-        return False
-    count = text.count(needle)
-    if count != 1:
+    matches = needle.findall(text)
+    if not matches:
+        if applied.search(text):
+            return False
         return None
-    path.write_text(text.replace(needle, replacement, 1))
+    if len(matches) != 1:
+        return None
+    path.write_text(needle.sub(replacement, text, count=1))
     return True
 
 
@@ -1577,7 +1607,7 @@ def _app_asar_is_patched(app_asar: Path) -> bool:
         text = app_asar.read_bytes().decode("utf-8", errors="ignore")
     except OSError:
         return False
-    return MODEL_PICKER_REPLACEMENT in text and SIDEBAR_RECENT_THREADS_REPLACEMENT in text
+    return MODEL_PICKER_APPLIED.search(text) is not None and SIDEBAR_RECENT_THREADS_APPLIED.search(text) is not None
 
 
 def _resign_codex_app(codex_app: Path = SYSTEM_CODEX_APP) -> None:

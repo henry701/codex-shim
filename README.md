@@ -1191,8 +1191,8 @@ codex-model [list|<slug>]    shortcut for `codex-shim model …`
 
 Global flags:
 
-- `--settings <path>`: used by catalog/model/start/app/codex flows.
-- `--port <port>`: used by daemon/provider flows.
+- `--settings <path>`: used by catalog/model/start/app/codex/doctor flows.
+- `--port <port>`: used by daemon/provider/doctor flows.
 
 `patch-app` and `restore-app` always target `/Applications/Codex.app`, do not
 use `--settings`, and exit with a clear error on Windows/Linux.
@@ -1268,10 +1268,18 @@ server is reachable.
 ### Shim will not start
 
 ```bash
+codex-shim doctor
 codex-shim status
 codex-shim doctor
 tail -n 80 .codex-shim/shim.log
 ```
+
+`codex-shim doctor` prints a read-only diagnostics report grouped by section
+(Python, dependencies, Codex CLI, settings, runtime files, daemon health,
+passthrough availability, proxy bypass, and Codex config). It never writes
+configuration, starts/stops the daemon, calls model providers, or prints API
+keys/tokens. It exits 1 only when a hard `FAIL` is detected; warnings are meant
+as local setup hints.
 
 Common causes:
 

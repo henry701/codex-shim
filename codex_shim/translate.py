@@ -679,6 +679,7 @@ def chat_completion_to_response(
                 "content": [{"type": "output_text", "text": text, "annotations": []}],
             }
         )
+    tool_types = tool_types or {}
     for call in message.get("tool_calls") or []:
         output.append(function_call_item_from_chat_tool(call, tool_types, tool_resolve))
     return {
@@ -1045,6 +1046,12 @@ def _chat_image_part(part: dict[str, Any]) -> dict[str, Any] | None:
         return None
     image_url: dict[str, Any] = {"url": url}
     detail = part.get("detail") or part.get("image_detail")
+    if detail and detail not in ("low", "auto", "high", "xhigh"):
+        # Codex Desktop sends "original" which is not a standard OpenAI Chat
+        # Completions value — providers like Kimi K2.6 reject it (400).
+        # Map it to "high" (the closest standard equivalent). Any unknown
+        # detail value falls back to "auto".
+        detail = "high" if detail == "original" else "auto"
     if detail:
         image_url["detail"] = _normalize_chat_image_detail(str(detail))
     return {"type": "image_url", "image_url": image_url}
