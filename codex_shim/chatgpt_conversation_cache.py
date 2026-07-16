@@ -34,6 +34,35 @@ def session_key_from_headers(headers: Mapping[str, str]) -> str:
     return _UNSCOPED_SESSION_KEY
 
 
+def thread_id_from_headers(headers: Mapping[str, str]) -> str | None:
+    """Codex Desktop thread id for subagent isolation.
+
+    Prefer explicit ``thread-id``, then ``x-codex-turn-metadata.thread_id``,
+    then the thread portion of ``x-codex-window-id`` (``<thread>:<window>``).
+    Parent and spawned reviewer threads share ``session_id`` but have distinct
+    ``thread_id`` values — callers that must not cross subagent boundaries
+    should use this, not ``session_key_from_headers``.
+    """
+    for name in ("thread-id", "Thread-Id"):
+        raw = headers.get(name)
+        if isinstance(raw, str) and raw.strip():
+            return raw.strip()
+    meta_raw = headers.get("x-codex-turn-metadata") or headers.get("X-Codex-Turn-Metadata")
+    if isinstance(meta_raw, str) and meta_raw.strip():
+        try:
+            meta = json.loads(meta_raw)
+        except json.JSONDecodeError:
+            meta = None
+        if isinstance(meta, dict):
+            thread_id = meta.get("thread_id")
+            if isinstance(thread_id, str) and thread_id.strip():
+                return thread_id.strip()
+    window = headers.get("x-codex-window-id") or headers.get("X-Codex-Window-Id")
+    if isinstance(window, str) and window.strip():
+        return window.strip().split(":", 1)[0]
+    return None
+
+
 def sanitize_path_segment(value: str) -> str:
     cleaned = value.replace("/", "_").replace("\\", "_").replace("..", "_")
     cleaned = _UNSAFE_SEGMENT.sub("_", cleaned).strip("._")

@@ -13,6 +13,7 @@ from codex_shim.chatgpt_conversation_cache import (
     sanitize_path_segment,
     sanitize_response_filename,
     session_key_from_headers,
+    thread_id_from_headers,
 )
 
 
@@ -29,6 +30,18 @@ def test_session_key_unscoped_when_missing(capsys):
     assert session_key_from_headers({}) == "_unscoped"
     captured = capsys.readouterr()
     assert captured.out.count("_unscoped partition") == 1
+
+
+def test_thread_id_from_turn_metadata_and_window():
+    assert thread_id_from_headers({"thread-id": "thread-explicit"}) == "thread-explicit"
+    assert (
+        thread_id_from_headers(
+            {"x-codex-turn-metadata": json.dumps({"thread_id": "thread-meta", "session_id": "sess"})}
+        )
+        == "thread-meta"
+    )
+    assert thread_id_from_headers({"x-codex-window-id": "thread-window:13"}) == "thread-window"
+    assert thread_id_from_headers({}) is None
 
 
 def test_sanitize_response_filename():

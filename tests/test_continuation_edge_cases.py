@@ -668,6 +668,127 @@ async def test_byok_model_swap_uses_separate_upstream_lanes(tmp_path, chatgpt_ca
         await client_b.close()
 
 
+@pytest.mark.asyncio
+async def test_parent_http_does_not_close_other_thread_upstream_ws(
+    monkeypatch, tmp_path, auth_present,
+):
+    """Parent wait_agent HTTP must not kill a concurrent reviewer subagent WS upstream."""
+    parent_headers = {
+        "x-codex-window-id": "parent-thread:13",
+        "x-codex-turn-metadata": json.dumps(
+            {"session_id": "shared-session", "thread_id": "parent-thread"}
+        ),
+    }
+    reviewer_headers = {
+        "x-codex-window-id": "reviewer-thread:0",
+        "x-codex-turn-metadata": json.dumps(
+            {
+                "session_id": "shared-session",
+                "thread_id": "reviewer-thread",
+                "parent_thread_id": "parent-thread",
+                "subagent_kind": "thread_spawn",
+            }
+        ),
+    }
+
+    state = MockUpstreamWsState(
+        response_sequences=[
+            [
+                {"type": "response.created", "response": {"id": "resp_reviewer_1", "model": "gpt-5.5"}},
+                {"type": "response.completed", "response": {"id": "resp_reviewer_1", "model": "gpt-5.5", "status": "completed"}},
+            ],
+            [
+                {"type": "response.created", "response": {"id": "resp_reviewer_2", "model": "gpt-5.5"}},
+                {"type": "response.completed", "response": {"id": "resp_reviewer_2", "model": "gpt-5.5", "status": "completed"}},
+            ],
+        ]
+    )
+    upstream_state, upstream_client = await start_mock_upstream_ws(state)
+    _patch_chatgpt_ws_url(monkeypatch, _ws_url_from_test_client(upstream_client))
+
+    class FakeHttpUpstream:
+        status = 200
+        content_type = "text/event-stream"
+        headers = {}
+
+        def __init__(self) -> None:
+            self.content = _FakeSseContent(
+                [
+                    b'data: {"type":"response.created","response":{"id":"resp_parent","model":"gpt-5.5"}}\n\n',
+                    b'data: {"type":"response.completed","response":{"id":"resp_parent","model":"gpt-5.5","status":"completed"}}\n\n',
+                ]
+            )
+
+        def release(self) -> None:
+            pass
+
+    async def fake_post(self, url, json=None, headers=None):
+        return FakeHttpUpstream()
+
+    monkeypatch.setattr("codex_shim.server.ClientSession.post", fake_post)
+
+    settings = tmp_path / "settings.json"
+    settings.write_text("{}")
+    shim = ShimServer(settings)
+    shim_client = TestClient(TestServer(shim.app()))
+    await shim_client.start_server()
+    try:
+        reviewer_ws = await shim_client.ws_connect("/v1/responses", headers=reviewer_headers)
+        await reviewer_ws.send_json(
+            {
+                "type": "response.create",
+                "model": "codex-gpt-5-5",
+                "input": [{"type": "message", "role": "user", "content": "review"}],
+                "stream": True,
+            }
+        )
+        for _ in range(2):
+            msg = await reviewer_ws.receive(timeout=2)
+            assert msg.type.name == "TEXT"
+        assert len(upstream_state.handshakes) == 1
+
+        await shim_client.post(
+            "/v1/responses",
+            json={
+                "model": "codex-gpt-5-5",
+                "input": [{"type": "message", "role": "user", "content": "wait_agent"}],
+                "stream": True,
+            },
+            headers=parent_headers,
+        )
+
+        reviewer_sessions = [
+            p for p in shim._active_ws_passthroughs.values() if p.matches_thread("reviewer-thread")
+        ]
+        assert len(reviewer_sessions) == 1
+        reviewer = reviewer_sessions[0]
+        assert len(reviewer.upstream_by_url) == 1
+        upstream_url = next(iter(reviewer.upstream_by_url))
+        upstream = reviewer.upstream_by_url[upstream_url]
+        assert not upstream.closed
+        assert reviewer.last_upstream_chained_response_id(upstream_url) == "resp_reviewer_1"
+
+        await reviewer_ws.send_json(
+            {
+                "type": "response.create",
+                "model": "codex-gpt-5-5",
+                "previous_response_id": "resp_reviewer_1",
+                "input": [{"type": "message", "role": "user", "content": "continue"}],
+                "stream": True,
+            }
+        )
+        for _ in range(2):
+            msg = await reviewer_ws.receive(timeout=2)
+            assert msg.type.name == "TEXT"
+
+        assert len(upstream_state.handshakes) == 1
+        assert upstream_state.received_frames[1]["previous_response_id"] == "resp_reviewer_1"
+        await reviewer_ws.close()
+    finally:
+        await shim_client.close()
+        await upstream_client.close()
+
+
 class _FakeSseContent:
     def __init__(self, chunks: list[bytes]) -> None:
         self._chunks = list(chunks)

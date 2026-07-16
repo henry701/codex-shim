@@ -73,7 +73,7 @@ from .cursor_passthrough import (
     resolve_cursor_workspace,
 )
 from .catalog import sort_catalog_entries
-from .chatgpt_conversation_cache import ChatgptConversationCache, session_key_from_headers
+from .chatgpt_conversation_cache import ChatgptConversationCache, session_key_from_headers, thread_id_from_headers
 from .continuation_policy import (
     ContinuationRoute,
     ContinuationSurface,
@@ -198,10 +198,19 @@ class ShimServer:
     def _unregister_ws_passthrough(self, passthrough: WsPassthroughSession) -> None:
         self._active_ws_passthroughs.pop(id(passthrough), None)
 
-    async def _invalidate_chatgpt_ws_native_chains(self) -> None:
+    async def _invalidate_chatgpt_ws_native_chains(self, *, thread_id: str | None = None) -> None:
+        """Clear native prev_id chain tracking for matching inbound WS sessions.
+
+        Important: do **not** close upstream sockets here. Parent HTTP turns and
+        spawned reviewer subagents run concurrently; a global close was killing
+        the reviewer's live upstream WS and leaving the parent stuck in
+        wait_agent/list_agents loops. Chain-id clearing is enough — the next WS
+        turn expands when ``previous_response_id`` no longer matches.
+        """
         for passthrough in list(self._active_ws_passthroughs.values()):
+            if thread_id is not None and not passthrough.matches_thread(thread_id):
+                continue
             passthrough.invalidate_native_chain(CHATGPT_WS_URL)
-            await passthrough.close_upstream(CHATGPT_WS_URL)
 
     def _chatgpt_compaction_lock(self, session_key: str) -> asyncio.Lock:
         lock = self._chatgpt_compaction_locks.get(session_key)
@@ -1134,6 +1143,7 @@ class ShimServer:
         )
         upstream_url = CHATGPT_WS_URL
         source = "chatgpt-passthrough-ws"
+        passthrough.note_thread_id(thread_id_from_headers(request.headers))
 
         try:
             _, connection_reused = await passthrough.connect_upstream(
@@ -1263,7 +1273,7 @@ class ShimServer:
         http_session: ClientSession,
     ) -> None:
         session_key = self._session_key(request)
-        await self._invalidate_chatgpt_ws_native_chains()
+        await self._invalidate_chatgpt_ws_native_chains(thread_id=thread_id_from_headers(request.headers))
         raw_body = {k: v for k, v in payload.items() if k != "type"}
         forwarded = self._prepare_chatgpt_passthrough_body_http(raw_body, session_key=session_key)
         forwarded["model"] = target.upstream_model
@@ -2200,7 +2210,7 @@ class ShimServer:
                 return fallback
             raise web.HTTPUnauthorized(text="auth.json has no access_token")
         session_key = self._session_key(request)
-        await self._invalidate_chatgpt_ws_native_chains()
+        await self._invalidate_chatgpt_ws_native_chains(thread_id=thread_id_from_headers(request.headers))
         raw_body = body
         forwarded = self._prepare_chatgpt_passthrough_body_http(body, session_key=session_key)
         if collect_stream:

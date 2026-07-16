@@ -58,12 +58,22 @@ class WsPassthroughSession:
     client_ws: web.WebSocketResponse
     upstream_by_url: dict[str, ClientWebSocketResponse] = field(default_factory=dict)
     last_chained_response_id_by_url: dict[str, str] = field(default_factory=dict)
+    thread_ids: set[str] = field(default_factory=set)
 
     @property
     def upstream_ws(self) -> ClientWebSocketResponse | None:
         if len(self.upstream_by_url) == 1:
             return next(iter(self.upstream_by_url.values()))
         return None
+
+    def note_thread_id(self, thread_id: str | None) -> None:
+        if thread_id:
+            self.thread_ids.add(thread_id)
+
+    def matches_thread(self, thread_id: str | None) -> bool:
+        if not thread_id:
+            return False
+        return thread_id in self.thread_ids
 
     def last_upstream_chained_response_id(self, upstream_url: str) -> str | None:
         return self.last_chained_response_id_by_url.get(upstream_url)
