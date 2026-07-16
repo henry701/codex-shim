@@ -10,8 +10,9 @@ import shutil
 import subprocess
 import time
 from typing import Any
+from datetime import datetime, timezone
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlparse
+from urllib.parse import urlencode, urlparse
 from urllib.request import Request, urlopen
 from pathlib import Path
 
@@ -26,6 +27,8 @@ MODELS_DEV_OPENCODE_PROVIDER = "opencode"
 OPENAI_MODELS_URL = "https://api.openai.com/v1/models"
 CHATGPT_CODEX_MODELS_URL = "https://chatgpt.com/backend-api/codex/models"
 DEFAULT_CHATGPT_CODEX_CLIENT_VERSION = "0.144.1"
+CODEX_OAUTH_TOKEN_URL = "https://auth.openai.com/oauth/token"
+CODEX_OAUTH_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
 DISCOVER_INDEX_BASE = 10_000
 
 _NVIDIA_SKIP_RE = re.compile(
@@ -351,6 +354,108 @@ def _load_codex_auth_tokens(auth_path: Any | None = None) -> tuple[str, str] | N
     return access_token, account_id
 
 
+def refresh_codex_auth_tokens(auth_path: Any | None = None, *, timeout: float = 20.0) -> bool:
+    """Refresh Codex OAuth tokens in ``~/.codex/auth.json``. Returns True on success."""
+    from .settings import DEFAULT_CODEX_AUTH
+
+    expanded = Path(auth_path if auth_path is not None else DEFAULT_CODEX_AUTH).expanduser()
+    if not expanded.exists():
+        return False
+    try:
+        data = json.loads(expanded.read_text())
+    except (OSError, json.JSONDecodeError):
+        return False
+    if not isinstance(data, dict):
+        return False
+    tokens = data.get("tokens")
+    if not isinstance(tokens, dict):
+        return False
+    refresh_token = str(tokens.get("refresh_token") or "").strip()
+    if not refresh_token:
+        logger.warning("Codex auth refresh skipped: no refresh_token in %s", expanded)
+        return False
+    body = urlencode(
+        {
+            "grant_type": "refresh_token",
+            "refresh_token": refresh_token,
+            "client_id": CODEX_OAUTH_CLIENT_ID,
+        }
+    ).encode("utf-8")
+    request = Request(
+        CODEX_OAUTH_TOKEN_URL,
+        data=body,
+        headers={"Content-Type": "application/x-www-form-urlencoded", "Accept": "application/json"},
+        method="POST",
+    )
+    try:
+        with urlopen(request, timeout=timeout) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except (OSError, URLError, HTTPError, TimeoutError, json.JSONDecodeError, ValueError) as exc:
+        logger.warning("Codex auth refresh failed: %s", exc)
+        return False
+    if not isinstance(payload, dict):
+        return False
+    access_token = str(payload.get("access_token") or "").strip()
+    if not access_token:
+        logger.warning("Codex auth refresh returned no access_token")
+        return False
+    next_tokens = dict(tokens)
+    next_tokens["access_token"] = access_token
+    if payload.get("refresh_token"):
+        next_tokens["refresh_token"] = str(payload["refresh_token"])
+    if payload.get("id_token"):
+        next_tokens["id_token"] = str(payload["id_token"])
+    data["tokens"] = next_tokens
+    data["last_refresh"] = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    try:
+        expanded.write_text(json.dumps(data, indent=2) + "\n")
+    except OSError as exc:
+        logger.warning("Codex auth refresh write failed: %s", exc)
+        return False
+    logger.info("Refreshed Codex OAuth tokens in %s", expanded)
+    return True
+
+
+def persist_chatgpt_models_cache(
+    models: list[dict[str, Any]],
+    cache_path: Any | None = None,
+    *,
+    client_version: str | None = None,
+) -> Path | None:
+    """Write a successful ChatGPT Codex /models payload to ``models_cache.json``."""
+    from .settings import DEFAULT_CODEX_MODELS_CACHE
+
+    if not models:
+        return None
+    path = Path(cache_path if cache_path is not None else DEFAULT_CODEX_MODELS_CACHE).expanduser()
+    version = (
+        client_version
+        or os.environ.get("CODEX_SHIM_CHATGPT_MODELS_CLIENT_VERSION")
+        or DEFAULT_CHATGPT_CODEX_CLIENT_VERSION
+    ).strip()
+    existing: dict[str, Any] = {}
+    if path.exists():
+        try:
+            loaded = json.loads(path.read_text())
+            if isinstance(loaded, dict):
+                existing = loaded
+        except (OSError, json.JSONDecodeError):
+            existing = {}
+    payload = {
+        "fetched_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        "etag": existing.get("etag"),
+        "client_version": version,
+        "models": [dict(model) for model in models if isinstance(model, dict)],
+    }
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(payload, indent=2) + "\n")
+    except OSError as exc:
+        logger.warning("Failed to persist ChatGPT models cache to %s: %s", path, exc)
+        return None
+    return path
+
+
 def _parse_chatgpt_codex_models_payload(payload: Any) -> list[dict[str, Any]]:
     if not isinstance(payload, dict):
         return []
@@ -373,27 +478,7 @@ def _parse_chatgpt_codex_models_payload(payload: Any) -> list[dict[str, Any]]:
     return models
 
 
-def fetch_chatgpt_codex_backend_models(
-    *,
-    client_version: str | None = None,
-    auth_path: Any | None = None,
-    timeout: float = 20.0,
-    retries: int = 3,
-    backoff_base: float = 0.5,
-    backoff_factor: float = 2.0,
-) -> list[dict[str, Any]]:
-    """List ChatGPT Codex models from chatgpt.com/backend-api/codex/models.
-
-    Uses the Codex OAuth token in ``~/.codex/auth.json``. Retries transient HTTP
-    failures with exponential backoff. Returns ``[]`` when auth is missing or
-    the request ultimately fails.
-    """
-    auth = _load_codex_auth_tokens(auth_path)
-    if auth is None:
-        return []
-    access_token, account_id = auth
-    version = (client_version or os.environ.get("CODEX_SHIM_CHATGPT_MODELS_CLIENT_VERSION") or DEFAULT_CHATGPT_CODEX_CLIENT_VERSION).strip()
-    url = f"{CHATGPT_CODEX_MODELS_URL}?client_version={version}"
+def _chatgpt_codex_models_headers(access_token: str, account_id: str, version: str) -> dict[str, str]:
     headers = {
         "Authorization": f"Bearer {access_token}",
         "Accept": "application/json",
@@ -402,6 +487,33 @@ def fetch_chatgpt_codex_backend_models(
     }
     if account_id:
         headers["ChatGPT-Account-Id"] = account_id
+    return headers
+
+
+def fetch_chatgpt_codex_backend_models(
+    *,
+    client_version: str | None = None,
+    auth_path: Any | None = None,
+    timeout: float = 20.0,
+    retries: int = 3,
+    backoff_base: float = 0.5,
+    backoff_factor: float = 2.0,
+    refresh_on_unauthorized: bool = True,
+) -> list[dict[str, Any]]:
+    """List ChatGPT Codex models from chatgpt.com/backend-api/codex/models.
+
+    Uses the Codex OAuth token in ``~/.codex/auth.json``. On HTTP 401, refreshes
+    the OAuth token once and retries. Retries transient HTTP failures with
+    exponential backoff. Returns ``[]`` when auth is missing or the request
+    ultimately fails.
+    """
+    auth = _load_codex_auth_tokens(auth_path)
+    if auth is None:
+        return []
+    access_token, account_id = auth
+    version = (client_version or os.environ.get("CODEX_SHIM_CHATGPT_MODELS_CLIENT_VERSION") or DEFAULT_CHATGPT_CODEX_CLIENT_VERSION).strip()
+    url = f"{CHATGPT_CODEX_MODELS_URL}?client_version={version}"
+    headers = _chatgpt_codex_models_headers(access_token, account_id, version)
     try:
         payload = fetch_http_json(
             url,
@@ -411,7 +523,29 @@ def fetch_chatgpt_codex_backend_models(
             backoff_base=backoff_base,
             backoff_factor=backoff_factor,
         )
-    except (OSError, URLError, HTTPError, TimeoutError, json.JSONDecodeError, ValueError) as exc:
+    except HTTPError as exc:
+        if refresh_on_unauthorized and exc.code == 401 and refresh_codex_auth_tokens(auth_path, timeout=timeout):
+            auth = _load_codex_auth_tokens(auth_path)
+            if auth is None:
+                return []
+            access_token, account_id = auth
+            headers = _chatgpt_codex_models_headers(access_token, account_id, version)
+            try:
+                payload = fetch_http_json(
+                    url,
+                    headers=headers,
+                    timeout=timeout,
+                    retries=retries,
+                    backoff_base=backoff_base,
+                    backoff_factor=backoff_factor,
+                )
+            except (OSError, URLError, HTTPError, TimeoutError, json.JSONDecodeError, ValueError) as retry_exc:
+                logger.warning("ChatGPT Codex /models fetch failed after auth refresh: %s", retry_exc)
+                return []
+        else:
+            logger.warning("ChatGPT Codex /models fetch failed after retries: %s", exc)
+            return []
+    except (OSError, URLError, TimeoutError, json.JSONDecodeError, ValueError) as exc:
         logger.warning("ChatGPT Codex /models fetch failed after retries: %s", exc)
         return []
     return _parse_chatgpt_codex_models_payload(payload)

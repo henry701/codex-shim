@@ -21,6 +21,15 @@ def _disable_model_discovery_by_default(monkeypatch, request):
 
 
 @pytest.fixture(autouse=True)
+def _isolate_published_desktop_catalog(monkeypatch, tmp_path_factory):
+    # Keep catalog sync tests from reading the developer's live Desktop catalog.
+    monkeypatch.setattr(
+        "codex_shim.settings.DEFAULT_DESKTOP_MODEL_CATALOG",
+        tmp_path_factory.mktemp("published-catalog") / "missing-custom_model_catalog.json",
+    )
+
+
+@pytest.fixture(autouse=True)
 def _disable_cursor_passthrough_by_default(monkeypatch, request):
     if "cursor_present" in request.fixturenames:
         return

@@ -178,7 +178,7 @@ def _parse_cursor_list_models_output(output: str) -> dict[str, CursorCatalogMode
         if not match:
             continue
         upstream_id, display_name = match.group(1).strip(), match.group(2).strip()
-        if not upstream_id or upstream_id.lower() == "auto":
+        if not upstream_id:
             continue
         catalog_slug = cursor_catalog_slug(upstream_id)
         model = CursorCatalogModel(

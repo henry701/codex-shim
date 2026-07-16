@@ -764,8 +764,15 @@ def sync_desktop(settings_path: Path, port: int, model_slug: str | None = None, 
     if install_config:
         install_codex_config(settings_path, port, model_slug)
     discovered_count = sum(1 for model in models if model.raw.get("discovered"))
-    catalog_models = len(json.loads(desktop_catalog.read_text()).get("models", []))
+    catalog_payload = json.loads(desktop_catalog.read_text())
+    catalog_models = len(catalog_payload.get("models", []))
+    chatgpt_count = sum(
+        1
+        for entry in catalog_payload.get("models", [])
+        if str(entry.get("slug") or "").startswith("codex-")
+    )
     print(f"Synced {catalog_models} Desktop catalog entries ({discovered_count} auto-discovered routes):")
+    print(f"  chatgpt passthrough: {chatgpt_count}")
     print(f"  desktop catalog: {desktop_catalog}")
     if install_config:
         print(f"  codex config:    {CODEX_CONFIG_PATH}")

@@ -8,7 +8,7 @@ from pathlib import Path
 import re
 from typing import Any
 
-from .catalog_slugs import CHATGPT_CATALOG_SLUG, CHATGPT_UPSTREAM_DEFAULT, codex_catalog_slug
+from .catalog_slugs import CHATGPT_CATALOG_SLUG, CHATGPT_UPSTREAM_DEFAULT, codex_catalog_slug, upstream_from_codex_catalog_slug
 
 logger = logging.getLogger(__name__)
 
@@ -17,12 +17,16 @@ DEFAULT_CHATGPT_CONVERSATIONS_DIR = Path.home() / ".codex-shim" / "chatgpt-conve
 DEFAULT_CURSOR_API_KEY_FILE = Path.home() / ".codex-shim" / "cursor-api-key"
 DEFAULT_CODEX_AUTH = Path.home() / ".codex" / "auth.json"
 DEFAULT_CODEX_MODELS_CACHE = Path.home() / ".codex" / "models_cache.json"
+DEFAULT_DESKTOP_MODEL_CATALOG = Path.home() / ".codex" / "custom_model_catalog.json"
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8765
 PROVIDER_NAME = "codex_shim"
 OPENAI_PROVIDER_ID = "openai"
 CHATGPT_MODEL_SLUG = CHATGPT_UPSTREAM_DEFAULT
 FALLBACK_CHATGPT_PASSTHROUGH_SLUGS = (
+    "gpt-5.6-terra",
+    "gpt-5.6-sol",
+    "gpt-5.6-luna",
     "gpt-5.5",
     "gpt-5.4",
     "gpt-5.4-mini",
@@ -32,6 +36,9 @@ FALLBACK_CHATGPT_PASSTHROUGH_SLUGS = (
     "codex-auto-review",
 )
 FALLBACK_CHATGPT_DISPLAY_NAMES = {
+    "gpt-5.6-terra": "GPT-5.6-Terra",
+    "gpt-5.6-sol": "GPT-5.6-Sol",
+    "gpt-5.6-luna": "GPT-5.6-Luna",
     "gpt-5.5": "GPT-5.5",
     "gpt-5.4": "gpt-5.4",
     "gpt-5.4-mini": "GPT-5.4-Mini",
@@ -146,6 +153,43 @@ def _load_chatgpt_cache_catalog_models(cache_path: Path | None = None) -> list[d
     return [dict(model) for model in models if isinstance(model, dict) and _is_listed_gpt_model(model)]
 
 
+def _load_published_chatgpt_catalog_models(catalog_path: Path | None = None) -> list[dict[str, Any]]:
+    """Recover ChatGPT passthrough models from a previously published Desktop catalog.
+
+    Used when live ``/models`` fails so ``sync-desktop`` on boot cannot regress
+    away GPT-5.6 (etc.) that were published on a prior successful sync.
+    """
+    path = Path(catalog_path or DEFAULT_DESKTOP_MODEL_CATALOG).expanduser()
+    if not path.exists():
+        return []
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return []
+    models = data.get("models") if isinstance(data, dict) else None
+    if not isinstance(models, list):
+        return []
+    recovered: list[dict[str, Any]] = []
+    for entry in models:
+        if not isinstance(entry, dict):
+            continue
+        slug = str(entry.get("slug") or "").strip()
+        if not slug.startswith("codex-"):
+            continue
+        if entry.get("visibility") == "hidden":
+            continue
+        upstream = str(entry.get("_upstream_model") or "").strip() or upstream_from_codex_catalog_slug(slug)
+        recovered.append(
+            {
+                **{key: value for key, value in entry.items() if not str(key).startswith("_")},
+                "slug": upstream,
+                "display_name": entry.get("display_name") or upstream,
+                "visibility": entry.get("visibility") or "list",
+            }
+        )
+    return recovered
+
+
 def _codex_passthrough_entry(
     upstream: str,
     display_name: str,
@@ -169,53 +213,79 @@ def _codex_passthrough_entry(
     )
 
 
-def load_chatgpt_passthrough_catalog_models(cache_path: Path | None = None) -> list[dict[str, Any]]:
+def _entries_from_upstream_models(upstream_models: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    from .naming import display_name_from_slug
+
+    by_upstream: dict[str, dict[str, Any]] = {}
+    for entry in upstream_models:
+        upstream = str(entry.get("slug") or "").strip()
+        if not upstream:
+            continue
+        by_upstream[upstream] = _codex_passthrough_entry(
+            upstream,
+            str(
+                entry.get("display_name")
+                or FALLBACK_CHATGPT_DISPLAY_NAMES.get(upstream, display_name_from_slug(upstream))
+            ),
+            cache_entry=entry,
+        )
+    return sorted(by_upstream.values(), key=lambda item: str(item.get("slug") or ""))
+
+
+def _merge_upstream_model_lists(*groups: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Union model rows by upstream slug; earlier groups win on conflicts."""
+    merged: dict[str, dict[str, Any]] = {}
+    for group in groups:
+        for entry in group:
+            if not isinstance(entry, dict):
+                continue
+            upstream = str(entry.get("slug") or "").strip()
+            if not upstream or upstream in merged:
+                continue
+            merged[upstream] = dict(entry)
+    return list(merged.values())
+
+
+def load_chatgpt_passthrough_catalog_models(
+    cache_path: Path | None = None,
+    *,
+    catalog_path: Path | None = None,
+) -> list[dict[str, Any]]:
     """Build ChatGPT passthrough catalog entries.
 
     Preference order:
-      1. Live ``chatgpt.com/backend-api/codex/models`` (Codex OAuth token)
-      2. Local ``~/.codex/models_cache.json`` (with a warning — often stale when
-         Codex is pointed at the shim via ``openai_base_url``)
+      1. Live ``chatgpt.com/backend-api/codex/models`` (Codex OAuth token; refreshes on 401)
+         — also persists into ``models_cache.json`` so boot-time syncs stay fresh
+      2. Union of local ``models_cache.json`` + previously published Desktop catalog
+         (anti-regression when live fetch fails during ``ExecStartPre sync-desktop``)
       3. Hardcoded ``FALLBACK_CHATGPT_PASSTHROUGH_SLUGS``
     """
-    from .discover import fetch_chatgpt_codex_backend_models
-    from .naming import display_name_from_slug
+    from .discover import fetch_chatgpt_codex_backend_models, persist_chatgpt_models_cache
 
     backend_models = fetch_chatgpt_codex_backend_models()
     if backend_models:
-        by_upstream: dict[str, dict[str, Any]] = {}
-        for entry in backend_models:
-            upstream = str(entry.get("slug") or "").strip()
-            if not upstream:
-                continue
-            by_upstream[upstream] = _codex_passthrough_entry(
-                upstream,
-                str(entry.get("display_name") or FALLBACK_CHATGPT_DISPLAY_NAMES.get(upstream, display_name_from_slug(upstream))),
-                cache_entry=entry,
-            )
-        if by_upstream:
-            return sorted(by_upstream.values(), key=lambda entry: str(entry.get("slug") or ""))
+        persist_chatgpt_models_cache(backend_models, cache_path)
+        return _entries_from_upstream_models(backend_models)
 
     cache_models = _load_chatgpt_cache_catalog_models(cache_path)
-    if cache_models:
+    published_models = _load_published_chatgpt_catalog_models(catalog_path)
+    merged = _merge_upstream_model_lists(cache_models, published_models)
+    if merged:
+        sources = []
+        if cache_models:
+            sources.append("models_cache.json")
+        if published_models:
+            sources.append("published custom_model_catalog.json")
         logger.warning(
-            "ChatGPT Codex backend /models unavailable; falling back to local models_cache.json "
-            "(often stale when Codex openai_base_url points at the shim)"
+            "ChatGPT Codex backend /models unavailable; falling back to %s "
+            "(%s upstream models; often needed when ExecStartPre sync-desktop races token refresh)",
+            " + ".join(sources),
+            len(merged),
         )
-        by_upstream = {}
-        for entry in cache_models:
-            upstream = str(entry.get("slug") or "").strip()
-            if upstream:
-                by_upstream[upstream] = _codex_passthrough_entry(
-                    upstream,
-                    str(entry.get("display_name") or upstream),
-                    cache_entry=entry,
-                )
-        if by_upstream:
-            return sorted(by_upstream.values(), key=lambda entry: str(entry.get("slug") or ""))
+        return _entries_from_upstream_models(merged)
 
     logger.warning(
-        "ChatGPT Codex backend /models unavailable and models_cache.json empty/missing; "
+        "ChatGPT Codex backend /models unavailable and no local chatgpt catalog/cache; "
         "using hardcoded FALLBACK_CHATGPT_PASSTHROUGH_SLUGS"
     )
     return [
