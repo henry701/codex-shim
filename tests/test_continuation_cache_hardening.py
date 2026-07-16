@@ -254,9 +254,9 @@ async def test_prev_id_retry_closes_upstream_before_reconnect(
     close_calls: list[bool] = []
     original_close = WsPassthroughSession.close_upstream
 
-    async def tracking_close(self: WsPassthroughSession) -> None:
+    async def tracking_close(self: WsPassthroughSession, upstream_url: str | None = None) -> None:
         close_calls.append(True)
-        await original_close(self)
+        await original_close(self, upstream_url)
 
     monkeypatch.setattr(WsPassthroughSession, "close_upstream", tracking_close)
 
@@ -318,7 +318,7 @@ async def test_prev_id_retry_closes_upstream_before_reconnect(
                 "stream": True,
             }
         )
-        for _ in range(3):
+        for _ in range(2):
             await ws.receive(timeout=2)
         await ws.close()
     finally:
@@ -337,8 +337,13 @@ async def test_prev_id_retry_reconnect_failure_falls_back_to_http_expanded(
     new_connect_attempts: list[str] = []
     original_connect = WsPassthroughSession.connect_upstream
 
-    async def counting_connect(self: WsPassthroughSession, url: str, headers: dict[str, str]):
-        if self.upstream_ws is not None and not self.upstream_ws.closed:
+    async def counting_connect(
+        self: WsPassthroughSession,
+        url: str,
+        headers: dict[str, str],
+    ):
+        existing = self.upstream_by_url.get(url)
+        if existing is not None and not existing.closed:
             return {}, True
         new_connect_attempts.append("new")
         if len(new_connect_attempts) > 1:
@@ -437,3 +442,100 @@ async def test_prev_id_retry_reconnect_failure_falls_back_to_http_expanded(
     assert body["input"][1]["call_id"] == "call_1"
     assert body["input"][2] == tool_output
     assert len(upstream_state.received_frames) == 2
+
+
+@pytest.mark.asyncio
+async def test_expand_retry_still_fails_falls_back_to_http(
+    monkeypatch, tmp_path, auth_present, chatgpt_cache_dir
+):
+    captured_http: dict[str, Any] = {}
+    session_headers = {"session-id": "ws-expand-fail"}
+    first_input = [{"type": "message", "role": "user", "content": "run"}]
+    tool_call = {
+        "type": "function_call",
+        "id": "fc_1",
+        "call_id": "call_1",
+        "name": "exec_command",
+        "arguments": "{}",
+    }
+    tool_output = {"type": "function_call_output", "call_id": "call_1", "output": "ok"}
+    cache = ChatgptConversationCache(chatgpt_cache_dir)
+    cache.put("ws-expand-fail", "resp_previous", [*first_input, tool_call])
+
+    prev_id_error = {
+        "type": "error",
+        "error": {
+            "code": "previous_response_not_found",
+            "message": "Previous response with id 'resp_previous' not found.",
+            "param": "previous_response_id",
+        },
+    }
+    state = MockUpstreamWsState(
+        response_sequences=[
+            [
+                {"type": "response.created", "response": {"id": "resp_previous", "model": "gpt-5.5"}},
+                {"type": "response.output_item.done", "response": {"id": "resp_previous"}, "item": tool_call},
+                {"type": "response.completed", "response": {"id": "resp_previous", "model": "gpt-5.5", "status": "completed"}},
+            ],
+            [prev_id_error],
+            [prev_id_error],
+        ]
+    )
+    upstream_state, upstream_client = await start_mock_upstream_ws(state)
+    _patch_chatgpt_ws_url(monkeypatch, _ws_url_from_test_client(upstream_client))
+
+    class FakeHttpUpstream:
+        status = 200
+        content_type = "text/event-stream"
+        headers = {}
+        content = _FakeSseContent(
+            [
+                b'data: {"type":"response.created","response":{"id":"resp_http","model":"gpt-5.5"}}\n\n',
+                b'data: {"type":"response.completed","response":{"id":"resp_http","model":"gpt-5.5","status":"completed"}}\n\n',
+            ]
+        )
+
+        def release(self) -> None:
+            pass
+
+    async def fake_post(self, url, json=None, headers=None):
+        captured_http["url"] = str(url)
+        captured_http["body"] = json
+        return FakeHttpUpstream()
+
+    monkeypatch.setattr("codex_shim.server.ClientSession.post", fake_post)
+
+    settings = tmp_path / "settings.json"
+    settings.write_text("{}")
+    shim_client = TestClient(TestServer(ShimServer(settings).app()))
+    await shim_client.start_server()
+    try:
+        ws = await shim_client.ws_connect("/v1/responses", headers=session_headers)
+        await ws.send_json(
+            {"type": "response.create", "model": "codex-gpt-5-5", "input": first_input, "stream": True}
+        )
+        for _ in range(3):
+            await ws.receive(timeout=2)
+
+        await ws.send_json(
+            {
+                "type": "response.create",
+                "model": "codex-gpt-5-5",
+                "previous_response_id": "resp_previous",
+                "input": [tool_output],
+                "stream": True,
+            }
+        )
+        for _ in range(2):
+            msg = await ws.receive(timeout=2)
+            assert msg.type == WSMsgType.TEXT
+        await ws.close()
+    finally:
+        await shim_client.close()
+        await upstream_client.close()
+
+    assert captured_http["body"] is not None
+    assert "previous_response_id" not in captured_http["body"]
+    assert captured_http["body"]["input"][0] == first_input[0]
+    assert len(upstream_state.received_frames) == 3
+    assert len(upstream_state.handshakes) == 2

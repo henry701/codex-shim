@@ -102,7 +102,9 @@ async def test_relay_rewrites_model_in_events():
     ]
     upstream_ws = FakeUpstreamWs(events)
 
-    session = WsPassthroughSession(client_session=AsyncMock(), client_ws=client_ws, upstream_ws=upstream_ws)
+    session = WsPassthroughSession(client_session=AsyncMock(), client_ws=client_ws)
+    url = "ws://example/v1/responses"
+    session.upstream_by_url[url] = upstream_ws
     sent: list[dict] = []
 
     async def capture(event: dict) -> None:
@@ -110,6 +112,7 @@ async def test_relay_rewrites_model_in_events():
 
     await session.relay_until_terminal(
         source="test-ws",
+        upstream_url=url,
         model_override="codex-gpt-5-5",
         rewrite_model=_rewrite_response_model,
         write_event=capture,
@@ -142,8 +145,14 @@ async def test_relay_records_usage_on_completed(monkeypatch):
     )
     upstream_ws = FakeUpstreamWs([payload])
 
-    session = WsPassthroughSession(client_session=AsyncMock(), client_ws=client_ws, upstream_ws=upstream_ws)
-    await session.relay_until_terminal(source="chatgpt-passthrough-ws", write_event=AsyncMock())
+    session = WsPassthroughSession(client_session=AsyncMock(), client_ws=client_ws)
+    url = "ws://example/v1/responses"
+    session.upstream_by_url[url] = upstream_ws
+    await session.relay_until_terminal(
+        source="chatgpt-passthrough-ws",
+        upstream_url=url,
+        write_event=AsyncMock(),
+    )
 
     assert observed[0]["source"] == "chatgpt-passthrough-ws"
     assert observed[0]["usage"]["input_tokens_details"]["cached_tokens"] == 2

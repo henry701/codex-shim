@@ -43,6 +43,18 @@ def test_codex_ws_native_on_reused_connection():
         surface=ContinuationSurface.WS,
         route=ContinuationRoute.CHATGPT_CODEX,
         upstream_connection_reused=True,
+        last_upstream_chained_response_id="resp_1",
+        body=body,
+    )
+
+
+def test_codex_ws_expand_when_chain_broken_on_reused_connection():
+    body = {"previous_response_id": "resp_2", "input": []}
+    assert should_expand_continuation(
+        surface=ContinuationSurface.WS,
+        route=ContinuationRoute.CHATGPT_CODEX,
+        upstream_connection_reused=True,
+        last_upstream_chained_response_id="resp_1",
         body=body,
     )
 

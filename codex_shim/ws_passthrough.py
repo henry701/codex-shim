@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import os
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable
 from urllib.parse import urljoin, urlparse, urlunparse
 
@@ -46,45 +46,74 @@ class WsPassthroughConnectError(Exception):
 
 @dataclass
 class WsPassthroughSession:
-    """Proxies client ``response.create`` frames to an upstream Responses WebSocket.
+    """One inbound client WebSocket paired with upstream WS lanes keyed by URL.
 
-    The Codex OAuth backend treats ``previous_response_id`` as **connection-scoped**:
-    chaining works only while ``upstream_ws`` stays open. A fresh upstream connect
-    requires cache expansion instead of native continuation.
+    Each inbound Desktop WS connection gets its own ``WsPassthroughSession``.
+    Within that session, upstream connections are keyed by upstream URL so model
+    swaps that change provider/base URL open a new lane, while swapping back reuses
+    an still-open lane and its native ``previous_response_id`` chain.
     """
 
     client_session: ClientSession
     client_ws: web.WebSocketResponse
-    upstream_ws: ClientWebSocketResponse | None = None
+    upstream_by_url: dict[str, ClientWebSocketResponse] = field(default_factory=dict)
+    last_chained_response_id_by_url: dict[str, str] = field(default_factory=dict)
+
+    @property
+    def upstream_ws(self) -> ClientWebSocketResponse | None:
+        if len(self.upstream_by_url) == 1:
+            return next(iter(self.upstream_by_url.values()))
+        return None
+
+    def last_upstream_chained_response_id(self, upstream_url: str) -> str | None:
+        return self.last_chained_response_id_by_url.get(upstream_url)
+
+    def note_chained_response(self, upstream_url: str, response_id: str | None) -> None:
+        if response_id:
+            self.last_chained_response_id_by_url[upstream_url] = response_id
+        else:
+            self.last_chained_response_id_by_url.pop(upstream_url, None)
+
+    def invalidate_native_chain(self, upstream_url: str | None = None) -> None:
+        if upstream_url is None:
+            self.last_chained_response_id_by_url.clear()
+            return
+        self.last_chained_response_id_by_url.pop(upstream_url, None)
 
     async def connect_upstream(self, url: str, headers: dict[str, str]) -> tuple[dict[str, str], bool]:
-        if self.upstream_ws is not None and not self.upstream_ws.closed:
+        existing = self.upstream_by_url.get(url)
+        if existing is not None and not existing.closed:
             return {}, True
         try:
-            self.upstream_ws = await self.client_session.ws_connect(url, headers=headers)
+            upstream_ws = await self.client_session.ws_connect(url, headers=headers)
         except Exception as exc:
-            status = getattr(exc, "status", None)
-            raise WsPassthroughConnectError(str(exc), status=status) from exc
-        upgrade_headers = forwardable_ws_upgrade_headers(upstream_headers_from_response(self.upstream_ws))
+            raise WsPassthroughConnectError(str(exc)) from exc
+        self.upstream_by_url[url] = upstream_ws
+        self.last_chained_response_id_by_url.pop(url, None)
+        upgrade_headers = forwardable_ws_upgrade_headers(upstream_headers_from_response(upstream_ws))
         print(f"[ws-passthrough] connected upstream url={url}", flush=True)
         return upgrade_headers, False
 
-    async def send_response_create(self, body: dict[str, Any]) -> None:
-        if self.upstream_ws is None or self.upstream_ws.closed:
+    async def send_response_create(self, body: dict[str, Any], *, upstream_url: str) -> None:
+        upstream_ws = self.upstream_by_url.get(upstream_url)
+        if upstream_ws is None or upstream_ws.closed:
             raise WsPassthroughConnectError("upstream websocket is not connected")
         payload = {"type": "response.create", **body}
-        await self.upstream_ws.send_str(json.dumps(payload, separators=(",", ":")))
+        await upstream_ws.send_str(json.dumps(payload, separators=(",", ":")))
 
     async def relay_until_terminal(
         self,
         *,
         source: str,
+        upstream_url: str,
         model_override: str | None = None,
         on_event: Callable[[dict[str, Any]], None] | None = None,
         rewrite_model: Callable[[Any, str | None], None] | None = None,
         write_event: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
+        forward_terminal: Callable[[dict[str, Any]], bool] | None = None,
     ) -> dict[str, Any] | None:
-        if self.upstream_ws is None or self.upstream_ws.closed:
+        upstream_ws = self.upstream_by_url.get(upstream_url)
+        if upstream_ws is None or upstream_ws.closed:
             raise WsPassthroughConnectError("upstream websocket is not connected")
 
         terminal_event: dict[str, Any] | None = None
@@ -95,12 +124,17 @@ class WsPassthroughSession:
             else:
                 await self.client_ws.send_str(json.dumps(event, separators=(",", ":")))
 
-        async for msg in self.upstream_ws:
+        async for msg in upstream_ws:
             if msg.type == WSMsgType.TEXT:
                 try:
                     event = json.loads(msg.data)
                 except json.JSONDecodeError:
-                    await _write_error(self.client_ws, 502, "upstream_protocol_error", "upstream emitted non-JSON websocket data")
+                    await _write_error(
+                        self.client_ws,
+                        502,
+                        "upstream_protocol_error",
+                        "upstream emitted non-JSON websocket data",
+                    )
                     continue
                 if not isinstance(event, dict):
                     continue
@@ -113,21 +147,28 @@ class WsPassthroughSession:
                     usage = response_obj.get("usage") if isinstance(response_obj, dict) else None
                     observe_upstream_response(
                         source,
-                        self.upstream_ws,
+                        upstream_ws,
                         usage=usage if isinstance(usage, dict) else None,
                     )
-                await _write_event(event)
                 if event.get("type") in _TERMINAL_EVENT_TYPES:
                     terminal_event = event
+                    if forward_terminal is None or forward_terminal(event):
+                        await _write_event(event)
                     break
+                await _write_event(event)
             elif msg.type in {WSMsgType.CLOSE, WSMsgType.CLOSED, WSMsgType.ERROR}:
                 break
         return terminal_event
 
-    async def close_upstream(self) -> None:
-        if self.upstream_ws is not None and not self.upstream_ws.closed:
-            await self.upstream_ws.close()
-        self.upstream_ws = None
+    async def close_upstream(self, upstream_url: str | None = None) -> None:
+        if upstream_url is None:
+            for url in list(self.upstream_by_url):
+                await self.close_upstream(url)
+            return
+        upstream_ws = self.upstream_by_url.pop(upstream_url, None)
+        self.last_chained_response_id_by_url.pop(upstream_url, None)
+        if upstream_ws is not None and not upstream_ws.closed:
+            await upstream_ws.close()
 
 
 async def _write_error(ws: web.WebSocketResponse, status: int, code: str, message: str) -> None:

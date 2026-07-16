@@ -50,14 +50,20 @@ def should_expand_continuation(
     surface: ContinuationSurface,
     route: ContinuationRoute,
     upstream_connection_reused: bool = False,
+    last_upstream_chained_response_id: str | None = None,
     body: dict[str, Any] | None = None,
 ) -> bool:
     if surface == ContinuationSurface.WS and route == ContinuationRoute.CHATGPT_CODEX:
+        previous_response_id = (body or {}).get("previous_response_id")
         if chatgpt_ws_force_expand():
-            return bool((body or {}).get("previous_response_id"))
-        if not (body or {}).get("previous_response_id"):
+            return bool(previous_response_id)
+        if not previous_response_id:
             return False
-        return not upstream_connection_reused
+        if not upstream_connection_reused:
+            return True
+        if last_upstream_chained_response_id != previous_response_id:
+            return True
+        return False
     if not (body or {}).get("previous_response_id"):
         return False
     return True

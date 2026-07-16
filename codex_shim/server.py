@@ -190,6 +190,18 @@ class ShimServer:
         self.picker_token = secrets.token_urlsafe(32)
         self._chatgpt_compaction_locks: dict[str, asyncio.Lock] = {}
         self._compact_timeout = ClientTimeout(total=300, sock_connect=120, sock_read=300)
+        self._active_ws_passthroughs: dict[int, WsPassthroughSession] = {}
+
+    def _register_ws_passthrough(self, passthrough: WsPassthroughSession) -> None:
+        self._active_ws_passthroughs[id(passthrough)] = passthrough
+
+    def _unregister_ws_passthrough(self, passthrough: WsPassthroughSession) -> None:
+        self._active_ws_passthroughs.pop(id(passthrough), None)
+
+    async def _invalidate_chatgpt_ws_native_chains(self) -> None:
+        for passthrough in list(self._active_ws_passthroughs.values()):
+            passthrough.invalidate_native_chain(CHATGPT_WS_URL)
+            await passthrough.close_upstream(CHATGPT_WS_URL)
 
     def _chatgpt_compaction_lock(self, session_key: str) -> asyncio.Lock:
         lock = self._chatgpt_compaction_locks.get(session_key)
@@ -950,6 +962,7 @@ class ShimServer:
                     if target is not None and ws_passthrough_enabled():
                         if passthrough is None:
                             passthrough = WsPassthroughSession(client_session=http_session, client_ws=ws)
+                            self._register_ws_passthrough(passthrough)
                         handled = await self._handle_ws_passthrough_response_create(
                             request,
                             passthrough,
@@ -979,6 +992,7 @@ class ShimServer:
                     break
             if passthrough is not None:
                 await passthrough.close_upstream()
+                self._unregister_ws_passthrough(passthrough)
         return ws
 
     @dataclass(frozen=True)
@@ -1080,7 +1094,7 @@ class ShimServer:
             print(f"[ws-passthrough] upstream connect failed url={upstream_url} err={exc}", flush=True)
             return False
 
-        await passthrough.send_response_create(forwarded)
+        await passthrough.send_response_create(forwarded, upstream_url=upstream_url)
         client_ws = passthrough.client_ws
 
         async def write_event(event: dict[str, Any]) -> None:
@@ -1088,6 +1102,7 @@ class ShimServer:
 
         await passthrough.relay_until_terminal(
             source=source,
+            upstream_url=upstream_url,
             model_override=target.response_model_override,
             on_event=on_event,
             rewrite_model=_rewrite_response_model,
@@ -1121,7 +1136,10 @@ class ShimServer:
         source = "chatgpt-passthrough-ws"
 
         try:
-            _, connection_reused = await passthrough.connect_upstream(upstream_url, headers)
+            _, connection_reused = await passthrough.connect_upstream(
+                upstream_url,
+                headers,
+            )
         except WsPassthroughConnectError as exc:
             print(f"[ws-passthrough] upstream connect failed; http-fallback url={upstream_url} err={exc}", flush=True)
             await self._handle_chatgpt_response_create_websocket_http(
@@ -1139,6 +1157,7 @@ class ShimServer:
                 raw_body,
                 session_key=session_key,
                 upstream_connection_reused=connection_reused,
+                last_upstream_chained_response_id=passthrough.last_upstream_chained_response_id(upstream_url),
                 force_expand=force_expand,
             )
             forwarded["model"] = target.upstream_model
@@ -1150,21 +1169,28 @@ class ShimServer:
                 _collector.record(event)
 
             client_ws = passthrough.client_ws
+            suppress_terminal = attempt == 0 and bool(raw_body.get("previous_response_id"))
 
             async def write_event(event: dict[str, Any]) -> None:
                 await _write_ws_json(client_ws, event)
 
-            await passthrough.send_response_create(forwarded)
+            def forward_terminal(event: dict[str, Any]) -> bool:
+                if not suppress_terminal:
+                    return True
+                return not is_previous_response_id_upstream_event(event)
+
+            await passthrough.send_response_create(forwarded, upstream_url=upstream_url)
             terminal = await passthrough.relay_until_terminal(
                 source=source,
+                upstream_url=upstream_url,
                 model_override=target.response_model_override,
                 on_event=on_event,
                 rewrite_model=_rewrite_response_model,
                 write_event=write_event,
+                forward_terminal=forward_terminal,
             )
             if (
-                attempt == 0
-                and terminal is not None
+                terminal is not None
                 and is_previous_response_id_upstream_event(terminal)
                 and raw_body.get("previous_response_id")
                 and not force_expand
@@ -1175,9 +1201,12 @@ class ShimServer:
                 )
                 force_expand = True
                 connection_reused = False
-                await passthrough.close_upstream()
+                await passthrough.close_upstream(upstream_url)
                 try:
-                    _, connection_reused = await passthrough.connect_upstream(upstream_url, headers)
+                    _, connection_reused = await passthrough.connect_upstream(
+                        upstream_url,
+                        headers,
+                    )
                 except WsPassthroughConnectError as exc:
                     print(
                         f"[ws-passthrough] reconnect after prev_id error failed; http-fallback url={upstream_url} err={exc}",
@@ -1192,9 +1221,28 @@ class ShimServer:
                     )
                     return True
                 continue
+            if (
+                attempt == 1
+                and terminal is not None
+                and is_previous_response_id_upstream_event(terminal)
+                and raw_body.get("previous_response_id")
+            ):
+                print(
+                    "[chatgpt-ws] expand retry still failed; http-fallback",
+                    flush=True,
+                )
+                await self._handle_chatgpt_response_create_websocket_http(
+                    request,
+                    passthrough.client_ws,
+                    payload,
+                    target,
+                    http_session=passthrough.client_session,
+                )
+                return True
             break
 
         if collector.response_id:
+            passthrough.note_chained_response(upstream_url, collector.response_id)
             items = self._build_turn_cache_items(request, raw_body, collector.output_items())
             if items:
                 await self._store_chatgpt_passthrough_conversation_async(
@@ -1215,6 +1263,7 @@ class ShimServer:
         http_session: ClientSession,
     ) -> None:
         session_key = self._session_key(request)
+        await self._invalidate_chatgpt_ws_native_chains()
         raw_body = {k: v for k, v in payload.items() if k != "type"}
         forwarded = self._prepare_chatgpt_passthrough_body_http(raw_body, session_key=session_key)
         forwarded["model"] = target.upstream_model
@@ -1998,6 +2047,7 @@ class ShimServer:
         *,
         session_key: str,
         upstream_connection_reused: bool,
+        last_upstream_chained_response_id: str | None = None,
         force_expand: bool = False,
         context: str = "turn",
     ) -> dict[str, Any]:
@@ -2005,10 +2055,15 @@ class ShimServer:
             surface=ContinuationSurface.WS,
             route=ContinuationRoute.CHATGPT_CODEX,
             upstream_connection_reused=upstream_connection_reused,
+            last_upstream_chained_response_id=last_upstream_chained_response_id,
             body=body,
         )
         if expand:
-            reason = "force" if force_expand else ("new_upstream_ws" if not upstream_connection_reused else "policy")
+            reason = "force" if force_expand else (
+                "chain_break"
+                if body.get("previous_response_id") and last_upstream_chained_response_id != body.get("previous_response_id")
+                else ("new_upstream_ws" if not upstream_connection_reused else "policy")
+            )
             print(f"[chatgpt-ws] expanding continuation reason={reason}", flush=True)
         elif body.get("previous_response_id"):
             print("[chatgpt-ws] native passthrough (reused upstream connection)", flush=True)
@@ -2145,6 +2200,7 @@ class ShimServer:
                 return fallback
             raise web.HTTPUnauthorized(text="auth.json has no access_token")
         session_key = self._session_key(request)
+        await self._invalidate_chatgpt_ws_native_chains()
         raw_body = body
         forwarded = self._prepare_chatgpt_passthrough_body_http(body, session_key=session_key)
         if collect_stream:
