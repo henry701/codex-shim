@@ -109,12 +109,29 @@ def test_sanitize_chatgpt_passthrough_body_removes_nested_shim_encrypted_content
     assert "encrypted_content" in body["input"][0]["content"][0]
 
 
-def test_sanitize_chatgpt_passthrough_body_drops_native_compaction_item():
+def test_sanitize_chatgpt_passthrough_body_keeps_native_compaction_item():
     body = {
         "model": "codex-gpt-5-5",
         "input": [
             {"type": "message", "role": "user", "content": "hi"},
             {"type": "compaction", "encrypted_content": "gAAAA-openai-native"},
+        ],
+    }
+
+    sanitized = _sanitize_chatgpt_passthrough_body(body)
+
+    assert len(sanitized["input"]) == 2
+    assert sanitized["input"][1]["type"] == "compaction"
+    assert sanitized["input"][1]["encrypted_content"] == "gAAAA-openai-native"
+
+
+def test_sanitize_chatgpt_passthrough_body_drops_empty_compaction_item():
+    body = {
+        "model": "codex-gpt-5-5",
+        "input": [
+            {"type": "message", "role": "user", "content": "hi"},
+            {"type": "compaction", "encrypted_content": ""},
+            {"type": "compaction"},
         ],
     }
 

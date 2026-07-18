@@ -3707,10 +3707,7 @@ def _sanitize_chatgpt_passthrough_value(value: Any) -> Any:
         if value.get("type") == "reasoning" and _has_shim_encrypted_content(value):
             return _DROP_ITEM
         if value.get("type") == "compaction":
-            replaced = _replace_shim_compaction_for_chatgpt(value)
-            if replaced is not None:
-                return replaced
-            return _DROP_ITEM
+            return _sanitize_chatgpt_passthrough_compaction(value)
         output = {}
         for key, item in value.items():
             if key == "encrypted_content" and isinstance(item, str) and _is_shim_opaque_encrypted_content(item):
@@ -3726,18 +3723,28 @@ def _is_shim_opaque_encrypted_content(value: str) -> bool:
     return value.startswith(SHIM_ENCRYPTED_CONTENT_PREFIX) or value.startswith(SHIM_COMPACTION_PREFIX)
 
 
-def _replace_shim_compaction_for_chatgpt(value: dict[str, Any]) -> Any:
+def _sanitize_chatgpt_passthrough_compaction(value: dict[str, Any]) -> Any:
+    """Keep OpenAI-native compaction blobs; rewrite shim-encoded summaries to text.
+
+    After native ChatGPT compact, Desktop resends the returned ``compaction`` item
+    on the next turn. Dropping those blobs strips the compacted thread state and
+    breaks goal-following between compactions. Shim-encoded summaries are not valid
+    ChatGPT ciphertext, so those still become developer messages.
+    """
     encrypted = value.get("encrypted_content")
-    if not isinstance(encrypted, str) or not encrypted.startswith(SHIM_COMPACTION_PREFIX):
-        return None
-    summary = decode_shim_compaction_summary(encrypted)
-    if not summary:
-        return _DROP_ITEM
-    return {
-        "type": "message",
-        "role": "developer",
-        "content": [{"type": "input_text", "text": f"Compacted conversation state:\n{summary}"}],
-    }
+    if isinstance(encrypted, str) and encrypted.startswith(SHIM_COMPACTION_PREFIX):
+        summary = decode_shim_compaction_summary(encrypted)
+        if not summary:
+            return _DROP_ITEM
+        return {
+            "type": "message",
+            "role": "developer",
+            "content": [{"type": "input_text", "text": f"Compacted conversation state:\n{summary}"}],
+        }
+    if isinstance(encrypted, str) and encrypted.strip() and not _is_shim_opaque_encrypted_content(encrypted):
+        # OpenAI-native compaction ciphertext — forward unchanged for ChatGPT round-trip.
+        return value
+    return _DROP_ITEM
 
 
 def _has_shim_encrypted_content(value: dict[str, Any]) -> bool:
