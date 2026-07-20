@@ -9,6 +9,33 @@ from typing import Any
 UPSTREAM_IO_DIR = Path.home() / ".codex-shim" / "upstream-io"
 RESPONSE_TEXT_LIMIT = 12_000
 REQUEST_BODY_FILE_LIMIT = 1_500_000
+_INPUT_TYPE_TAIL = 20
+
+# Catalog / picker / discover paths — keep error artifacts quiet (SSD).
+_QUIET_SURFACE_MARKERS = (
+    "model",
+    "models",
+    "discover",
+    "catalog",
+    "picker",
+    "health",
+    "sync-desktop",
+    "sync_desktop",
+)
+
+# Responses / compaction / turn passthrough — verbose errors by default.
+_VERBOSE_ERROR_SURFACE_MARKERS = (
+    "response",
+    "responses",
+    "compact",
+    "compaction",
+    "passthrough",
+    "chatgpt",
+    "byok",
+    "anthropic",
+    "cursor",
+    "summarization",
+)
 
 
 def shim_io_log_enabled() -> bool:
@@ -16,6 +43,19 @@ def shim_io_log_enabled() -> bool:
         if os.environ.get(key, "").lower() in {"1", "true", "yes", "on"}:
             return True
     return False
+
+
+def is_quiet_surface(surface: str) -> bool:
+    lower = (surface or "").lower()
+    return any(marker in lower for marker in _QUIET_SURFACE_MARKERS)
+
+
+def is_verbose_error_surface(surface: str) -> bool:
+    """True for response/compaction turn paths; false for models/picker/discover."""
+    if is_quiet_surface(surface):
+        return False
+    lower = (surface or "").lower()
+    return any(marker in lower for marker in _VERBOSE_ERROR_SURFACE_MARKERS)
 
 
 def _summarize_input_item(item: Any) -> str:
@@ -47,7 +87,7 @@ def _summarize_input_item(item: Any) -> str:
     return f"{item_type}{extra}"
 
 
-def summarize_upstream_body(body: dict[str, Any]) -> dict[str, Any]:
+def summarize_upstream_body(body: dict[str, Any], *, full_input_types: bool | None = None) -> dict[str, Any]:
     tools = body.get("tools") or []
     input_items = body.get("input")
     messages = body.get("messages")
@@ -55,7 +95,15 @@ def summarize_upstream_body(body: dict[str, Any]) -> dict[str, Any]:
     input_count = 0
     if isinstance(input_items, list):
         input_count = len(input_items)
-        input_types = [_summarize_input_item(item) for item in input_items]
+        if full_input_types is None:
+            full_input_types = shim_io_log_enabled()
+        if full_input_types or input_count <= _INPUT_TYPE_TAIL:
+            input_types = [_summarize_input_item(item) for item in input_items]
+        else:
+            head = input_count - _INPUT_TYPE_TAIL
+            input_types = [f"…({head} earlier items)"] + [
+                _summarize_input_item(item) for item in input_items[-_INPUT_TYPE_TAIL:]
+            ]
     message_count = len(messages) if isinstance(messages, list) else 0
     return {
         "model": body.get("model"),
@@ -77,12 +125,14 @@ def _body_json_size(body: Any) -> int:
         return 0
 
 
-def _body_for_error_file(body: dict[str, Any] | None) -> Any:
+def _body_for_error_file(body: dict[str, Any] | None, *, verbose: bool) -> Any:
     if body is None:
         return None
+    if not verbose:
+        return summarize_upstream_body(body, full_input_types=False)
     if _body_json_size(body) <= REQUEST_BODY_FILE_LIMIT:
         return body
-    summary = summarize_upstream_body(body)
+    summary = summarize_upstream_body(body, full_input_types=True)
     summary["_truncated"] = True
     summary["_full_size"] = _body_json_size(body)
     return summary
@@ -96,20 +146,31 @@ def record_upstream_error(
     *,
     request_body: dict[str, Any] | None = None,
 ) -> None:
+    """Persist upstream failures.
+
+    Response/compaction turn surfaces: verbose ``last-error.json`` (request +
+    response) by default. Models/picker/discover stay summary-only.
+
+    Timestamped ``error-*.json`` files are still debug-only — a 429 retry storm
+    on ChatGPT passthrough would otherwise rewrite gigabytes.
+    """
     try:
         UPSTREAM_IO_DIR.mkdir(parents=True, exist_ok=True)
+        debug = shim_io_log_enabled()
+        verbose = debug or is_verbose_error_surface(surface)
         artifact = {
             "ts": time.time(),
             "surface": surface,
             "url": url,
             "status": status,
-            "response_text": (response_text or "")[:RESPONSE_TEXT_LIMIT],
+            "response_text": (response_text or "")[: (RESPONSE_TEXT_LIMIT if verbose else 800)],
             "request_summary": summarize_upstream_body(request_body) if request_body else None,
-            "request_body": _body_for_error_file(request_body),
+            "request_body": _body_for_error_file(request_body, verbose=verbose),
         }
         text = json.dumps(artifact, indent=2, default=str)
         (UPSTREAM_IO_DIR / "last-error.json").write_text(text)
-        (UPSTREAM_IO_DIR / f"error-{int(time.time())}.json").write_text(text)
+        if debug:
+            (UPSTREAM_IO_DIR / f"error-{int(time.time())}.json").write_text(text)
     except OSError:
         pass
 
@@ -123,8 +184,8 @@ def _write_request_artifact(surface: str, url: str, body: dict[str, Any]) -> Non
             "ts": time.time(),
             "surface": surface,
             "url": url,
-            "request_summary": summarize_upstream_body(body),
-            "request_body": _body_for_error_file(body),
+            "request_summary": summarize_upstream_body(body, full_input_types=True),
+            "request_body": _body_for_error_file(body, verbose=True),
         }
         (UPSTREAM_IO_DIR / "last-request.json").write_text(
             json.dumps(artifact, indent=2, default=str)
@@ -158,7 +219,8 @@ def log_upstream_response(
     if status >= 400 and preview:
         line += f" body={preview!r}"
     print(line, flush=True)
-    if status >= 400 or shim_io_log_enabled():
+    verbose_error = status >= 400 and (shim_io_log_enabled() or is_verbose_error_surface(surface))
+    if verbose_error or shim_io_log_enabled():
         payload = {
             "surface": surface,
             "url": url,
@@ -167,7 +229,10 @@ def log_upstream_response(
             "response_text": (response_text or "")[:RESPONSE_TEXT_LIMIT],
         }
         if request_body is not None:
-            payload["request_summary"] = summarize_upstream_body(request_body)
+            payload["request_summary"] = summarize_upstream_body(
+                request_body,
+                full_input_types=shim_io_log_enabled() or is_verbose_error_surface(surface),
+            )
         print(f"[io-resp] {json.dumps(payload, separators=(',', ':'), default=str)}", flush=True)
     if status >= 400:
         record_upstream_error(surface, url, status, response_text, request_body=request_body)
