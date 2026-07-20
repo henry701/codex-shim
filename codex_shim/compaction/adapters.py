@@ -63,7 +63,7 @@ def compaction_request_from_v2(
     settings = load_compaction_settings(server.settings.path)
     budget_slug = compaction_budget_slug(settings, requested_slug)
     try:
-        models = server.settings.load()
+        models = server.models_cached_or_load()
     except Exception:
         models = []
     compaction_model_context_window = context_window_tokens_for_slug(

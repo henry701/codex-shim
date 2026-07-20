@@ -8,6 +8,7 @@ import os
 import re
 import shutil
 import subprocess
+import threading
 import time
 from typing import Any
 from datetime import datetime, timezone
@@ -781,24 +782,49 @@ def discover_chatgpt_models_from_cursor() -> list[tuple[str, str]]:
     return sorted(rows, key=lambda item: item[0])
 
 
+# `opencode models` is ~2s and openrouter/nvidia each call it on discover.
+# Without a TTL cache, Codex Desktop traffic that reloads settings re-spawns it
+# continuously (process parent = codex-shim). Keep automatic refreshes rare.
+_OPENCODE_CLI_MODELS_CACHE_TTL_SEC = 3 * 60 * 60
+_opencode_cli_models_cache: tuple[float, list[str]] | None = None
+_opencode_cli_models_lock = threading.Lock()
+
+
+def clear_opencode_cli_models_cache() -> None:
+    global _opencode_cli_models_cache
+    with _opencode_cli_models_lock:
+        _opencode_cli_models_cache = None
+
+
 def list_opencode_cli_models() -> list[str]:
-    binary = shutil.which("opencode")
-    if not binary:
-        return []
-    try:
-        result = subprocess.run(
-            [binary, "models"],
-            capture_output=True,
-            text=True,
-            timeout=60,
-            check=False,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return []
-    output = result.stdout or ""
-    if result.returncode != 0:
-        output = f"{result.stdout}\n{result.stderr}"
-    return [line.strip() for line in output.splitlines() if line.strip()]
+    global _opencode_cli_models_cache
+    now = time.monotonic()
+    with _opencode_cli_models_lock:
+        cached = _opencode_cli_models_cache
+        if cached is not None and now - cached[0] < _OPENCODE_CLI_MODELS_CACHE_TTL_SEC:
+            return list(cached[1])
+
+        binary = shutil.which("opencode")
+        if not binary:
+            _opencode_cli_models_cache = (time.monotonic(), [])
+            return []
+        try:
+            result = subprocess.run(
+                [binary, "models"],
+                capture_output=True,
+                text=True,
+                timeout=60,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            # Do not cache hard failures forever — allow a quick retry next call.
+            return []
+        output = result.stdout or ""
+        if result.returncode != 0:
+            output = f"{result.stdout}\n{result.stderr}"
+        lines = [line.strip() for line in output.splitlines() if line.strip()]
+        _opencode_cli_models_cache = (time.monotonic(), lines)
+        return list(lines)
 
 
 def discover_opencode_cli_ids(prefix: str) -> list[str]:

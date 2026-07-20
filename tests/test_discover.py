@@ -206,6 +206,29 @@ def test_refresh_local_explicit_models_uses_endpoint_name(monkeypatch):
     assert refreshed.max_context_limit == 65536
 
 
+def test_list_opencode_cli_models_caches_subprocess(monkeypatch):
+    from types import SimpleNamespace
+
+    from codex_shim import discover
+
+    assert discover._OPENCODE_CLI_MODELS_CACHE_TTL_SEC == 3 * 60 * 60
+
+    calls = {"n": 0}
+
+    def fake_run(*_args, **_kwargs):
+        calls["n"] += 1
+        return SimpleNamespace(returncode=0, stdout="opencode/big-pickle\nopenrouter/free\n", stderr="")
+
+    discover.clear_opencode_cli_models_cache()
+    monkeypatch.setattr("codex_shim.discover.shutil.which", lambda _name: "/usr/bin/opencode")
+    monkeypatch.setattr("codex_shim.discover.subprocess.run", fake_run)
+
+    assert discover.list_opencode_cli_models() == ["opencode/big-pickle", "openrouter/free"]
+    assert discover.discover_opencode_cli_ids("openrouter") == ["free"]
+    assert discover.list_opencode_cli_models() == ["opencode/big-pickle", "openrouter/free"]
+    assert calls["n"] == 1
+
+
 def test_is_openrouter_free_model():
     assert is_openrouter_free_model("openrouter/free")
     assert is_openrouter_free_model("meta-llama/llama-3.3-70b-instruct:free")

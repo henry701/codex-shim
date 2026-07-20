@@ -21,6 +21,15 @@ def _disable_model_discovery_by_default(monkeypatch, request):
 
 
 @pytest.fixture(autouse=True)
+def _clear_opencode_cli_models_cache():
+    from codex_shim.discover import clear_opencode_cli_models_cache
+
+    clear_opencode_cli_models_cache()
+    yield
+    clear_opencode_cli_models_cache()
+
+
+@pytest.fixture(autouse=True)
 def _isolate_published_desktop_catalog(monkeypatch, tmp_path_factory):
     # Keep catalog sync tests from reading the developer's live Desktop catalog.
     monkeypatch.setattr(

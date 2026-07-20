@@ -147,7 +147,8 @@ DEBUG_DIR = Path(__file__).resolve().parents[1] / ".codex-shim"
 CODEX_CONFIG_PATH = Path.home() / ".codex" / "config.toml"
 PICKER_TOKEN_HEADER = "X-Codex-Shim-Picker-Token"
 CHATGPT_ACCEPT_ENCODING = "zstd, gzip, deflate"
-_MODELS_CACHE_TTL_SEC = 30.0
+# Align with opencode CLI discover cache: automatic in-process refresh is rare.
+_MODELS_CACHE_TTL_SEC = 3 * 60 * 60
 _STARTUP_REFRESH_TIMEOUT_SEC = 120.0
 
 
@@ -179,6 +180,7 @@ class ShimServer:
         self.host = host
         self.timeout = ClientTimeout(total=None, sock_connect=120, sock_read=None)
         self._models_cache: tuple[float, list[ShimModel]] | None = None
+        self._models_load_lock = asyncio.Lock()
         self._health_snapshot: dict[str, Any] = {
             "ok": True,
             "models": 0,
@@ -765,16 +767,31 @@ class ShimServer:
         }
 
     def _compute_health_snapshot(self) -> dict[str, Any]:
-        return self._compute_health_snapshot_from_models(self.settings.load())
+        return self._compute_health_snapshot_from_models(self.models_cached_or_load())
+
+    def models_cached_or_load(self) -> list[ShimModel]:
+        """Sync model list for paths that cannot await ``_load_models`` (e.g. compaction)."""
+        now = time.monotonic()
+        cached = self._models_cache
+        if cached is not None and now - cached[0] < _MODELS_CACHE_TTL_SEC:
+            return cached[1]
+        models = self.settings.load()
+        self._models_cache = (time.monotonic(), models)
+        return models
 
     async def _load_models(self) -> list[ShimModel]:
         now = time.monotonic()
         cached = self._models_cache
         if cached is not None and now - cached[0] < _MODELS_CACHE_TTL_SEC:
             return cached[1]
-        models = await asyncio.to_thread(self.settings.load)
-        self._models_cache = (now, models)
-        return models
+        async with self._models_load_lock:
+            now = time.monotonic()
+            cached = self._models_cache
+            if cached is not None and now - cached[0] < _MODELS_CACHE_TTL_SEC:
+                return cached[1]
+            models = await asyncio.to_thread(self.settings.load)
+            self._models_cache = (time.monotonic(), models)
+            return models
 
     async def picker_page(self, _request: web.Request) -> web.Response:
         return web.Response(text=_picker_html(self.picker_token), content_type="text/html")
