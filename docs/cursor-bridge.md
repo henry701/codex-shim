@@ -49,9 +49,99 @@ sends a new turn with that history plus the steer text (see CLI
 `steer_interrupts_wait_agent_and_is_sent_in_follow_up_request`). The shim
 mirrors that: cancel the live cursor-agent on unexpected disconnect, and on any
 follow-up that is not a pure tool-output adopt kill the orphan still blocked on
-`wait`. The next turn respawns from the conversation cache + new input.
+`wait` (including empty or steer-shaped turns). The next turn respawns from the
+conversation cache + new input.
+
+Handoff disconnect is recognized only **after** `finish()` completes successfully
+during early-complete — a disconnect while the stream is still open (user cancel)
+always kills the agent.
 
 A fresh agent is also spawned when there is no live one to adopt.
+
+## Codex Desktop multi-agent (sub-agents)
+
+Codex Desktop v2 multi-agent runs **spawned sub-agents in their own Desktop
+threads** while the parent turn is routed through Cursor passthrough. The bridge
+makes that work end-to-end: collaboration tools become real Codex
+`function_call` items, results return through wait/poll, and parent/sub
+`agent_message` traffic is preserved in the cursor-agent prompt.
+
+### What is bridged
+
+| Collaboration tool | Role in Desktop | Bridge behavior |
+|--------------------|-----------------|-----------------|
+| `spawn_agent` | Creates child thread (`/root/task_name`) | Invoke → early-complete → Desktop runs sub locally |
+| `wait_agent` | Parent blocks until sub finishes | Parent cursor-agent waits on bridge; sub runs in parallel |
+| `send_message` / `followup_task` | Inter-agent messaging | Same async invoke + wait/poll pattern |
+| `list_agents` / `interrupt_agent` | Team introspection / cancel | Bridged when present in `body.tools` |
+
+Goals (`create_goal`, `update_goal`, `get_goal`), `update_plan`, and other
+non-denylisted Codex tools in the same turn use the same bridge path.
+
+### Sub-agent task delivery (`agent_message`)
+
+When Desktop spawns a sub-agent, the child's first turn includes an
+`agent_message` input item (`author` → `recipient`, task text often in
+`encrypted_content`). The shim's input translator (`translate.py`) turns that into
+a normal user message in the cursor-agent prompt so the sub actually receives its
+brief. **Dropping this item leaves a sub-agent with no instructions** — a common
+failure mode before the translator fix.
+
+Parent ↔ sub **FINAL_ANSWER** replies use the same `agent_message` shape in the
+opposite direction. When the sub completes, Desktop injects that message into
+the parent's next `/v1/responses` request; the parent cursor-agent respawns from
+cached history plus the new input and continues.
+
+### Live flow (verified 2026-07-25)
+
+Parent thread `019f9789-…`, sub-agent `neutral_parity_audit` ("Poincare") on
+Cursor Grok 4.5:
+
+```text
+Parent cursor-agent
+  │ bridge invoke spawn_agent
+  │ early-complete (parent HTTP stream ends; agent kept)
+  ▼
+Codex Desktop
+  │ executes spawn_agent locally → new sub thread
+  │ sub_agent_activity: started
+  ▼
+Sub-agent cursor-agent (separate thread)
+  │ receives agent_message NEW_TASK via prompt translation
+  │ read-only audit work (shell, logs, git)
+  │ writes neutral-audit-20260725.md
+  │ task_complete + FINAL_ANSWER agent_message → parent
+  ▼
+Codex Desktop
+  │ next parent request carries agent_message + tool history (input≈36)
+  ▼
+Parent cursor-agent (respawned / adopted)
+  │ reads audit verdict ("Goal not achieved. Do not commit/push.")
+  │ update_plan + resumes fixing timeline-scroll failures
+```
+
+Shim log signatures for a healthy run:
+
+```text
+[cursor-bridge] invoke … tool=spawn_agent namespace=collaboration
+[cursor-bridge] early-complete bridge=… so Codex can run pending tool calls
+[cursor-bridge] invoke … tool=wait_agent namespace=collaboration
+[cursor-bridge] delivery-wake ingested=1; no leftover text — continuing with Cursor passthrough
+[req] … input=… agent_message(from=/root/neutral_parity_audit to=/root)
+[cursor-bridge] adopt bridge=… ingested=N — continuing the in-flight cursor-agent
+```
+
+While the sub runs, the parent **looks idle in Desktop** but the parent's
+cursor-agent is correctly blocked on `wait_agent` — not stopped. Desktop wakes
+the parent when the sub's `FINAL_ANSWER` arrives.
+
+### Cancel / steer during sub-agent work
+
+If the user cancels or Desktop sends a non-adopt follow-up (`input=0` wake,
+steer text, new user message) while an agent is blocked on bridge wait,
+`cancel_live_agents_for_session` kills the orphan cursor-agent immediately so it
+cannot keep editing files in the background. Pure tool-output adopts (next bridge
+round-trip) still preserve the agent. See **One agent per session** above.
 
 ## Suffix protocol
 
@@ -210,9 +300,24 @@ Injection is always driven by the HTTP invoke, not by parsing NDJSON.
 - **`create_goal` fails validation** — Codex requires an `objective` string, not `name`/`description`.
 - **`spawn_agent` fails validation** — requires `task_name` + `message`.
 
-## Verified in live session (2026-06-28)
+## Verified in live session (2026-07-25)
 
-Real bridged Codex session under Cursor Composer 2.5 (bridge session `uyqpNSBgq2SBawBG` on :8765):
+Multi-agent + goals under Cursor Grok 4.5 on session `019f9789-…`:
+
+- Parent spawned `neutral_parity_audit` via bridged `spawn_agent`; Desktop
+  recorded `sub_agent_activity: started` on child thread `019f9a9b-…`.
+- Sub-agent received `agent_message` NEW_TASK, produced
+  `neutral-audit-20260725.md`, and completed with `task_complete`.
+- Parent received `FINAL_ANSWER` (`Goal not achieved. Do not commit/push.`),
+  resumed via adopt on a fresh bridge turn, and continued `update_plan` +
+  code fixes (timeline scroll / `composerLayoutEpoch`).
+- Bridged `wait_agent` correctly blocked the parent cursor-agent while the sub
+  worked; `delivery-wake` + `agent_message` follow-up woke the parent without a
+  manual user message.
+- User-cancel path: `cancel-live` fired on superseding turns; orphan agents were
+  killed before respawn (see shim log `cancel-live count=1`).
+
+Earlier verification (2026-06-28, bridge session `uyqpNSBgq2SBawBG` on :8765):
 
 - The full injected suffix block (including workspace path `/home/henry`, exact curl recipe, allowed tools list, and goal rules) was received by the inner agent exactly as emitted by `build_bridge_suffix`.
 - `create_goal` was invoked via the prescribed `curl -sS -X POST ...` pattern using Shell tool; shim accepted it and returned `{"ok": true, ..., "codex_call_id": "call_..._1"}`, confirming the emit path to Codex.
@@ -220,7 +325,7 @@ Real bridged Codex session under Cursor Composer 2.5 (bridge session `uyqpNSBgq2
 - `codex-shim doctor` reported: cursor_passthrough true, 1 session dir in chatgpt-conversations cache, 4 cached responses, stale-pid warning handled gracefully (health still OK).
 - Goal completion will be signaled via `update_goal` + `status: "complete"` at end of task.
 
-This validates the bridge solves goal/tool visibility for Codex when routed through Cursor passthrough.
+This validates the bridge for goals **and** Codex Desktop sub-agent collaboration when routed through Cursor passthrough.
 
 ## Smoke test
 

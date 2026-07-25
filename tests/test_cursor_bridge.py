@@ -1233,3 +1233,114 @@ async def test_steer_follow_up_cancels_orphaned_agent_instead_of_adopting(monkey
         assert "Inventorying" in second or "Codex said" in second or len(second) > 0
     finally:
         await client.close()
+
+
+def _attach_sleeping_agent(session: CursorBridgeSession) -> asyncio.Task[None]:
+    async def sleeper() -> None:
+        await asyncio.sleep(100)
+
+    task = asyncio.create_task(sleeper())
+    session._agent_task = task
+    return task
+
+
+@pytest.mark.asyncio
+async def test_cancel_agent_on_disconnect_kills_when_turn_closed_without_handoff():
+    """User cancel after early-complete used to skip kill because turn_closed was set."""
+    session = CursorBridgeSession.create(
+        allowed_tools=frozenset({"create_goal"}),
+        tool_types={},
+        tool_resolve={},
+    )
+    task = _attach_sleeping_agent(session)
+    session.mark_turn_closed()
+
+    session.cancel_agent_on_disconnect("user cancel")
+
+    await asyncio.sleep(0)
+    assert task.cancelled()
+
+
+@pytest.mark.asyncio
+async def test_cancel_agent_on_disconnect_preserves_agent_after_handoff_disconnect():
+    session = CursorBridgeSession.create(
+        allowed_tools=frozenset({"create_goal"}),
+        tool_types={},
+        tool_resolve={},
+    )
+    task = _attach_sleeping_agent(session)
+    session.mark_turn_closed()
+    session.mark_handoff_disconnect_expected()
+
+    session.cancel_agent_on_disconnect("expected handoff hang-up")
+
+    await asyncio.sleep(0)
+    assert not task.cancelled()
+    task.cancel()
+
+
+@pytest.mark.asyncio
+async def test_cancel_live_agents_for_session_kills_waiting_orphan():
+    session = CursorBridgeSession.create(
+        allowed_tools=frozenset({"create_goal"}),
+        tool_types={},
+        tool_resolve={},
+    )
+    session.session_key = "codex-session-1"
+    task = _attach_sleeping_agent(session)
+    await cursor_bridge_registry.register(session, session_key="codex-session-1")
+
+    cancelled = cursor_bridge_registry.cancel_live_agents_for_session("codex-session-1")
+
+    assert cancelled == 1
+    await asyncio.sleep(0)
+    assert task.cancelled()
+    cursor_bridge_registry.close(session.bridge_id)
+
+
+@pytest.mark.asyncio
+async def test_fresh_turn_after_handoff_kills_orphan_agent(monkeypatch, tmp_path):
+    """Cancel-without-tool-output must not leave cursor-agent blocked on bridge wait."""
+    import codex_shim.server as server_module
+
+    agent = _FakeBridgeAgent()
+    monkeypatch.setattr(server_module, "cursor_passthrough_available", lambda: True)
+    monkeypatch.setattr(server_module, "iter_cursor_agent_events", agent)
+    monkeypatch.setattr(server_module, "cursor_upstream_model", lambda slug: "composer-2.5")
+
+    settings = tmp_path / "settings.json"
+    settings.write_text("{}")
+    client = TestClient(TestServer(ShimServer(settings).app()))
+    await client.start_server()
+    try:
+        tools = _goal_tools_body()["tools"]
+        first = await _post_cursor_turn(
+            client,
+            {
+                "model": "cursor-composer-2-5",
+                "stream": True,
+                "tools": tools,
+                "input": [{"role": "user", "content": "start goal"}],
+            },
+        )
+        call_ids = [
+            event["item"]["call_id"]
+            for event in _sse_events(first)
+            if event.get("type") == "response.output_item.added"
+            and (event.get("item") or {}).get("type") == "function_call"
+        ]
+        assert len(call_ids) == 1
+        assert agent.spawns == 1
+
+        await _post_cursor_turn(
+            client,
+            {
+                "model": "cursor-composer-2-5",
+                "stream": True,
+                "tools": tools,
+                "input": [{"role": "user", "content": "never mind, do something else"}],
+            },
+        )
+        assert agent.spawns == 2, "fresh turn must cancel the waiting agent and respawn"
+    finally:
+        await client.close()

@@ -2595,6 +2595,7 @@ class ShimServer:
         slug = response_model_override or CURSOR_MODEL_SLUG
         upstream = upstream_model or cursor_upstream_model(slug)
         raw_body = body
+        session_key = self._session_key(request)
         # Prefer continuing the agent that emitted these tool calls over spawning a new
         # one. Must run before ingest: completing the jobs unblocks the agent, which may
         # invoke again immediately, and it needs this turn's stream already attached.
@@ -2626,6 +2627,13 @@ class ShimServer:
                     "(follow-up is not a pure tool-output adopt)",
                     flush=True,
                 )
+        cancelled_live = cursor_bridge_registry.cancel_live_agents_for_session(session_key)
+        if cancelled_live:
+            print(
+                f"[cursor-bridge] cancel-live count={cancelled_live} "
+                f"session={session_key!r} (new turn is not adopting the in-flight agent)",
+                flush=True,
+            )
         # Snapshot waiter/early-close state BEFORE ingest: completing jobs wakes waiters
         # and can clear has_active_waiters() before we decide the delivery path.
         delivery_path = cursor_bridge_registry.has_active_waiters() or bool(
@@ -2679,7 +2687,6 @@ class ShimServer:
             surface=ContinuationSurface.HTTP,
             route=ContinuationRoute.CURSOR,
         )
-        session_key = self._session_key(request)
         prompt = build_cursor_prompt(body)
         cursor_workspace_path = resolve_cursor_workspace(
             body,
@@ -2702,7 +2709,10 @@ class ShimServer:
                     tool_resolve=tool_resolve,
                     tool_specs=tool_specs,
                 )
-                await cursor_bridge_registry.register(bridge_session)
+                await cursor_bridge_registry.register(
+                    bridge_session,
+                    session_key=session_key,
+                )
                 prompt += "\n\n" + build_bridge_suffix(
                     bridge_session,
                     port,
@@ -2788,6 +2798,7 @@ class ShimServer:
                         flush=True,
                     )
                     await state.finish(response, upstream_saw_done=True)
+                    bridge_session.mark_handoff_disconnect_expected()
                     bridge_session.mark_turn_closed()
 
                 bridge_session.attach_stream(_stream_emit)
@@ -2854,16 +2865,10 @@ class ShimServer:
                 await state.finish(response, upstream_saw_done=True)
                 await _persist_turn_cache()
             except ClientDisconnected:
-                # Steer / interrupt / user-cancel: Codex drops the HTTP request. That is
-                # not our early-complete handoff — kill the agent and let the next turn
-                # rebuild from cached history + the steer text (Codex's own model).
-                if bridge_session is not None and not bridge_session.turn_closed:
-                    print(
-                        f"[cursor-bridge] cancel bridge={bridge_session.bridge_id} "
-                        "(Codex disconnected before early-complete)",
-                        flush=True,
+                if bridge_session is not None:
+                    bridge_session.cancel_agent_on_disconnect(
+                        "Codex disconnected (user cancel / steer / interrupt)"
                     )
-                    bridge_session.cancel_agent()
             except Exception as exc:
                 detail = str(exc).strip() or repr(exc)
                 print(f"[err] cursor passthrough {slug}: {type(exc).__name__}: {detail}", flush=True)
@@ -2941,6 +2946,7 @@ class ShimServer:
                 flush=True,
             )
             await state.finish(response, upstream_saw_done=True)
+            session.mark_handoff_disconnect_expected()
             session.mark_turn_closed()
 
         session.attach_stream(_stream_emit)
@@ -2985,14 +2991,9 @@ class ShimServer:
             else:
                 agent_done = not session.agent_alive()
         except ClientDisconnected:
-            # Mid-adopt disconnect is a steer/interrupt, not a tool-result handoff.
-            if not session.turn_closed:
-                print(
-                    f"[cursor-bridge] cancel bridge={session.bridge_id} "
-                    "(Codex disconnected mid-adopt)",
-                    flush=True,
-                )
-                session.cancel_agent()
+            session.cancel_agent_on_disconnect(
+                "Codex disconnected mid-adopt (user cancel / steer / interrupt)"
+            )
         except Exception as exc:
             detail = str(exc).strip() or repr(exc)
             print(f"[err] cursor adopt {slug}: {type(exc).__name__}: {detail}", flush=True)

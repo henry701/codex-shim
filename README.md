@@ -793,8 +793,8 @@ capture scripts, and how to refresh fixtures.
 
 When Codex sends tools in the request, the shim also appends a **bridge suffix**
 so Composer can forward those tools back as real Codex `function_call` items via
-a loopback curl API (Goals, `update_plan`, etc.). See
-[`docs/cursor-bridge.md`](docs/cursor-bridge.md).
+a loopback curl API (Goals, `update_plan`, **sub-agent collaboration**
+`spawn_agent` / `wait_agent`, etc.). See [`docs/cursor-bridge.md`](docs/cursor-bridge.md).
 
 ---
 

@@ -537,6 +537,8 @@ class CursorBridgeSession:
     _agent_task: asyncio.Task[None] | None = field(default=None, repr=False)
     _agent_finished: bool = False
     _post_terminal_text: list[str] = field(default_factory=list, repr=False)
+    session_key: str = ""
+    _handoff_disconnect_expected: bool = False
 
     @classmethod
     def create(
@@ -589,6 +591,24 @@ class CursorBridgeSession:
     def mark_turn_closed(self) -> None:
         self._turn_closed = True
 
+    def mark_handoff_disconnect_expected(self) -> None:
+        """The next client disconnect is from our early-complete, not user cancel."""
+        self._handoff_disconnect_expected = True
+
+    def consume_handoff_disconnect_expected(self) -> bool:
+        expected = self._handoff_disconnect_expected
+        self._handoff_disconnect_expected = False
+        return expected
+
+    def cancel_agent_on_disconnect(self, reason: str) -> None:
+        """Kill the agent unless the disconnect was caused by our handoff finish."""
+        if self.consume_handoff_disconnect_expected():
+            return
+        if not self.agent_alive():
+            return
+        print(f"[cursor-bridge] cancel bridge={self.bridge_id} ({reason})", flush=True)
+        self.cancel_agent()
+
     @property
     def turn_closed(self) -> bool:
         return self._turn_closed
@@ -601,6 +621,7 @@ class CursorBridgeSession:
         """
         self._turn_closed = False
         self._turn_complete_requested = False
+        self._handoff_disconnect_expected = False
 
     def start_agent(self, events: AsyncIterator[dict[str, Any]]) -> None:
         """Own the cursor-agent for the life of the session, not of one HTTP turn.
@@ -954,11 +975,50 @@ class CursorBridgeRegistry:
         self._call_tool_names: dict[str, str] = {}
         self._lock = asyncio.Lock()
 
-    async def register(self, session: CursorBridgeSession) -> str:
+    async def register(
+        self,
+        session: CursorBridgeSession,
+        *,
+        session_key: str = "",
+    ) -> str:
+        session.session_key = str(session_key or "").strip()
         async with self._lock:
             self._sessions[session.bridge_id] = session
         self.prune_expired()
         return session.bridge_id
+
+    def cancel_live_agents_for_session(
+        self,
+        session_key: str,
+        *,
+        except_bridge_id: str | None = None,
+    ) -> int:
+        """Kill cursor-agents still running for a Codex session (cancel / new turn).
+
+        After early-complete the agent waits for a tool-output adopt. If the user
+        cancels or starts a fresh turn instead, that agent must die immediately —
+        otherwise it can keep running shell/file tools in the background.
+        """
+        key = str(session_key or "").strip()
+        if not key:
+            return 0
+        skip = str(except_bridge_id or "").strip()
+        cancelled = 0
+        for session in list(self._sessions.values()):
+            if session.session_key != key:
+                continue
+            if skip and session.bridge_id == skip:
+                continue
+            if not session.agent_alive():
+                continue
+            print(
+                f"[cursor-bridge] cancel bridge={session.bridge_id} "
+                f"(superseded by new Codex turn session={key})",
+                flush=True,
+            )
+            session.cancel_agent()
+            cancelled += 1
+        return cancelled
 
     def prune_expired(self) -> int:
         """Drop sessions past their TTL.
