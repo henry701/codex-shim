@@ -1344,3 +1344,77 @@ async def test_fresh_turn_after_handoff_kills_orphan_agent(monkeypatch, tmp_path
         assert agent.spawns == 2, "fresh turn must cancel the waiting agent and respawn"
     finally:
         await client.close()
+
+
+def test_replayed_history_tail_is_a_tool_output_delivery_not_a_steer():
+    """After compaction Codex drops previous_response_id and replays history inline."""
+    from codex_shim.cursor_bridge import input_items_deliver_tool_outputs
+
+    post_compaction_replay = [
+        {"type": "message", "role": "user", "content": "start goal"},
+        {"type": "compaction", "summary": "…"},
+        {"type": "message", "role": "assistant", "content": "working"},
+        {"type": "reasoning", "summary": [{"type": "summary_text", "text": "…"}]},
+        {"type": "function_call_output", "call_id": "c1", "output": "agents"},
+        {"type": "function_call_output", "call_id": "c2", "output": "goal-state"},
+    ]
+    steer = [
+        {"type": "function_call_output", "call_id": "c1", "output": "interrupted"},
+        {"role": "user", "content": "stop waiting and continue"},
+    ]
+
+    assert input_items_deliver_tool_outputs(post_compaction_replay)
+    assert not input_items_deliver_tool_outputs(steer)
+    assert not input_items_deliver_tool_outputs([])
+
+
+@pytest.mark.asyncio
+async def test_post_compaction_history_replay_adopts_instead_of_respawning(monkeypatch, tmp_path):
+    """Compaction stops Codex from sending previous_response_id, so the follow-up carries
+    the whole conversation inline. Treating that as a steer cancelled the agent that owned
+    the results and respawned it, which made the agent re-announce its plan every turn.
+    """
+    import codex_shim.server as server_module
+
+    agent = _FakeBridgeAgent()
+    monkeypatch.setattr(server_module, "cursor_passthrough_available", lambda: True)
+    monkeypatch.setattr(server_module, "iter_cursor_agent_events", agent)
+    monkeypatch.setattr(server_module, "cursor_upstream_model", lambda slug: "composer-2.5")
+
+    settings = tmp_path / "settings.json"
+    settings.write_text("{}")
+    client = TestClient(TestServer(ShimServer(settings).app()))
+    await client.start_server()
+    try:
+        body = _goal_tools_body()
+        body["stream"] = True
+        first = await _post_cursor_turn(client, body)
+
+        calls = [
+            event
+            for event in _sse_events(first)
+            if event.get("type") == "response.output_item.added"
+            and (event.get("item") or {}).get("type") == "function_call"
+        ]
+        assert len(calls) == 1
+        assert agent.spawns == 1
+
+        follow_up = _goal_tools_body()
+        follow_up["stream"] = True
+        # No previous_response_id: post-compaction Codex replays history inline.
+        follow_up["input"] = [
+            {"type": "message", "role": "user", "content": "Mark goal complete"},
+            {"type": "compaction", "summary": "earlier work summarized"},
+            {"type": "reasoning", "summary": [{"type": "summary_text", "text": "…"}]},
+            {
+                "type": "function_call_output",
+                "call_id": calls[0]["item"]["call_id"],
+                "output": "goal-created",
+            },
+        ]
+        second = await _post_cursor_turn(client, follow_up)
+
+        assert agent.spawns == 1, "replayed history must adopt the live agent, not respawn"
+        assert "Codex said: goal-created" in second
+    finally:
+        await client.close()

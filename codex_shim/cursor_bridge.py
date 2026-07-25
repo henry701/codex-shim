@@ -1230,6 +1230,35 @@ def input_items_are_only_tool_outputs(items: Any) -> bool:
     return saw_tool_output
 
 
+def input_items_deliver_tool_outputs(items: Any) -> bool:
+    """True when the *tail* of a Codex follow-up is tool results, not new user input.
+
+    Codex normally sends only the delta (``previous_response_id`` plus the outputs),
+    but after compaction it drops the response chain and replays the whole
+    conversation inline. Matching on the entire input therefore classified every
+    post-compaction delivery as a steer, so the shim cancelled the very agent that
+    owned those results and respawned it — which is why the agent re-announced its
+    plan every turn. Steering appends the user's text *after* the interrupted
+    outputs, so the tail still separates the two cases.
+    """
+    if not isinstance(items, list) or not items:
+        return False
+    saw_tool_output = False
+    for item in reversed(items):
+        if not isinstance(item, dict):
+            break
+        item_type = str(item.get("type") or "").strip()
+        if item_type in {"function_call_output", "custom_tool_call_output", "tool_search_output"}:
+            saw_tool_output = True
+            continue
+        if item_type in {"function_call", "custom_tool_call", "item_reference"}:
+            continue
+        if item_type.startswith("reasoning"):
+            continue
+        break
+    return saw_tool_output
+
+
 # Must never appear as assistant output — ends Desktop turns and causes goal loops.
 BRIDGE_DELIVERY_STUB_MARKER = "[codex-shim] Bridge delivered"
 

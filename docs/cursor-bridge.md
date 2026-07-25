@@ -48,9 +48,20 @@ records whatever was already streamed (thinking + tool text) into history, and
 sends a new turn with that history plus the steer text (see CLI
 `steer_interrupts_wait_agent_and_is_sent_in_follow_up_request`). The shim
 mirrors that: cancel the live cursor-agent on unexpected disconnect, and on any
-follow-up that is not a pure tool-output adopt kill the orphan still blocked on
+follow-up that is not a tool-output delivery kill the orphan still blocked on
 `wait` (including empty or steer-shaped turns). The next turn respawns from the
 conversation cache + new input.
+
+Adoption keys off the **tail** of `input`, not the whole list
+(`input_items_deliver_tool_outputs`). Codex normally sends just the delta
+(`previous_response_id` + outputs), but **after compaction it drops the response
+chain and replays the entire conversation inline**. Matching the whole input
+classified every post-compaction delivery as a steer, so the shim cancelled the
+agent that owned those very results and respawned it — the agent then
+re-announced its plan on each turn, producing a visible loop
+(`cancel bridge=X (orphaned by steer/interrupt call_id=call_X_1)` immediately
+after `early-complete bridge=X`). Steering appends the user's text *after* the
+interrupted outputs, so the tail still separates the two cases.
 
 Handoff disconnect is recognized only **after** `finish()` completes successfully
 during early-complete — a disconnect while the stream is still open (user cancel)
@@ -140,8 +151,15 @@ the parent when the sub's `FINAL_ANSWER` arrives.
 If the user cancels or Desktop sends a non-adopt follow-up (`input=0` wake,
 steer text, new user message) while an agent is blocked on bridge wait,
 `cancel_live_agents_for_session` kills the orphan cursor-agent immediately so it
-cannot keep editing files in the background. Pure tool-output adopts (next bridge
+cannot keep editing files in the background. Tool-output deliveries (next bridge
 round-trip) still preserve the agent. See **One agent per session** above.
+
+A sub-agent's `FINAL_ANSWER` only reaches the user if the parent turn that
+receives it survives long enough to speak. If the parent is caught in the
+respawn loop above, the verdict lands in history but is never rendered, and a
+following compaction can summarize it away — after which the parent re-reads
+`list_agents`, believes the completed sub-agent is stuck, and calls
+`interrupt_agent` on it repeatedly.
 
 ## Suffix protocol
 

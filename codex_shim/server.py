@@ -63,7 +63,7 @@ from .cursor_bridge import (
     cursor_bridge_enabled,
     cursor_bridge_registry,
     decide_tool_output_followup,
-    input_items_are_only_tool_outputs,
+    input_items_deliver_tool_outputs,
     BRIDGE_DELIVERY_STUB_MARKER,
     bridge_unknown_session_payload,
     is_loopback_peer,
@@ -2603,7 +2603,7 @@ class ShimServer:
             cursor_bridge_enabled()
             and bool(raw_body.get("stream"))
             and not force_non_stream
-            and input_items_are_only_tool_outputs(raw_body.get("input"))
+            and input_items_deliver_tool_outputs(raw_body.get("input"))
         ):
             adopt_session = cursor_bridge_registry.inflight_session_for_tool_outputs(
                 raw_body.get("input")
