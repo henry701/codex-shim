@@ -9,6 +9,7 @@ import re
 import secrets
 import string
 import time
+from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable
 
@@ -24,6 +25,9 @@ BRIDGE_PATH = "/_cursor_bridge/v1/invoke"
 BRIDGE_WAIT_PATH = "/_cursor_bridge/v1/wait"
 BRIDGE_POLL_PATH = "/_cursor_bridge/v1/poll"
 BRIDGE_SUFFIX_TAG = "[CODEX_SHIM_CURSOR_BRIDGE v1]"
+BRIDGE_TURN_CLOSED_EVENT = "bridge_turn_closed"
+BRIDGE_CALL_EVENT = "bridge_call"
+BRIDGE_EMIT_TIMEOUT_S = 30.0
 BRIDGE_ENV = "CODEX_SHIM_CURSOR_BRIDGE"
 BRIDGE_TTL_ENV = "CODEX_SHIM_CURSOR_BRIDGE_TTL_S"
 BRIDGE_TOOL_LIST_CAP_ENV = "CODEX_SHIM_CURSOR_BRIDGE_TOOL_LIST_CAP"
@@ -527,6 +531,11 @@ class CursorBridgeSession:
     _turn_closed: bool = False
     _waiter_count: int = 0
     _passthrough_finished: asyncio.Event = field(default_factory=asyncio.Event)
+    _events: asyncio.Queue[dict[str, Any] | None] = field(
+        default_factory=asyncio.Queue, repr=False
+    )
+    _agent_task: asyncio.Task[None] | None = field(default=None, repr=False)
+    _agent_finished: bool = False
     _post_terminal_text: list[str] = field(default_factory=list, repr=False)
 
     @classmethod
@@ -579,6 +588,91 @@ class CursorBridgeSession:
 
     def mark_turn_closed(self) -> None:
         self._turn_closed = True
+
+    def reopen_turn(self) -> None:
+        """Let the same agent emit more Codex tool calls on the next turn.
+
+        Early-complete closes the turn so Codex can run what was already emitted; the
+        agent itself is untouched and will keep invoking once its results arrive.
+        """
+        self._turn_closed = False
+        self._turn_complete_requested = False
+
+    def start_agent(self, events: AsyncIterator[dict[str, Any]]) -> None:
+        """Own the cursor-agent for the life of the session, not of one HTTP turn.
+
+        Codex can only run tool calls once the response stream ends, so a bridged turn
+        is cut short while the agent is still mid-thought. Draining it here keeps that
+        one process alive across turns and buffers whatever it emits until the next
+        turn adopts it; respawning instead would restart the agent from a rebuilt
+        prompt and lose everything it had already worked out.
+        """
+        if self._agent_task is not None:
+            return
+
+        async def _pump() -> None:
+            try:
+                async for event in events:
+                    await self._events.put(event)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                await self._events.put(
+                    {"type": "error", "message": str(exc).strip() or repr(exc)}
+                )
+            finally:
+                self._agent_finished = True
+                await self._events.put(None)
+
+        self._agent_task = asyncio.create_task(_pump())
+
+    def agent_alive(self) -> bool:
+        """True while the agent can still produce output (running or buffered)."""
+        if self._agent_task is None:
+            return False
+        return not self._agent_finished or not self._events.empty()
+
+    async def next_event(self, *, timeout_s: float) -> dict[str, Any] | None:
+        """Next buffered or live agent event; ``None`` once the agent is done.
+
+        Raises ``TimeoutError`` when the agent goes quiet.
+        """
+        return await asyncio.wait_for(self._events.get(), timeout=max(0.1, timeout_s))
+
+    def cancel_agent(self) -> None:
+        task = self._agent_task
+        self._agent_task = None
+        if task is not None and not task.done():
+            task.cancel()
+
+    async def _emit_call_in_stream_order(self, payload: dict[str, Any]) -> None:
+        """Queue a tool call behind the agent text that preceded it.
+
+        The agent produces text and tool calls as one sequence. Writing a call straight
+        to the response while earlier text is still queued reorders the turn, and the
+        stranded text is then cut off when the call closes the turn.
+        """
+        delivered = asyncio.Event()
+        self._events.put_nowait(
+            {"type": BRIDGE_CALL_EVENT, "emit": payload, "delivered": delivered}
+        )
+        try:
+            await asyncio.wait_for(delivered.wait(), timeout=BRIDGE_EMIT_TIMEOUT_S)
+        except TimeoutError as exc:
+            raise BridgeNotAttachedError(
+                "no Codex turn is streaming this bridge session right now"
+            ) from exc
+
+    async def deliver_queued_call(self, event: dict[str, Any]) -> None:
+        """Write a queued tool call into the turn that is currently streaming."""
+        emit = event.get("emit") or {}
+        delivered = event.get("delivered")
+        try:
+            if self._stream_emit is not None:
+                await self._stream_emit(**emit)
+        finally:
+            if isinstance(delivered, asyncio.Event):
+                delivered.set()
 
     def has_pending_jobs(self) -> bool:
         return any(job.status in {"pending", "ready"} for job in self._jobs_by_id.values())
@@ -652,6 +746,10 @@ class CursorBridgeSession:
             except Exception as exc:
                 print(f"[cursor-bridge] turn-complete failed bridge={self.bridge_id}: {exc}", flush=True)
         self._turn_closed = True
+        if self._agent_task is not None:
+            # The turn's consumer is parked on the event queue and the agent cannot emit
+            # again until Codex returns these results, so wake it to close the response.
+            self._events.put_nowait({"type": BRIDGE_TURN_CLOSED_EVENT})
 
     def complete_call(self, call_id: str, output: Any) -> bool:
         """Mark a pending job ready. Idempotent: already-ready/consumed → False."""
@@ -706,13 +804,17 @@ class CursorBridgeSession:
             cursor_bridge_registry.remember_call_tool(call_id, chat_name)
 
             if self._stream_emit is not None:
-                await self._stream_emit(
-                    name=emit_name,
-                    arguments=arguments,
-                    call_id=call_id,
-                    namespace=emit_namespace,
-                    chat_name=chat_name,
-                )
+                emit_payload = {
+                    "name": emit_name,
+                    "arguments": arguments,
+                    "call_id": call_id,
+                    "namespace": emit_namespace,
+                    "chat_name": chat_name,
+                }
+                if self._agent_task is not None:
+                    await self._emit_call_in_stream_order(emit_payload)
+                else:
+                    await self._stream_emit(**emit_payload)
             elif self._collector is not None:
                 self._collector.append_function_call(
                     name=emit_name,
@@ -943,16 +1045,45 @@ class CursorBridgeRegistry:
             return
         for call_id in list(session._jobs_by_call_id):
             self.unindex_call(call_id)
+        session.cancel_agent()
         session.detach_passthrough()
 
     def release_if_idle(self, bridge_id: str) -> None:
         session = self.get(bridge_id)
         if session is None:
             return
-        if session.has_pending_jobs() or session.has_active_waiters():
+        # A live agent is mid-thought between Codex turns; closing here would strand it
+        # and force the next turn to respawn from a rebuilt prompt.
+        if session.agent_alive() or session.has_pending_jobs() or session.has_active_waiters():
             session.detach_passthrough()
             return
         self.close(bridge_id)
+
+    def inflight_session_for_tool_outputs(self, items: Any) -> CursorBridgeSession | None:
+        """Session whose cursor-agent is still running and owns these tool outputs."""
+        if not isinstance(items, list):
+            return None
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            if str(item.get("type") or "").strip() not in {
+                "function_call_output",
+                "custom_tool_call_output",
+            }:
+                continue
+            call_id = str(item.get("call_id") or "").strip()
+            if not call_id:
+                continue
+            bridge_id = self._call_index.get(call_id)
+            session = self.get(bridge_id) if bridge_id else None
+            if session is None:
+                for candidate in list(self._sessions.values()):
+                    if call_id in candidate._jobs_by_call_id:
+                        session = candidate
+                        break
+            if session is not None and session.agent_alive():
+                return session
+        return None
 
     def has_active_waiters(self) -> bool:
         return any(session.has_active_waiters() for session in self._sessions.values())

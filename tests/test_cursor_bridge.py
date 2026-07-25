@@ -901,3 +901,224 @@ async def test_registry_remembers_tool_name_after_job_is_consumed():
         assert cursor_bridge_registry.tool_name_for_call("call_missing") is None
     finally:
         cursor_bridge_registry.close(session.bridge_id)
+
+
+class _FakeBridgeAgent:
+    """Scripted cursor-agent that drives the real bridge protocol.
+
+    Mirrors what the agent's curl calls do: emit text, invoke a Codex tool, block on
+    the result, then keep talking. Records how many times it was spawned so tests can
+    prove a follow-up turn continued this process instead of starting a new one.
+    """
+
+    def __init__(self) -> None:
+        self.spawns = 0
+        self.prompts: list[str] = []
+
+    def __call__(self, prompt, model, *, workspace=None):
+        self.spawns += 1
+        self.prompts.append(prompt)
+        return self._run(prompt)
+
+    async def _run(self, prompt: str):
+        yield {"type": "text_delta", "delta": "Inventorying the fork."}
+        bridge_id = ""
+        for line in prompt.splitlines():
+            if '"bridge"' in line and ":" in line:
+                bridge_id = line.split('"bridge"')[1].split('"')[1]
+                break
+        session = cursor_bridge_registry.get(bridge_id)
+        assert session is not None, f"agent could not find bridge {bridge_id!r}"
+        accepted = await session.invoke(
+            tool="create_goal", arguments={"objective": "merge fork"}, namespace="goals"
+        )
+        result = await session.wait_job(accepted["job_id"], timeout_s=5.0)
+        yield {"type": "text_delta", "delta": f"Codex said: {result.get('output')}."}
+        yield {"type": "completed", "text": "done"}
+
+
+async def _post_cursor_turn(client, payload: dict) -> str:
+    resp = await client.post(
+        "/v1/responses",
+        json=payload,
+        headers={"session-id": "adopt-session", "Host": "127.0.0.1"},
+    )
+    assert resp.status == 200
+    return await resp.text()
+
+
+@pytest.mark.asyncio
+async def test_tool_output_turn_adopts_inflight_agent_instead_of_respawning(monkeypatch, tmp_path):
+    """One cursor-agent must span the whole goal, across Codex tool round-trips.
+
+    Respawning per turn rebuilds the prompt from scratch, which is how the agent lost
+    its own reasoning and restarted its plan every turn.
+    """
+    import codex_shim.server as server_module
+
+    agent = _FakeBridgeAgent()
+    monkeypatch.setattr(server_module, "cursor_passthrough_available", lambda: True)
+    monkeypatch.setattr(server_module, "iter_cursor_agent_events", agent)
+    monkeypatch.setattr(server_module, "cursor_upstream_model", lambda slug: "composer-2.5")
+
+    settings = tmp_path / "settings.json"
+    settings.write_text("{}")
+    client = TestClient(TestServer(ShimServer(settings).app()))
+    await client.start_server()
+    try:
+        body = _goal_tools_body()
+        body["stream"] = True
+        first = await _post_cursor_turn(client, body)
+
+        calls = [
+            event
+            for event in _sse_events(first)
+            if event.get("type") == "response.output_item.added"
+            and (event.get("item") or {}).get("type") == "function_call"
+        ]
+        assert len(calls) == 1, "first turn should hand Codex the tool call"
+        call_id = calls[0]["item"]["call_id"]
+        assert agent.spawns == 1
+
+        follow_up = {
+            "model": "cursor-composer-2-5",
+            "stream": True,
+            "tools": body["tools"],
+            "input": [
+                {"type": "function_call_output", "call_id": call_id, "output": "goal-created"}
+            ],
+        }
+        second = await _post_cursor_turn(client, follow_up)
+
+        assert agent.spawns == 1, "follow-up must continue the live agent, not spawn another"
+        assert "Codex said: goal-created" in second
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_adopted_turn_falls_back_to_a_fresh_agent_when_none_is_live(monkeypatch, tmp_path):
+    """With no agent to adopt, the follow-up must still produce a real turn."""
+    import codex_shim.server as server_module
+
+    async def fake_events(prompt, model, *, workspace=None):
+        yield {"type": "text_delta", "delta": "fresh agent answer"}
+        yield {"type": "completed", "text": "fresh agent answer"}
+
+    monkeypatch.setattr(server_module, "cursor_passthrough_available", lambda: True)
+    monkeypatch.setattr(server_module, "iter_cursor_agent_events", fake_events)
+    monkeypatch.setattr(server_module, "cursor_upstream_model", lambda slug: "composer-2.5")
+
+    settings = tmp_path / "settings.json"
+    settings.write_text("{}")
+    client = TestClient(TestServer(ShimServer(settings).app()))
+    await client.start_server()
+    try:
+        text = await _post_cursor_turn(
+            client,
+            {
+                "model": "cursor-composer-2-5",
+                "stream": True,
+                "input": [
+                    {
+                        "type": "function_call_output",
+                        "call_id": "call_never_seen",
+                        "output": "orphan",
+                    }
+                ],
+            },
+        )
+        assert "fresh agent answer" in text
+    finally:
+        await client.close()
+
+
+class _TwoRoundBridgeAgent(_FakeBridgeAgent):
+    """Agent that invokes a second Codex tool after its first result arrives."""
+
+    async def _run(self, prompt: str):
+        bridge_id = ""
+        for line in prompt.splitlines():
+            if '"bridge"' in line and ":" in line:
+                bridge_id = line.split('"bridge"')[1].split('"')[1]
+                break
+        session = cursor_bridge_registry.get(bridge_id)
+        assert session is not None
+        first = await session.invoke(
+            tool="create_goal", arguments={"objective": "merge fork"}, namespace="goals"
+        )
+        created = await session.wait_job(first["job_id"], timeout_s=5.0)
+        yield {"type": "text_delta", "delta": f"Created: {created.get('output')}."}
+        second = await session.invoke(tool="get_goal", arguments={}, namespace="goals")
+        state = await session.wait_job(second["job_id"], timeout_s=5.0)
+        yield {"type": "text_delta", "delta": f"State: {state.get('output')}."}
+        yield {"type": "completed", "text": "done"}
+
+
+@pytest.mark.asyncio
+async def test_adopted_agent_can_invoke_more_tools_on_later_turns(monkeypatch, tmp_path):
+    """Early-complete closes the turn, not the session: the same agent keeps calling tools."""
+    import codex_shim.server as server_module
+
+    agent = _TwoRoundBridgeAgent()
+    monkeypatch.setattr(server_module, "cursor_passthrough_available", lambda: True)
+    monkeypatch.setattr(server_module, "iter_cursor_agent_events", agent)
+    monkeypatch.setattr(server_module, "cursor_upstream_model", lambda slug: "composer-2.5")
+
+    settings = tmp_path / "settings.json"
+    settings.write_text("{}")
+    client = TestClient(TestServer(ShimServer(settings).app()))
+    await client.start_server()
+    try:
+        tools = _goal_tools_body()["tools"]
+
+        def _call_ids(sse: str) -> list[str]:
+            return [
+                event["item"]["call_id"]
+                for event in _sse_events(sse)
+                if event.get("type") == "response.output_item.added"
+                and (event.get("item") or {}).get("type") == "function_call"
+            ]
+
+        first = await _post_cursor_turn(
+            client,
+            {
+                "model": "cursor-composer-2-5",
+                "stream": True,
+                "tools": tools,
+                "input": [{"role": "user", "content": "merge the fork"}],
+            },
+        )
+        call_one = _call_ids(first)
+        assert len(call_one) == 1
+
+        second = await _post_cursor_turn(
+            client,
+            {
+                "model": "cursor-composer-2-5",
+                "stream": True,
+                "tools": tools,
+                "input": [
+                    {"type": "function_call_output", "call_id": call_one[0], "output": "goal-1"}
+                ],
+            },
+        )
+        assert "Created: goal-1" in second
+        call_two = _call_ids(second)
+        assert len(call_two) == 1, "adopted turn must be able to emit a new Codex tool call"
+
+        third = await _post_cursor_turn(
+            client,
+            {
+                "model": "cursor-composer-2-5",
+                "stream": True,
+                "tools": tools,
+                "input": [
+                    {"type": "function_call_output", "call_id": call_two[0], "output": "goal-state"}
+                ],
+            },
+        )
+        assert "State: goal-state" in third
+        assert agent.spawns == 1, "three Codex turns must share one cursor-agent"
+    finally:
+        await client.close()

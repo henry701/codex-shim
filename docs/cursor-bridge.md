@@ -33,10 +33,21 @@ codex-shim bridge handler
     │ when next turn carries function_call_output → resolve job
     ▼
 Codex Desktop executes tool locally; result returns via wait/poll JSON.
-When the follow-up request is tool-output-only, the shim wakes waiters and
-reuses any leftover in-flight Cursor text; otherwise it continues with a normal
-Cursor passthrough (never a stub “delivered” assistant message).
 ```
+
+## One agent per session
+
+Codex only runs tool calls once the response stream ends, so a bridged turn is
+early-completed while cursor-agent is still mid-thought. The agent is **not**
+killed: the bridge session owns the process, buffers whatever it emits while no
+Codex turn is attached, and a tool-output-only follow-up **adopts** it —
+replaying the buffered output and then streaming live. The turn reopens, so the
+same agent keeps invoking tools across as many Codex round-trips as it needs.
+
+Respawning per turn instead would rebuild the prompt from the cached history and
+restart the agent from a blank slate, which made it re-announce the same plan
+every turn instead of making progress. A fresh agent is spawned only when there
+is no live one to adopt.
 
 ## Suffix protocol
 
@@ -51,9 +62,9 @@ block tagged `[CODEX_SHIM_CURSOR_BRIDGE v1]` containing:
 - Sub-agent and goal protocol notes
 
 Composer must **batch invokes**, then **wait/poll** for results. The first
-wait/poll early-completes the Codex stream so tools can run; further invokes on
-the same bridge session fail until the next Codex turn. File/shell/search/MCP
-work stays on Cursor-native tools — never via the bridge.
+wait/poll early-completes the Codex stream so tools can run; further invokes
+block until the next Codex turn adopts the agent and reopens the turn.
+File/shell/search/MCP work stays on Cursor-native tools — never via the bridge.
 
 ## HTTP API
 

@@ -10,6 +10,7 @@ import secrets
 import sys
 import time
 import uuid
+from collections.abc import AsyncIterator
 from pathlib import Path
 from dataclasses import dataclass
 from typing import Any, Literal, Mapping
@@ -51,14 +52,18 @@ from .compaction.strategies.bodies import (
 from .prompt_cache import format_prompt_cache_req_suffix
 from .compaction.types import CompactionRequest, NativeAttemptResult, SummarizationAttemptResult
 from .cursor_bridge import (
+    BRIDGE_CALL_EVENT,
+    BRIDGE_TURN_CLOSED_EVENT,
     BridgeError,
     BridgeToolNotAllowedError,
     CursorBridgeSession,
     build_bridge_suffix,
     bridge_tool_specs,
+    bridge_wait_timeout_ms,
     cursor_bridge_enabled,
     cursor_bridge_registry,
     decide_tool_output_followup,
+    input_items_are_only_tool_outputs,
     BRIDGE_DELIVERY_STUB_MARKER,
     bridge_unknown_session_payload,
     is_loopback_peer,
@@ -2590,6 +2595,24 @@ class ShimServer:
         slug = response_model_override or CURSOR_MODEL_SLUG
         upstream = upstream_model or cursor_upstream_model(slug)
         raw_body = body
+        # Prefer continuing the agent that emitted these tool calls over spawning a new
+        # one. Must run before ingest: completing the jobs unblocks the agent, which may
+        # invoke again immediately, and it needs this turn's stream already attached.
+        if (
+            cursor_bridge_enabled()
+            and bool(raw_body.get("stream"))
+            and not force_non_stream
+            and input_items_are_only_tool_outputs(raw_body.get("input"))
+        ):
+            adopt_session = cursor_bridge_registry.inflight_session_for_tool_outputs(
+                raw_body.get("input")
+            )
+            if adopt_session is not None:
+                adopted = await self._cursor_adopt_inflight_turn(
+                    request, raw_body, slug, adopt_session
+                )
+                if adopted is not None:
+                    return adopted
         # Snapshot waiter/early-close state BEFORE ingest: completing jobs wakes waiters
         # and can clear has_active_waiters() before we decide the delivery path.
         delivery_path = cursor_bridge_registry.has_active_waiters() or bool(
@@ -2780,16 +2803,30 @@ class ShimServer:
                     items,
                 )
 
+            if bridge_session is not None:
+                # The session owns the agent from here: this turn ends early so Codex can
+                # run the tool calls, but the agent keeps going and the next turn adopts it.
+                bridge_session.start_agent(
+                    iter_cursor_agent_events(prompt, upstream, workspace=cursor_workspace_path)
+                )
+                agent_events = _bridge_agent_events(bridge_session)
+            else:
+                agent_events = iter_cursor_agent_events(
+                    prompt, upstream, workspace=cursor_workspace_path
+                )
             try:
                 await state.start(response)
-                async for event in iter_cursor_agent_events(
-                    prompt,
-                    upstream,
-                    workspace=cursor_workspace_path,
-                ):
+                async for event in agent_events:
                     if state.terminal_emitted or state.failed:
-                        if bridge_session is not None and event.get("type") == "text_delta":
-                            bridge_session.append_post_terminal_text(str(event.get("delta") or ""))
+                        if bridge_session is not None:
+                            # Leave the remainder buffered for the adopting turn rather
+                            # than draining it into a stream Codex has stopped reading.
+                            break
+                        continue
+                    if event.get("type") == BRIDGE_TURN_CLOSED_EVENT:
+                        continue
+                    if event.get("type") == BRIDGE_CALL_EVENT and bridge_session is not None:
+                        await bridge_session.deliver_queued_call(event)
                         continue
                     if event["type"] == "usage":
                         normalized_usage = normalize_responses_usage(event.get("usage"))
@@ -2821,6 +2858,140 @@ class ShimServer:
                 bridge_session.mark_passthrough_finished()
                 # Keep session alive while jobs are pending so wait/poll can resolve.
                 cursor_bridge_registry.release_if_idle(bridge_session.bridge_id)
+
+    async def _cursor_adopt_inflight_turn(
+        self,
+        request: web.Request,
+        raw_body: dict[str, Any],
+        slug: str,
+        session: CursorBridgeSession,
+    ) -> web.StreamResponse | None:
+        """Continue the agent that emitted these tool calls instead of spawning a new one.
+
+        Returns ``None`` when the agent had nothing left to say, so the caller can fall
+        back to a normal turn; completing an empty stream would end the Desktop goal.
+        """
+        response = _sse_response()
+        state = ResponsesStreamState(
+            slug,
+            tool_types=session.tool_types,
+            tool_resolve=session.tool_resolve,
+        )
+        prepared = False
+
+        async def _ensure_prepared() -> None:
+            nonlocal prepared
+            if prepared:
+                return
+            prepared = True
+            await response.prepare(request)
+            await state.start(response)
+
+        async def _stream_emit(
+            *,
+            name: str,
+            arguments: dict[str, Any],
+            call_id: str,
+            namespace: str | None = None,
+            chat_name: str | None = None,
+        ) -> None:
+            if state.terminal_emitted or state.failed:
+                raise BridgeError(
+                    "bridge turn already completed; cannot emit more Codex tool calls on this session"
+                )
+            await _ensure_prepared()
+            await state.emit_synthetic_function_call(
+                response,
+                name=name,
+                arguments=arguments,
+                call_id=call_id,
+                namespace=namespace,
+                chat_name=chat_name,
+            )
+
+        async def _turn_complete() -> None:
+            if state.terminal_emitted or state.failed:
+                return
+            await _ensure_prepared()
+            print(
+                f"[cursor-bridge] early-complete bridge={session.bridge_id} (adopted) "
+                "so Codex can run pending tool calls",
+                flush=True,
+            )
+            await state.finish(response, upstream_saw_done=True)
+            session.mark_turn_closed()
+
+        session.attach_stream(_stream_emit)
+        session.attach_turn_complete(_turn_complete)
+        session.reopen_turn()
+        session.mark_passthrough_started()
+
+        ingested = cursor_bridge_registry.ingest_function_call_outputs(raw_body.get("input"))
+        print(
+            f"[cursor-bridge] adopt bridge={session.bridge_id} ingested={ingested} "
+            "— continuing the in-flight cursor-agent",
+            flush=True,
+        )
+
+        agent_done = False
+        try:
+            async for event in _bridge_agent_events(session):
+                if state.terminal_emitted or state.failed:
+                    break
+                event_type = event.get("type")
+                if event_type == BRIDGE_TURN_CLOSED_EVENT:
+                    continue
+                if event_type == BRIDGE_CALL_EVENT:
+                    await _ensure_prepared()
+                    await session.deliver_queued_call(event)
+                    continue
+                if event_type == "usage":
+                    normalized_usage = normalize_responses_usage(event.get("usage"))
+                    if normalized_usage:
+                        state.usage = normalized_usage
+                elif event_type == "error":
+                    await _ensure_prepared()
+                    await state.fail(
+                        response,
+                        str(event.get("message") or "cursor-agent failed"),
+                        code="upstream_error",
+                    )
+                    break
+                else:
+                    await _ensure_prepared()
+                    await _apply_cursor_stream_event(state, response, event)
+            else:
+                agent_done = not session.agent_alive()
+        except ClientDisconnected:
+            pass
+        except Exception as exc:
+            detail = str(exc).strip() or repr(exc)
+            print(f"[err] cursor adopt {slug}: {type(exc).__name__}: {detail}", flush=True)
+            if not prepared:
+                session.detach_passthrough()
+                return None
+        finally:
+            session.mark_passthrough_finished()
+
+        if not prepared:
+            session.detach_passthrough()
+            return None
+
+        await state.finish(response, upstream_saw_done=True)
+        cache_items = self._build_turn_cache_items(request, raw_body, state.output_items())
+        if cache_items:
+            await self._store_chatgpt_passthrough_conversation_async(
+                self._session_key(request),
+                state.response_id,
+                cache_items,
+            )
+        if agent_done:
+            cursor_bridge_registry.release_if_idle(session.bridge_id)
+        try:
+            await response.write_eof()
+        except Exception:
+            pass
+        return response
 
     async def _cursor_bridge_delivery_response(
         self,
@@ -5509,6 +5680,25 @@ class ResponsesStreamState:
                 {"type": "output_text", "text": turn["message_text"], "annotations": []}
             ] if turn["message_text"] else [],
         }
+
+
+async def _bridge_agent_events(
+    session: CursorBridgeSession,
+) -> AsyncIterator[dict[str, Any]]:
+    """Buffered + live events from the agent the session owns.
+
+    Stops on end-of-agent or when it has been quiet long enough that no Codex turn
+    should keep waiting on it.
+    """
+    idle_timeout_s = max(30.0, bridge_wait_timeout_ms() / 1000.0)
+    while True:
+        try:
+            event = await session.next_event(timeout_s=idle_timeout_s)
+        except TimeoutError:
+            return
+        if event is None:
+            return
+        yield event
 
 
 async def _apply_cursor_stream_event(
