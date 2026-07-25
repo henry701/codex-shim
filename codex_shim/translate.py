@@ -947,6 +947,13 @@ def _responses_input_to_messages(value: Any) -> list[dict[str, Any]]:
                         "content": f"Compacted conversation state:\n{summary}",
                     }
                 )
+        elif item_type == "agent_message":
+            # Codex collaboration delivers parent->child task text as `agent_message`.
+            # Dropping it leaves a spawned sub-agent with no task at all.
+            flush_pending_assistant_tool_calls()
+            agent_message = _agent_message_to_chat_message(item)
+            if agent_message:
+                messages.append(agent_message)
         elif item_type == "compaction_trigger":
             continue
         elif item_type == "reasoning":
@@ -983,6 +990,62 @@ def _responses_input_to_messages(value: Any) -> list[dict[str, Any]]:
         )
         messages.extend(deferred)
     return messages
+
+
+def _agent_message_looks_like_plaintext(value: str) -> bool:
+    """Inter-agent payloads ride in `encrypted_content` parts that are usually plain text.
+
+    Opaque reasoning blobs use the same field name, so only accept values that read
+    like prose rather than a single long token.
+    """
+    text = value.strip()
+    if not text:
+        return False
+    if len(text) > 64 and not re.search(r"\s", text):
+        return False
+    printable = sum(1 for ch in text if ch.isprintable() or ch in "\n\r\t")
+    return printable / len(text) > 0.9
+
+
+def _agent_message_text(item: dict[str, Any]) -> str:
+    parts: list[str] = []
+    content = item.get("content")
+    if isinstance(content, str):
+        parts.append(content)
+    elif isinstance(content, list):
+        for part in content:
+            if isinstance(part, str):
+                parts.append(part)
+                continue
+            if not isinstance(part, dict):
+                continue
+            part_type = part.get("type")
+            if part_type in {"text", "input_text", "output_text"}:
+                parts.append(str(part.get("text") or ""))
+            elif part_type == "encrypted_content":
+                blob = str(part.get("encrypted_content") or "")
+                if _agent_message_looks_like_plaintext(blob):
+                    parts.append(blob)
+    direct = item.get("message")
+    if isinstance(direct, str):
+        parts.append(direct)
+    return "\n".join(part for part in parts if part and part.strip()).strip()
+
+
+def _agent_message_to_chat_message(item: dict[str, Any]) -> dict[str, Any] | None:
+    text = _agent_message_text(item)
+    if not text:
+        return None
+    author = str(item.get("author") or "").strip()
+    recipient = str(item.get("recipient") or "").strip()
+    if not author and not recipient:
+        # No routing metadata: this is the agent's own prior message.
+        return {"role": "assistant", "content": text}
+    header = f"[agent message from {author or 'unknown'}"
+    if recipient:
+        header += f" to {recipient}"
+    header += "]"
+    return {"role": "user", "content": f"{header}\n{text}"}
 
 
 def _responses_content_to_chat_content(content: Any) -> str | list[dict[str, Any]]:

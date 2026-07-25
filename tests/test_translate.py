@@ -820,3 +820,82 @@ def test_empty_function_call_output_for_mcp_search_is_not_substituted():
     out = responses_to_chat(body, "upstream")
     tool_message = out["messages"][-1]
     assert tool_message["content"] == ""
+
+
+def _spawn_agent_message() -> dict:
+    """Real shape captured from a Codex rollout when the parent spawns a sub-agent."""
+    return {
+        "type": "agent_message",
+        "author": "/root",
+        "recipient": "/root/smoke_timeline_fix",
+        "content": [
+            {
+                "type": "input_text",
+                "text": "Message Type: NEW_TASK\nTask name: /root/smoke_timeline_fix\nSender: /root\nPayload:\n",
+            },
+            {
+                "type": "encrypted_content",
+                "encrypted_content": "Fix App smoke session-timeline failures.\nRepo: /home/henry/x\nWrite results to smoke-fix-v2.md",
+            },
+        ],
+        "internal_chat_message_metadata_passthrough": {"turn_id": "t1"},
+    }
+
+
+def test_agent_message_delivers_sub_agent_task_payload():
+    """Sub-agents got no task at all while `agent_message` was dropped in translation."""
+    body = {
+        "model": "slug",
+        "input": [
+            {"role": "developer", "content": "You are a sub-agent."},
+            _spawn_agent_message(),
+        ],
+    }
+    out = responses_to_chat(body, "real-model")
+    joined = "\n".join(str(message.get("content") or "") for message in out["messages"])
+    assert "Fix App smoke session-timeline failures." in joined
+    assert "Write results to smoke-fix-v2.md" in joined
+    assert "/root/smoke_timeline_fix" in joined
+    incoming = [m for m in out["messages"] if "agent message from /root" in str(m.get("content") or "")]
+    assert incoming and incoming[0]["role"] == "user"
+
+
+def test_agent_message_without_routing_is_the_agents_own_message():
+    body = {
+        "model": "slug",
+        "input": [
+            {"role": "user", "content": "go"},
+            {
+                "type": "agent_message",
+                "message": "Batching bridge invokes, then waiting for results.",
+                "phase": None,
+                "memory_citation": None,
+            },
+        ],
+    }
+    out = responses_to_chat(body, "real-model")
+    assert any(
+        m.get("role") == "assistant" and "Batching bridge invokes" in str(m.get("content") or "")
+        for m in out["messages"]
+    )
+
+
+def test_agent_message_skips_opaque_encrypted_blobs():
+    body = {
+        "model": "slug",
+        "input": [
+            {
+                "type": "agent_message",
+                "author": "/root",
+                "recipient": "/root/child",
+                "content": [
+                    {"type": "input_text", "text": "Message Type: NEW_TASK"},
+                    {"type": "encrypted_content", "encrypted_content": "A" * 400},
+                ],
+            }
+        ],
+    }
+    out = responses_to_chat(body, "real-model")
+    joined = "\n".join(str(message.get("content") or "") for message in out["messages"])
+    assert "Message Type: NEW_TASK" in joined
+    assert "A" * 400 not in joined

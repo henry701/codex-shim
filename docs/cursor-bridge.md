@@ -32,7 +32,10 @@ codex-shim bridge handler
     │ emit function_call SSE; on wait/poll, early-complete stream
     │ when next turn carries function_call_output → resolve job
     ▼
-Codex Desktop executes tool locally; result returns via wait/poll JSON
+Codex Desktop executes tool locally; result returns via wait/poll JSON.
+When the follow-up request is tool-output-only, the shim wakes waiters and
+reuses any leftover in-flight Cursor text; otherwise it continues with a normal
+Cursor passthrough (never a stub “delivered” assistant message).
 ```
 
 ## Suffix protocol
@@ -123,6 +126,9 @@ waits for at least one.
 {"ok": true, "bridge": "…", "jobs": [/* consumed job objects */], "pending": 0}
 ```
 
+When a session has neither ready nor pending jobs the reply adds `"idle": true` and a
+`hint`, because agents otherwise re-poll an empty session in a loop.
+
 Errors:
 
 | Status | Cause |
@@ -130,6 +136,13 @@ Errors:
 | 403 | Non-loopback peer |
 | 400 | Invalid JSON, missing fields, disallowed tool |
 | 404 | Unknown/expired bridge session or unknown `job_id` |
+
+A 404 for a stale bridge returns a JSON body (`error: "unknown_bridge"`, `retryable: false`)
+that tells the agent to switch to the current turn's bridge id instead of retrying. Bare
+404s previously produced reconnect storms and goals marked blocked after a shim restart.
+
+Sessions are reclaimed when idle, and a TTL sweep drops sessions whose jobs were left
+ready-but-unconsumed (a turn that invokes three tools but waits on one).
 
 ## Bridged tool set (denylist)
 
@@ -175,6 +188,10 @@ Injection is always driven by the HTTP invoke, not by parsing NDJSON.
 - **invoke ok but no tool effect** — you must `wait`/`poll` for `output`; invoke only accepts the job.
 - **Goals still loop** — confirm Composer ran invoke **and** wait/poll (check shell output for `output`), and that `update_goal` used `status: complete` or `blocked`.
 - **Sub-agents appear stuck** — batch `spawn_agent` / `send_message` / `wait_agent` invokes, then wait/poll; do not busy-loop `list_agents`/`get_goal`.
+- **Sub-agent polls the bridge instead of working** — its task arrives as an `agent_message`
+  input item (`author`/`recipient` plus the payload in an `encrypted_content` part).
+  The translator renders it as an attributed user message; if it is dropped the sub-agent
+  starts with no instructions at all.
 - **`create_goal` fails validation** — Codex requires an `objective` string, not `name`/`description`.
 - **`spawn_agent` fails validation** — requires `task_name` + `message`.
 

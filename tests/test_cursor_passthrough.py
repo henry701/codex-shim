@@ -408,3 +408,37 @@ async def test_iter_cursor_agent_events_does_not_kill_normal_completion(monkeypa
     assert proc.killed is False
     assert proc.returncode == 0
     assert events[-1] == {"type": "completed", "text": "Hello"}
+
+
+def test_cursor_prompt_carries_spawned_sub_agent_task():
+    """A spawned sub-agent runs on a Cursor model; its task arrives as `agent_message`.
+
+    While that item was dropped the sub-agent started with no instructions and fell
+    back to polling the bridge.
+    """
+    body = {
+        "model": "cursor-grok-4-5-high",
+        "input": [
+            {"role": "developer", "content": "You are a Codex sub-agent."},
+            {
+                "type": "agent_message",
+                "author": "/root",
+                "recipient": "/root/smoke_timeline_fix",
+                "content": [
+                    {
+                        "type": "input_text",
+                        "text": "Message Type: NEW_TASK\nTask name: /root/smoke_timeline_fix\nSender: /root\nPayload:\n",
+                    },
+                    {
+                        "type": "encrypted_content",
+                        "encrypted_content": "Fix the failing smoke specs and write results to smoke-fix-v2.md",
+                    },
+                ],
+            },
+        ],
+    }
+    prompt = build_cursor_prompt(body)
+    assert "Fix the failing smoke specs" in prompt
+    assert "smoke-fix-v2.md" in prompt
+    assert "agent message from /root to /root/smoke_timeline_fix" in prompt
+    assert prompt != "Continue."

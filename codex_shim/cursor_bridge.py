@@ -423,6 +423,9 @@ def build_bridge_suffix(session: CursorBridgeSession, port: int, *, workspace: s
         "- After the first wait/poll, this Codex stream is completed so tools can run; batch needed invokes first,\n"
         "  then wait/poll. Further invokes on the same bridge session will fail until the next Codex turn.\n"
         "- Do not busy-loop invoke/list_agents. Wait or poll instead.\n"
+        "- If a call returns {\"error\":\"unknown_bridge\"}, the session is gone (shim restart or ended turn):\n"
+        "  do not retry that bridge id, and do not mark the goal blocked — use the bridge id from the\n"
+        "  current turn's instructions, or answer as text if none is present.\n"
         "\n"
         "Bridged Codex tools (denylist excludes shell/file/web/MCP runners):\n"
         f"{catalog}\n"
@@ -439,6 +442,28 @@ def build_bridge_suffix(session: CursorBridgeSession, port: int, *, workspace: s
         "- update_goal requires {\"status\":\"complete\"} or {\"status\":\"blocked\"} (include goal_id when known).\n"
         "- get_goal reads current goal state.\n"
     )
+
+
+def bridge_unknown_session_payload(bridge_id: str, action: str) -> dict[str, Any]:
+    """Actionable body for a stale bridge id.
+
+    Bridge state is per-process and per-turn, so a shim restart or a finished turn
+    invalidates old ids. A bare 404 makes agents retry in a reconnect storm and then
+    mark the goal blocked, so spell out the recovery path instead.
+    """
+    return {
+        "ok": False,
+        "error": "unknown_bridge",
+        "action": action,
+        "bridge": str(bridge_id or ""),
+        "retryable": False,
+        "hint": (
+            "This bridge session no longer exists (the shim restarted or that Codex turn ended). "
+            "Do not retry this bridge id. Use the bridge id printed in the current turn's "
+            f"{BRIDGE_SUFFIX_TAG} block; if there is none, finish with a normal text answer instead "
+            "of reporting the goal as blocked."
+        ),
+    }
 
 
 def is_bridge_shell_command(command: str) -> bool:
@@ -629,8 +654,9 @@ class CursorBridgeSession:
         self._turn_closed = True
 
     def complete_call(self, call_id: str, output: Any) -> bool:
+        """Mark a pending job ready. Idempotent: already-ready/consumed → False."""
         job = self._jobs_by_call_id.get(str(call_id or "").strip())
-        if job is None or job.status not in {"pending", "ready"}:
+        if job is None or job.status != "pending":
             return False
         job.output = output
         job.status = "ready"
@@ -792,12 +818,21 @@ class CursorBridgeSession:
                     for job in list(self._jobs_by_id.values())
                     if job.status == "ready"
                 ]
-            return {
+            pending = sum(1 for job in self._jobs_by_id.values() if job.status == "pending")
+            result: dict[str, Any] = {
                 "ok": True,
                 "bridge": self.bridge_id,
                 "jobs": jobs,
-                "pending": sum(1 for job in self._jobs_by_id.values() if job.status == "pending"),
+                "pending": pending,
             }
+            if not jobs and not pending:
+                # Agents otherwise re-poll an empty session forever; say so explicitly.
+                result["idle"] = True
+                result["hint"] = (
+                    "No jobs on this bridge session. Stop polling: invoke a tool first, "
+                    "or continue your answer if there is nothing left to collect."
+                )
+            return result
         finally:
             self._waiter_count = max(0, self._waiter_count - 1)
 
@@ -811,7 +846,25 @@ class CursorBridgeRegistry:
     async def register(self, session: CursorBridgeSession) -> str:
         async with self._lock:
             self._sessions[session.bridge_id] = session
-            return session.bridge_id
+        self.prune_expired()
+        return session.bridge_id
+
+    def prune_expired(self) -> int:
+        """Drop sessions past their TTL.
+
+        A turn that invokes three tools but only waits on one leaves the rest ``ready``
+        forever, so ``release_if_idle`` never reclaims the session. Without this sweep
+        those sessions accumulate for the life of the process.
+        """
+        stale = [
+            session.bridge_id
+            for session in list(self._sessions.values())
+            if session.is_expired() and not session.has_active_waiters()
+        ]
+        for bridge_id in stale:
+            print(f"[cursor-bridge] prune-expired bridge={bridge_id}", flush=True)
+            self.close(bridge_id)
+        return len(stale)
 
     def get(self, bridge_id: str) -> CursorBridgeSession | None:
         session = self._sessions.get(str(bridge_id or "").strip())
@@ -902,20 +955,57 @@ class CursorBridgeRegistry:
 
 
 def input_items_are_only_tool_outputs(items: Any) -> bool:
-    """True when Codex follow-up input is solely tool results (no new user/assistant text)."""
+    """True when Codex follow-up input is tool results (+ optional reasoning), no new user text."""
     if not isinstance(items, list) or not items:
         return False
+    saw_tool_output = False
     for item in items:
         if not isinstance(item, dict):
             return False
         item_type = str(item.get("type") or "").strip()
         if item_type in {"function_call_output", "custom_tool_call_output", "tool_search_output"}:
+            saw_tool_output = True
             continue
         # Expand/cache may include paired function_call items; still delivery-only.
         if item_type in {"function_call", "custom_tool_call", "item_reference"}:
             continue
+        # Desktop often replays reasoning blocks alongside tool outputs.
+        if item_type in {"reasoning", "reasoning_text"} or item_type.startswith("reasoning"):
+            continue
         return False
-    return True
+    return saw_tool_output
+
+
+# Must never appear as assistant output — ends Desktop turns and causes goal loops.
+BRIDGE_DELIVERY_STUB_MARKER = "[codex-shim] Bridge delivered"
+
+
+def decide_tool_output_followup(
+    *,
+    ingested: int,
+    delivery_path: bool,
+    input_items: Any,
+    leftover: str,
+) -> str:
+    """How to handle a Cursor passthrough follow-up after ingesting bridge job outputs.
+
+    ``delivery_path`` is True when waiters were active *before* ingest and/or an
+    early-closed bridge session still has leftover Cursor text to reclaim.
+
+    Returns:
+      - ``\"reuse_leftover\"`` — complete with in-flight Cursor leftover text (no new agent)
+      - ``\"continue_cursor\"`` — wake waiters (already done) then run normal Cursor passthrough
+      - ``\"noop\"`` — no waiter-delivery path; proceed as usual
+
+    Never returns a synthetic stub message — that ends Desktop turns and causes goal loops.
+    """
+    if ingested <= 0 or not delivery_path:
+        return "noop"
+    if not input_items_are_only_tool_outputs(input_items):
+        return "noop"
+    if str(leftover or "").strip():
+        return "reuse_leftover"
+    return "continue_cursor"
 
 
 cursor_bridge_registry = CursorBridgeRegistry()

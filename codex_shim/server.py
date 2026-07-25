@@ -58,7 +58,9 @@ from .cursor_bridge import (
     bridge_tool_specs,
     cursor_bridge_enabled,
     cursor_bridge_registry,
-    input_items_are_only_tool_outputs,
+    decide_tool_output_followup,
+    BRIDGE_DELIVERY_STUB_MARKER,
+    bridge_unknown_session_payload,
     is_loopback_peer,
     shim_port_from_request_host,
 )
@@ -2587,23 +2589,51 @@ class ShimServer:
         slug = response_model_override or CURSOR_MODEL_SLUG
         upstream = upstream_model or cursor_upstream_model(slug)
         raw_body = body
+        # Snapshot waiter/early-close state BEFORE ingest: completing jobs wakes waiters
+        # and can clear has_active_waiters() before we decide the delivery path.
+        delivery_path = cursor_bridge_registry.has_active_waiters() or bool(
+            cursor_bridge_registry.early_closed_sessions()
+        )
         # Resolve async bridge jobs from prior turn before rewriting input.
         ingested = cursor_bridge_registry.ingest_function_call_outputs(raw_body.get("input"))
         if ingested:
             print(f"[cursor-bridge] ingested {ingested} tool output(s) into jobs", flush=True)
-        # When wait/poll is blocked on those jobs, do not spawn a duplicate Cursor turn —
-        # deliver results via HTTP and let the in-flight Composer continue.
-        if (
-            ingested > 0
-            and cursor_bridge_registry.has_active_waiters()
-            and input_items_are_only_tool_outputs(raw_body.get("input"))
-        ):
-            print(
-                f"[cursor-bridge] suppress-cursor delivery ingested={ingested} "
-                "(active waiters; tool-output-only follow-up)",
-                flush=True,
+        # If wait/poll is blocked on those jobs, wake them and prefer any leftover
+        # assistant text from the in-flight Cursor turn. Never emit a stub message —
+        # an empty synthetic completion ends the Desktop turn and causes goal loops.
+        if ingested > 0 and delivery_path:
+            # Peek decision without leftover first; only block on passthrough when needed.
+            provisional = decide_tool_output_followup(
+                ingested=ingested,
+                delivery_path=True,
+                input_items=raw_body.get("input"),
+                leftover="",
             )
-            return await self._cursor_bridge_delivery_response(request, raw_body, slug)
+            if provisional in {"reuse_leftover", "continue_cursor"}:
+                leftover = await cursor_bridge_registry.wait_for_delivery_passthroughs(timeout_s=180.0)
+                decision = decide_tool_output_followup(
+                    ingested=ingested,
+                    delivery_path=True,
+                    input_items=raw_body.get("input"),
+                    leftover=leftover,
+                )
+                if decision == "reuse_leftover":
+                    print(
+                        f"[cursor-bridge] delivery-reuse ingested={ingested} "
+                        f"leftover_chars={len(leftover)}",
+                        flush=True,
+                    )
+                    return await self._cursor_bridge_delivery_response(
+                        request,
+                        raw_body,
+                        slug,
+                        message=leftover,
+                    )
+                print(
+                    f"[cursor-bridge] delivery-wake ingested={ingested}; "
+                    "no leftover text — continuing with Cursor passthrough",
+                    flush=True,
+                )
 
         body = self._apply_responses_input_pipeline(
             body,
@@ -2758,8 +2788,9 @@ class ShimServer:
             except ClientDisconnected:
                 pass
             except Exception as exc:
-                print(f"[err] cursor passthrough {slug}: {exc}", flush=True)
-                raise web.HTTPBadGateway(text=str(exc)) from exc
+                detail = str(exc).strip() or repr(exc)
+                print(f"[err] cursor passthrough {slug}: {type(exc).__name__}: {detail}", flush=True)
+                raise web.HTTPBadGateway(text=detail) from exc
             try:
                 await response.write_eof()
             except Exception:
@@ -2776,19 +2807,19 @@ class ShimServer:
         request: web.Request,
         raw_body: dict[str, Any],
         slug: str,
+        *,
+        message: str,
     ) -> web.StreamResponse:
-        """Complete a tool-output follow-up without starting a new cursor-agent.
-
-        Waits for in-flight wait/poll callers and the early-completed Cursor turn to
-        finish so post-wait local work (e.g. writing files) can complete. Returns any
-        leftover assistant text from that turn.
-        """
-        leftover = await cursor_bridge_registry.wait_for_delivery_passthroughs(timeout_s=180.0)
+        """Return leftover assistant text from an in-flight Cursor turn (no stub)."""
+        text = str(message or "").strip()
+        if not text:
+            raise web.HTTPInternalServerError(text="bridge delivery response requires non-empty message")
+        if BRIDGE_DELIVERY_STUB_MARKER in text:
+            raise web.HTTPInternalServerError(
+                text="bridge delivery response must not use the synthetic delivery stub"
+            )
         stream = bool(raw_body.get("stream"))
         response_id = f"resp_{int(time.time() * 1000)}"
-        message = leftover or (
-            "[codex-shim] Bridge delivered Codex tool results to the in-flight Cursor turn."
-        )
         if not stream:
             payload = {
                 "id": response_id,
@@ -2800,7 +2831,7 @@ class ShimServer:
                         "type": "message",
                         "id": f"msg_{int(time.time() * 1000)}",
                         "role": "assistant",
-                        "content": [{"type": "output_text", "text": message}],
+                        "content": [{"type": "output_text", "text": text}],
                     }
                 ],
             }
@@ -2810,13 +2841,21 @@ class ShimServer:
         await response.prepare(request)
         state = ResponsesStreamState(slug)
         await state.start(response)
-        await state._text_delta(response, message)
+        await state._text_delta(response, text)
         await state.finish(response, upstream_saw_done=True)
         try:
             await response.write_eof()
         except Exception:
             pass
         return response
+
+    def _bridge_unknown_session_response(self, bridge_id: str, action: str) -> web.Response:
+        payload = bridge_unknown_session_payload(bridge_id, action)
+        print(
+            f"[cursor-bridge] unknown-bridge action={action} bridge={bridge_id or '-'}",
+            flush=True,
+        )
+        return web.json_response(payload, status=404)
 
     async def cursor_bridge_invoke(self, request: web.Request) -> web.Response:
         if not is_loopback_peer(request.remote):
@@ -2845,7 +2884,7 @@ class ShimServer:
 
         session = cursor_bridge_registry.get(bridge_id)
         if session is None:
-            raise web.HTTPNotFound(text="Unknown or expired bridge session")
+            return self._bridge_unknown_session_response(bridge_id, "invoke")
 
         try:
             result = await session.invoke(
@@ -2894,7 +2933,7 @@ class ShimServer:
 
         session = cursor_bridge_registry.get(bridge_id)
         if session is None:
-            raise web.HTTPNotFound(text="Unknown or expired bridge session")
+            return self._bridge_unknown_session_response(bridge_id, "wait")
 
         result = await session.wait_job(job_id, timeout_s=timeout_s)
         status = 200 if result.get("ok") else (404 if result.get("error") == "unknown_job" else 200)
@@ -2927,7 +2966,7 @@ class ShimServer:
 
         session = cursor_bridge_registry.get(bridge_id)
         if session is None:
-            raise web.HTTPNotFound(text="Unknown or expired bridge session")
+            return self._bridge_unknown_session_response(bridge_id, "poll")
 
         result = await session.poll_jobs(timeout_s=timeout_s)
         print(
@@ -6025,6 +6064,10 @@ def _summarize_input_items(input_items: Any, *, tail: int = 6) -> tuple[int, lis
             role = item.get("role")
             if role:
                 extra = f"(role={role})"
+        elif item_type == "agent_message":
+            author = str(item.get("author") or "")
+            recipient = str(item.get("recipient") or "")
+            extra = f"(from={author} to={recipient})" if author or recipient else "(self)"
         summary.append(f"{item_type}{extra}")
     return len(input_items), summary
 

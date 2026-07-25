@@ -592,18 +592,274 @@ async def test_bridge_wait_http_handler_blocks_until_ingest():
 
 
 @pytest.mark.asyncio
-async def test_bridge_suppresses_duplicate_cursor_when_waiters_active():
-    from codex_shim.cursor_bridge import input_items_are_only_tool_outputs
+async def test_bridge_tool_output_followup_never_uses_delivery_stub():
+    from pathlib import Path
 
-    assert input_items_are_only_tool_outputs(
-        [{"type": "function_call_output", "call_id": "c1", "output": "x"}]
+    from codex_shim.cursor_bridge import (
+        BRIDGE_DELIVERY_STUB_MARKER,
+        decide_tool_output_followup,
+        input_items_are_only_tool_outputs,
     )
-    assert not input_items_are_only_tool_outputs(
-        [
-            {"type": "function_call_output", "call_id": "c1", "output": "x"},
-            {"role": "user", "content": "hi"},
+
+    only_outputs = [
+        {"type": "function_call_output", "call_id": "c1", "output": "goal-state"},
+        {"type": "function_call_output", "call_id": "c2", "output": "agents"},
+    ]
+    desktop_shaped = [
+        {"type": "reasoning", "summary": [{"type": "summary_text", "text": "…"}]},
+        {"type": "function_call_output", "call_id": "c1", "output": "x"},
+    ]
+    with_user = [
+        {"type": "function_call_output", "call_id": "c1", "output": "x"},
+        {"role": "user", "content": "hi"},
+    ]
+
+    assert input_items_are_only_tool_outputs(only_outputs)
+    assert input_items_are_only_tool_outputs(desktop_shaped)
+    assert not input_items_are_only_tool_outputs(with_user)
+
+    # Empty leftover must continue Cursor — never a stub completion.
+    assert (
+        decide_tool_output_followup(
+            ingested=3,
+            delivery_path=True,
+            input_items=only_outputs,
+            leftover="",
+        )
+        == "continue_cursor"
+    )
+    assert (
+        decide_tool_output_followup(
+            ingested=3,
+            delivery_path=True,
+            input_items=desktop_shaped,
+            leftover="   ",
+        )
+        == "continue_cursor"
+    )
+    assert (
+        decide_tool_output_followup(
+            ingested=2,
+            delivery_path=True,
+            input_items=only_outputs,
+            leftover="Real leftover from in-flight turn",
+        )
+        == "reuse_leftover"
+    )
+    assert (
+        decide_tool_output_followup(
+            ingested=2,
+            delivery_path=True,
+            input_items=with_user,
+            leftover="",
+        )
+        == "noop"
+    )
+    assert (
+        decide_tool_output_followup(
+            ingested=2,
+            delivery_path=False,
+            input_items=only_outputs,
+            leftover="",
+        )
+        == "noop"
+    )
+    # Guard: never reintroduce the Desktop-ending stub prose as an emitted string.
+    root = Path(__file__).resolve().parents[1] / "codex_shim"
+    banned = "Bridge delivered Codex tool results"
+    for rel in ("server.py", "cursor_bridge.py", "cursor_passthrough.py"):
+        assert banned not in (root / rel).read_text()
+
+
+@pytest.mark.asyncio
+async def test_bridge_ingest_is_idempotent_for_already_ready_jobs():
+    """Desktop replays function_call_output in expanded history; ingest must not re-count."""
+    body = _goal_tools_body()
+    from codex_shim.translate import responses_tool_resolve_map, responses_tool_type_map
+
+    tool_types = responses_tool_type_map(body["tools"])
+    tool_resolve = responses_tool_resolve_map(body["tools"])
+    session = CursorBridgeSession.create(
+        allowed_tools=bridge_allowed_tools(body),
+        tool_types=tool_types,
+        tool_resolve=tool_resolve,
+        tool_specs=bridge_tool_specs(body),
+    )
+    collector = CursorResponseCollector(tool_types=tool_types, tool_resolve=tool_resolve)
+    session.attach_collector(collector)
+    await cursor_bridge_registry.register(session)
+    try:
+        accepted = await session.invoke(
+            tool="update_goal",
+            arguments={"status": "complete"},
+            namespace="goals",
+        )
+        call_id = accepted["codex_call_id"]
+        items = [
+            {"type": "function_call_output", "call_id": call_id, "output": "first"},
         ]
+        assert cursor_bridge_registry.ingest_function_call_outputs(items) == 1
+        assert cursor_bridge_registry.ingest_function_call_outputs(items) == 0
+        assert cursor_bridge_registry.ingest_function_call_outputs(items) == 0
+        result = await session.wait_job(accepted["job_id"], timeout_s=1.0)
+        assert result["ok"] is True
+        assert result["output"] == "first"
+    finally:
+        cursor_bridge_registry.close(session.bridge_id)
+
+
+@pytest.mark.asyncio
+async def test_bridge_delivery_response_rejects_empty_message():
+    shim = ShimServer()
+    with pytest.raises(Exception) as excinfo:
+        await shim._cursor_bridge_delivery_response(
+            request=None,  # type: ignore[arg-type]
+            raw_body={"stream": False},
+            slug="cursor-composer-2-5",
+            message="",
+        )
+    # aiohttp HTTPInternalServerError or similar
+    assert "non-empty" in str(excinfo.value).lower() or getattr(excinfo.value, "status", None) == 500
+
+
+@pytest.mark.asyncio
+async def test_bridge_delivery_response_rejects_stub_marker_message():
+    """Regression: synthetic 'Bridge delivered…' must never be emitted as assistant text."""
+    from codex_shim.cursor_bridge import BRIDGE_DELIVERY_STUB_MARKER
+
+    shim = ShimServer()
+    stub = f"{BRIDGE_DELIVERY_STUB_MARKER} Codex tool results to the in-flight Cursor turn."
+    with pytest.raises(Exception) as excinfo:
+        await shim._cursor_bridge_delivery_response(
+            request=None,  # type: ignore[arg-type]
+            raw_body={"stream": False},
+            slug="cursor-composer-2-5",
+            message=stub,
+        )
+    assert "stub" in str(excinfo.value).lower() or getattr(excinfo.value, "status", None) == 500
+
+
+@pytest.mark.asyncio
+async def test_bridge_poll_reports_idle_when_session_has_no_jobs():
+    """Live logs showed agents re-polling `jobs=0 pending=0` sessions in a loop."""
+    body = _goal_tools_body()
+    session = CursorBridgeSession.create(
+        allowed_tools=bridge_allowed_tools(body),
+        tool_types={},
+        tool_resolve={},
+        tool_specs=bridge_tool_specs(body),
     )
+    session.attach_collector(CursorResponseCollector(tool_types={}, tool_resolve={}))
+    await cursor_bridge_registry.register(session)
+    try:
+        idle = await session.poll_jobs(timeout_s=0.0)
+        assert idle["ok"] is True
+        assert idle["jobs"] == []
+        assert idle["pending"] == 0
+        assert idle["idle"] is True
+        assert "stop polling" in idle["hint"].lower()
+
+        accepted = await session.invoke(tool="get_goal", arguments={}, namespace="goals")
+        busy = await session.poll_jobs(timeout_s=0.0)
+        assert busy["pending"] == 1
+        assert "idle" not in busy
+
+        cursor_bridge_registry.ingest_function_call_outputs(
+            [
+                {
+                    "type": "function_call_output",
+                    "call_id": accepted["codex_call_id"],
+                    "output": "goal-state",
+                }
+            ]
+        )
+        drained = await session.poll_jobs(timeout_s=0.0)
+        assert len(drained["jobs"]) == 1
+        assert "idle" not in drained
+    finally:
+        cursor_bridge_registry.close(session.bridge_id)
+
+
+@pytest.mark.asyncio
+async def test_registry_prunes_expired_sessions_with_unconsumed_jobs():
+    """Turns that invoke 3 tools but wait on 1 leave `ready` jobs; sessions must still expire."""
+    body = _goal_tools_body()
+    session = CursorBridgeSession.create(
+        allowed_tools=bridge_allowed_tools(body),
+        tool_types={},
+        tool_resolve={},
+        tool_specs=bridge_tool_specs(body),
+    )
+    session.attach_collector(CursorResponseCollector(tool_types={}, tool_resolve={}))
+    await cursor_bridge_registry.register(session)
+    stale_id = session.bridge_id
+    try:
+        accepted = await session.invoke(tool="get_goal", arguments={}, namespace="goals")
+        cursor_bridge_registry.ingest_function_call_outputs(
+            [
+                {
+                    "type": "function_call_output",
+                    "call_id": accepted["codex_call_id"],
+                    "output": "never-consumed",
+                }
+            ]
+        )
+        # Ready-but-unconsumed keeps release_if_idle from reclaiming the session.
+        cursor_bridge_registry.release_if_idle(stale_id)
+        assert cursor_bridge_registry.get(stale_id) is not None
+
+        session.created_at -= session.ttl_s + 1
+        assert cursor_bridge_registry.prune_expired() == 1
+        assert cursor_bridge_registry.get(stale_id) is None
+    finally:
+        cursor_bridge_registry.close(stale_id)
+
+
+@pytest.mark.asyncio
+async def test_bridge_routes_return_actionable_unknown_bridge_error():
+    """A stale bridge id (shim restart / ended turn) must not read as a hard failure.
+
+    A bare 404 caused reconnect storms and goals being marked blocked.
+    """
+    shim = ShimServer()
+    client = TestClient(TestServer(shim.app()))
+    await client.start_server()
+    try:
+        cases = [
+            ("invoke", {"bridge": "gone", "tool": "get_goal", "arguments": {}}),
+            ("wait", {"bridge": "gone", "job_id": "j1", "timeout_ms": 0}),
+            ("poll", {"bridge": "gone", "timeout_ms": 0}),
+        ]
+        for action, body in cases:
+            async with client.post(
+                f"/_cursor_bridge/v1/{action}",
+                json=body,
+                headers={"Host": "127.0.0.1"},
+            ) as resp:
+                assert resp.status == 404
+                payload = await resp.json()
+            assert payload["ok"] is False
+            assert payload["error"] == "unknown_bridge"
+            assert payload["action"] == action
+            assert payload["retryable"] is False
+            hint = payload["hint"].lower()
+            assert "do not retry" in hint
+            assert "blocked" in hint
+    finally:
+        await client.close()
+
+
+def test_bridge_suffix_documents_unknown_bridge_recovery():
+    body = _goal_tools_body()
+    session = CursorBridgeSession.create(
+        allowed_tools=bridge_allowed_tools(body),
+        tool_types={},
+        tool_resolve={},
+        tool_specs=bridge_tool_specs(body),
+    )
+    suffix = build_bridge_suffix(session, 8765)
+    assert "unknown_bridge" in suffix
+    assert "do not mark the goal blocked" in suffix
 
 
 def test_build_bridge_suffix_documents_wait_and_poll():
