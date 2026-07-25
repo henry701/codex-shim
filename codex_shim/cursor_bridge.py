@@ -21,15 +21,19 @@ from .translate import (
 )
 
 BRIDGE_PATH = "/_cursor_bridge/v1/invoke"
+BRIDGE_WAIT_PATH = "/_cursor_bridge/v1/wait"
+BRIDGE_POLL_PATH = "/_cursor_bridge/v1/poll"
 BRIDGE_SUFFIX_TAG = "[CODEX_SHIM_CURSOR_BRIDGE v1]"
 BRIDGE_ENV = "CODEX_SHIM_CURSOR_BRIDGE"
 BRIDGE_TTL_ENV = "CODEX_SHIM_CURSOR_BRIDGE_TTL_S"
 BRIDGE_TOOL_LIST_CAP_ENV = "CODEX_SHIM_CURSOR_BRIDGE_TOOL_LIST_CAP"
+BRIDGE_WAIT_TIMEOUT_ENV = "CODEX_SHIM_CURSOR_BRIDGE_WAIT_TIMEOUT_MS"
 
 DEFAULT_BRIDGE_TTL_S = 1800.0
 DEFAULT_SUFFIX_TOOL_LIST_CAP = 40
+DEFAULT_BRIDGE_WAIT_TIMEOUT_MS = 180_000
 _BRIDGE_ID_ALPHABET = string.ascii_letters + string.digits
-_BRIDGE_SHELL_MARKER = re.compile(r"/_cursor_bridge/v1/invoke", re.IGNORECASE)
+_BRIDGE_SHELL_MARKER = re.compile(r"/_cursor_bridge/v1/(invoke|wait|poll)", re.IGNORECASE)
 _BRIDGE_TOOL_JSON_RE = re.compile(r'"tool"\s*:\s*"([^"\\]+)"')
 
 # Cursor already has shell/file/search/MCP. Bridge only Codex-native control-plane tools
@@ -84,6 +88,14 @@ class BridgeNotAttachedError(BridgeError):
     """No stream emitter or collector attached to the session."""
 
 
+class BridgeJobUnknownError(BridgeError):
+    """job_id is unknown or already consumed."""
+
+
+class BridgeJobTimeoutError(BridgeError):
+    """Timed out waiting for a Codex tool result."""
+
+
 @dataclass(frozen=True)
 class BridgeToolSpec:
     chat_name: str
@@ -123,7 +135,21 @@ def bridge_tool_list_cap() -> int:
         return DEFAULT_SUFFIX_TOOL_LIST_CAP
 
 
+def bridge_wait_timeout_ms() -> int:
+    raw = os.environ.get(BRIDGE_WAIT_TIMEOUT_ENV, "").strip()
+    if not raw:
+        return DEFAULT_BRIDGE_WAIT_TIMEOUT_MS
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        return DEFAULT_BRIDGE_WAIT_TIMEOUT_MS
+
+
 def generate_bridge_id(length: int = 16) -> str:
+    return "".join(secrets.choice(_BRIDGE_ID_ALPHABET) for _ in range(length))
+
+
+def generate_job_id(length: int = 12) -> str:
     return "".join(secrets.choice(_BRIDGE_ID_ALPHABET) for _ in range(length))
 
 
@@ -315,6 +341,14 @@ def build_bridge_invoke_url(port: int) -> str:
     return f"http://127.0.0.1:{port}{BRIDGE_PATH}"
 
 
+def build_bridge_wait_url(port: int) -> str:
+    return f"http://127.0.0.1:{port}{BRIDGE_WAIT_PATH}"
+
+
+def build_bridge_poll_url(port: int) -> str:
+    return f"http://127.0.0.1:{port}{BRIDGE_POLL_PATH}"
+
+
 def _format_tool_catalog(specs: list[BridgeToolSpec], *, cap: int) -> str:
     if not specs:
         return "(none — no Codex-native tools on this turn)"
@@ -345,29 +379,50 @@ def _format_tool_catalog(specs: list[BridgeToolSpec], *, cap: int) -> str:
 
 def build_bridge_suffix(session: CursorBridgeSession, port: int, *, workspace: str | None = None) -> str:
     invoke_url = build_bridge_invoke_url(port)
+    wait_url = build_bridge_wait_url(port)
+    poll_url = build_bridge_poll_url(port)
     curl_body = (
         '{"bridge":"'
         + session.bridge_id
         + '","tool":"TOOL","namespace":"NAMESPACE_OR_EMPTY","arguments":ARGUMENTS}'
     )
+    wait_body = '{"bridge":"' + session.bridge_id + '","job_id":"JOB_ID","timeout_ms":TIMEOUT_MS}'
+    poll_body = '{"bridge":"' + session.bridge_id + '","timeout_ms":TIMEOUT_MS}'
     workspace_line = f"Codex workspace path: {workspace}\n\n" if workspace else ""
     catalog = _format_tool_catalog(session.tool_specs, cap=bridge_tool_list_cap())
+    default_timeout = bridge_wait_timeout_ms()
     return (
         f"{BRIDGE_SUFFIX_TAG}\n"
         f"Bridge session: {session.bridge_id}\n"
-        f"Invoke URL: {invoke_url}\n\n"
+        f"Invoke URL: {invoke_url}\n"
+        f"Wait URL: {wait_url}\n"
+        f"Poll URL: {poll_url}\n\n"
         f"{workspace_line}"
         "You are running under Cursor/Composer. Use Cursor's own tools for files, shell, search, and MCP.\n"
         "For Codex-native control-plane tools below (goals, sub-agents/collaboration, plan/UI helpers),\n"
-        "you MUST call them through this bridge via your Shell tool with EXACTLY this pattern\n"
-        "(substitute TOOL, NAMESPACE_OR_EMPTY, and ARGUMENTS only; do not alter bridge/URL/headers):\n"
+        "you MUST use this async bridge via your Shell tool.\n"
         "\n"
+        "Protocol (mandatory — do not skip wait/poll):\n"
+        "1) Invoke (returns immediately with job_id; does NOT include Codex tool output):\n"
         f"curl -sS -X POST '{invoke_url}' \\\n"
         "  -H 'Content-Type: application/json' \\\n"
         f"  -d '{curl_body}'\n"
+        "2) Wait for that job's Codex result (blocks until ready; substitute JOB_ID from step 1):\n"
+        f"curl -sS -X POST '{wait_url}' \\\n"
+        "  -H 'Content-Type: application/json' \\\n"
+        f"  -d '{wait_body}'\n"
+        f"   Default TIMEOUT_MS={default_timeout}. Use the returned JSON `output` (success or error text).\n"
+        "3) Pull channel (optional): poll returns any ready results and removes them so they are not duplicated:\n"
+        f"curl -sS -X POST '{poll_url}' \\\n"
+        "  -H 'Content-Type: application/json' \\\n"
+        f"  -d '{poll_body}'\n"
         "\n"
-        "For non-namespaced tools set \"namespace\":\"\". ARGUMENTS must be a JSON object.\n"
-        "Wait for curl stdout JSON before continuing. Never pretend a bridged tool ran.\n"
+        "Rules:\n"
+        "- For non-namespaced tools set \"namespace\":\"\". ARGUMENTS must be a JSON object.\n"
+        "- Never pretend a bridged tool ran. Never re-invoke the same logical action until wait/poll returned its result.\n"
+        "- After the first wait/poll, this Codex stream is completed so tools can run; batch needed invokes first,\n"
+        "  then wait/poll. Further invokes on the same bridge session will fail until the next Codex turn.\n"
+        "- Do not busy-loop invoke/list_agents. Wait or poll instead.\n"
         "\n"
         "Bridged Codex tools (denylist excludes shell/file/web/MCP runners):\n"
         f"{catalog}\n"
@@ -375,7 +430,7 @@ def build_bridge_suffix(session: CursorBridgeSession, port: int, *, workspace: s
         "Sub-agent protocol (critical):\n"
         "- spawn_agent: required {\"task_name\":\"...\",\"message\":\"...\"}; keep task_name lowercase/digits/underscores.\n"
         "- send_message / followup_task: required {\"target\":\"...\",\"message\":\"...\"} using ids/paths from spawn_agent or list_agents.\n"
-        "- wait_agent: optional {\"timeout_ms\":N}; use after spawn/send when waiting for mailbox updates — do not busy-loop list_agents alone.\n"
+        "- wait_agent: optional {\"timeout_ms\":N}; after invoke, use bridge wait/poll for the Codex result — do not spam list_agents.\n"
         "- list_agents: inspect live agents; interrupt_agent: {\"target\":\"...\"}.\n"
         "- Prefer send_message/followup_task to talk to children; do not use Cursor shell as a substitute for collaboration tools.\n"
         "\n"
@@ -402,6 +457,29 @@ def is_loopback_peer(remote: str | None) -> bool:
 
 
 StreamEmitFn = Callable[..., Awaitable[None]]
+TurnCompleteFn = Callable[[], Awaitable[None]]
+
+
+@dataclass
+class BridgeJob:
+    job_id: str
+    call_id: str
+    tool: str
+    namespace: str | None
+    created_at: float = field(default_factory=time.time)
+    status: str = "pending"  # pending | ready | consumed
+    output: Any = None
+    ready: asyncio.Event = field(default_factory=asyncio.Event)
+
+    def snapshot(self, *, consumed: bool = False) -> dict[str, Any]:
+        return {
+            "job_id": self.job_id,
+            "codex_call_id": self.call_id,
+            "tool": self.tool,
+            "namespace": self.namespace,
+            "status": "consumed" if consumed else self.status,
+            "output": self.output,
+        }
 
 
 @dataclass
@@ -417,6 +495,14 @@ class CursorBridgeSession:
     _lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     _stream_emit: StreamEmitFn | None = field(default=None, repr=False)
     _collector: Any = field(default=None, repr=False)
+    _turn_complete: TurnCompleteFn | None = field(default=None, repr=False)
+    _jobs_by_id: dict[str, BridgeJob] = field(default_factory=dict, repr=False)
+    _jobs_by_call_id: dict[str, BridgeJob] = field(default_factory=dict, repr=False)
+    _turn_complete_requested: bool = False
+    _turn_closed: bool = False
+    _waiter_count: int = 0
+    _passthrough_finished: asyncio.Event = field(default_factory=asyncio.Event)
+    _post_terminal_text: list[str] = field(default_factory=list, repr=False)
 
     @classmethod
     def create(
@@ -457,6 +543,48 @@ class CursorBridgeSession:
     def attach_collector(self, collector: Any) -> None:
         self._collector = collector
 
+    def attach_turn_complete(self, complete_fn: TurnCompleteFn) -> None:
+        self._turn_complete = complete_fn
+
+    def detach_passthrough(self) -> None:
+        self._stream_emit = None
+        self._collector = None
+        self._turn_complete = None
+        self._turn_complete_requested = False
+
+    def mark_turn_closed(self) -> None:
+        self._turn_closed = True
+
+    def has_pending_jobs(self) -> bool:
+        return any(job.status in {"pending", "ready"} for job in self._jobs_by_id.values())
+
+    def has_active_waiters(self) -> bool:
+        return self._waiter_count > 0
+
+    def mark_passthrough_started(self) -> None:
+        self._passthrough_finished = asyncio.Event()
+        self._post_terminal_text = []
+
+    def append_post_terminal_text(self, text: str) -> None:
+        value = str(text or "")
+        if value:
+            self._post_terminal_text.append(value)
+
+    def take_post_terminal_text(self) -> str:
+        text = "".join(self._post_terminal_text).strip()
+        self._post_terminal_text.clear()
+        return text
+
+    def mark_passthrough_finished(self) -> None:
+        self._passthrough_finished.set()
+
+    async def wait_passthrough_finished(self, *, timeout_s: float) -> bool:
+        try:
+            await asyncio.wait_for(self._passthrough_finished.wait(), timeout=max(0.1, timeout_s))
+            return True
+        except TimeoutError:
+            return False
+
     def _resolve_tool(self, tool: str, namespace: str | None) -> tuple[str, str | None, str]:
         raw = str(tool or "").strip()
         if not raw:
@@ -489,6 +617,34 @@ class CursorBridgeSession:
         emit_namespace, emit_name = resolve_namespaced_tool_name(chat_name, self.tool_resolve)
         return chat_name, emit_namespace, emit_name
 
+    async def _request_turn_complete(self) -> None:
+        if self._turn_complete_requested:
+            return
+        self._turn_complete_requested = True
+        if self._turn_complete is not None:
+            try:
+                await self._turn_complete()
+            except Exception as exc:
+                print(f"[cursor-bridge] turn-complete failed bridge={self.bridge_id}: {exc}", flush=True)
+        self._turn_closed = True
+
+    def complete_call(self, call_id: str, output: Any) -> bool:
+        job = self._jobs_by_call_id.get(str(call_id or "").strip())
+        if job is None or job.status not in {"pending", "ready"}:
+            return False
+        job.output = output
+        job.status = "ready"
+        job.ready.set()
+        return True
+
+    def _consume_job(self, job: BridgeJob) -> dict[str, Any]:
+        payload = job.snapshot(consumed=True)
+        payload["ok"] = True
+        job.status = "consumed"
+        self._jobs_by_id.pop(job.job_id, None)
+        self._jobs_by_call_id.pop(job.call_id, None)
+        return payload
+
     async def invoke(
         self,
         *,
@@ -502,9 +658,25 @@ class CursorBridgeSession:
         async with self._lock:
             if self.is_expired():
                 raise BridgeError("bridge session expired")
+            if self._turn_closed:
+                raise BridgeError(
+                    "bridge turn already completed for this session; "
+                    "finish wait/poll for in-flight jobs, then invoke on the next Codex turn"
+                )
             chat_name, emit_namespace, emit_name = self._resolve_tool(tool, namespace)
             self._invoke_count += 1
             call_id = f"call_{self.bridge_id}_{self._invoke_count}"
+            job_id = generate_job_id()
+            display_tool = emit_name if emit_namespace else chat_name
+            job = BridgeJob(
+                job_id=job_id,
+                call_id=call_id,
+                tool=display_tool,
+                namespace=emit_namespace,
+            )
+            self._jobs_by_id[job_id] = job
+            self._jobs_by_call_id[call_id] = job
+            cursor_bridge_registry.index_call(call_id, self.bridge_id)
 
             if self._stream_emit is not None:
                 await self._stream_emit(
@@ -525,20 +697,115 @@ class CursorBridgeSession:
                     tool_resolve=self.tool_resolve,
                 )
             else:
+                self._jobs_by_id.pop(job_id, None)
+                self._jobs_by_call_id.pop(call_id, None)
+                cursor_bridge_registry.unindex_call(call_id)
                 raise BridgeNotAttachedError("bridge session has no active passthrough sink")
 
             return {
                 "ok": True,
+                "status": "accepted",
                 "bridge": self.bridge_id,
-                "tool": emit_name if emit_namespace else chat_name,
+                "job_id": job_id,
+                "tool": display_tool,
                 "namespace": emit_namespace,
                 "codex_call_id": call_id,
             }
+
+    async def wait_job(self, job_id: str, *, timeout_s: float | None = None) -> dict[str, Any]:
+        clean_id = str(job_id or "").strip()
+        if not clean_id:
+            return {"ok": False, "error": "job_id_required"}
+        job = self._jobs_by_id.get(clean_id)
+        if job is None:
+            return {"ok": False, "error": "unknown_job", "job_id": clean_id}
+
+        if job.status == "pending":
+            await self._request_turn_complete()
+
+        self._waiter_count += 1
+        try:
+            if timeout_s is None:
+                timeout_s = bridge_wait_timeout_ms() / 1000.0
+            timeout_s = max(0.0, float(timeout_s))
+
+            if job.status == "pending":
+                if timeout_s <= 0:
+                    return {
+                        "ok": False,
+                        "error": "timeout",
+                        "job_id": clean_id,
+                        "codex_call_id": job.call_id,
+                        "tool": job.tool,
+                        "namespace": job.namespace,
+                        "status": job.status,
+                    }
+                try:
+                    await asyncio.wait_for(job.ready.wait(), timeout=timeout_s)
+                except TimeoutError:
+                    return {
+                        "ok": False,
+                        "error": "timeout",
+                        "job_id": clean_id,
+                        "codex_call_id": job.call_id,
+                        "tool": job.tool,
+                        "namespace": job.namespace,
+                        "status": job.status,
+                    }
+
+            if job.status == "ready":
+                async with self._lock:
+                    if job.status == "ready":
+                        return self._consume_job(job)
+            return {"ok": False, "error": "unknown_job", "job_id": clean_id}
+        finally:
+            self._waiter_count = max(0, self._waiter_count - 1)
+
+    async def poll_jobs(self, *, timeout_s: float = 0.0) -> dict[str, Any]:
+        if self.has_pending_jobs() or any(job.status == "ready" for job in self._jobs_by_id.values()):
+            await self._request_turn_complete()
+        timeout_s = max(0.0, float(timeout_s))
+
+        self._waiter_count += 1
+        try:
+            if timeout_s > 0 and not any(job.status == "ready" for job in self._jobs_by_id.values()):
+                pending = [job for job in self._jobs_by_id.values() if job.status == "pending"]
+                if pending:
+                    tasks = [asyncio.create_task(job.ready.wait()) for job in pending]
+                    try:
+                        done, outstanding = await asyncio.wait(
+                            tasks,
+                            timeout=timeout_s,
+                            return_when=asyncio.FIRST_COMPLETED,
+                        )
+                        for task in outstanding:
+                            task.cancel()
+                        if done:
+                            await asyncio.gather(*done, return_exceptions=True)
+                    except Exception:
+                        for task in tasks:
+                            task.cancel()
+
+            async with self._lock:
+                jobs = [
+                    self._consume_job(job)
+                    for job in list(self._jobs_by_id.values())
+                    if job.status == "ready"
+                ]
+            return {
+                "ok": True,
+                "bridge": self.bridge_id,
+                "jobs": jobs,
+                "pending": sum(1 for job in self._jobs_by_id.values() if job.status == "pending"),
+            }
+        finally:
+            self._waiter_count = max(0, self._waiter_count - 1)
 
 
 class CursorBridgeRegistry:
     def __init__(self) -> None:
         self._sessions: dict[str, CursorBridgeSession] = {}
+        self._call_index: dict[str, str] = {}
         self._lock = asyncio.Lock()
 
     async def register(self, session: CursorBridgeSession) -> str:
@@ -550,13 +817,105 @@ class CursorBridgeRegistry:
         session = self._sessions.get(str(bridge_id or "").strip())
         if session is None:
             return None
-        if session.is_expired():
-            self._sessions.pop(session.bridge_id, None)
+        if session.is_expired() and not session.has_pending_jobs():
+            self.close(session.bridge_id)
             return None
         return session
 
+    def index_call(self, call_id: str, bridge_id: str) -> None:
+        clean = str(call_id or "").strip()
+        if clean:
+            self._call_index[clean] = bridge_id
+
+    def unindex_call(self, call_id: str) -> None:
+        self._call_index.pop(str(call_id or "").strip(), None)
+
+    def ingest_function_call_outputs(self, items: Any) -> int:
+        """Complete bridge jobs from Codex `function_call_output` input items. Returns count."""
+        if not isinstance(items, list):
+            return 0
+        completed = 0
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            item_type = str(item.get("type") or "").strip()
+            if item_type not in {"function_call_output", "custom_tool_call_output"}:
+                continue
+            call_id = str(item.get("call_id") or "").strip()
+            if not call_id:
+                continue
+            bridge_id = self._call_index.get(call_id)
+            session = self.get(bridge_id) if bridge_id else None
+            if session is None:
+                # Slow path: scan sessions (call index miss after restart-in-process).
+                for candidate in list(self._sessions.values()):
+                    if call_id in candidate._jobs_by_call_id:
+                        session = candidate
+                        break
+            if session is None:
+                continue
+            output = item.get("output")
+            if session.complete_call(call_id, output):
+                completed += 1
+                print(
+                    f"[cursor-bridge] job-ready bridge={session.bridge_id} call_id={call_id}",
+                    flush=True,
+                )
+        return completed
+
     def close(self, bridge_id: str) -> None:
-        self._sessions.pop(str(bridge_id or "").strip(), None)
+        session = self._sessions.pop(str(bridge_id or "").strip(), None)
+        if session is None:
+            return
+        for call_id in list(session._jobs_by_call_id):
+            self.unindex_call(call_id)
+        session.detach_passthrough()
+
+    def release_if_idle(self, bridge_id: str) -> None:
+        session = self.get(bridge_id)
+        if session is None:
+            return
+        if session.has_pending_jobs() or session.has_active_waiters():
+            session.detach_passthrough()
+            return
+        self.close(bridge_id)
+
+    def has_active_waiters(self) -> bool:
+        return any(session.has_active_waiters() for session in self._sessions.values())
+
+    def early_closed_sessions(self) -> list[CursorBridgeSession]:
+        return [session for session in self._sessions.values() if session._turn_closed]
+
+    async def wait_for_delivery_passthroughs(self, *, timeout_s: float = 180.0) -> str:
+        """Wait for waiters to drain and early-completed Cursor turns to finish; return leftover text."""
+        deadline = time.time() + max(0.1, timeout_s)
+        while self.has_active_waiters() and time.time() < deadline:
+            await asyncio.sleep(0.05)
+        chunks: list[str] = []
+        for session in self.early_closed_sessions():
+            remaining = max(0.1, deadline - time.time())
+            await session.wait_passthrough_finished(timeout_s=remaining)
+            text = session.take_post_terminal_text()
+            if text:
+                chunks.append(text)
+        return "\n".join(chunks).strip()
+
+
+def input_items_are_only_tool_outputs(items: Any) -> bool:
+    """True when Codex follow-up input is solely tool results (no new user/assistant text)."""
+    if not isinstance(items, list) or not items:
+        return False
+    for item in items:
+        if not isinstance(item, dict):
+            return False
+        item_type = str(item.get("type") or "").strip()
+        if item_type in {"function_call_output", "custom_tool_call_output", "tool_search_output"}:
+            continue
+        # Expand/cache may include paired function_call items; still delivery-only.
+        if item_type in {"function_call", "custom_tool_call", "item_reference"}:
+            continue
+        return False
+    return True
 
 
 cursor_bridge_registry = CursorBridgeRegistry()

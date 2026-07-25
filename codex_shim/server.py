@@ -58,6 +58,7 @@ from .cursor_bridge import (
     bridge_tool_specs,
     cursor_bridge_enabled,
     cursor_bridge_registry,
+    input_items_are_only_tool_outputs,
     is_loopback_peer,
     shim_port_from_request_host,
 )
@@ -728,6 +729,8 @@ class ShimServer:
         app.router.add_get("/api/models", self.api_models)
         app.router.add_post("/api/switch", self.switch_model)
         app.router.add_post("/_cursor_bridge/v1/invoke", self.cursor_bridge_invoke)
+        app.router.add_post("/_cursor_bridge/v1/wait", self.cursor_bridge_wait)
+        app.router.add_post("/_cursor_bridge/v1/poll", self.cursor_bridge_poll)
         return app
 
     async def _on_startup(self, _app: web.Application) -> None:
@@ -2584,6 +2587,24 @@ class ShimServer:
         slug = response_model_override or CURSOR_MODEL_SLUG
         upstream = upstream_model or cursor_upstream_model(slug)
         raw_body = body
+        # Resolve async bridge jobs from prior turn before rewriting input.
+        ingested = cursor_bridge_registry.ingest_function_call_outputs(raw_body.get("input"))
+        if ingested:
+            print(f"[cursor-bridge] ingested {ingested} tool output(s) into jobs", flush=True)
+        # When wait/poll is blocked on those jobs, do not spawn a duplicate Cursor turn —
+        # deliver results via HTTP and let the in-flight Composer continue.
+        if (
+            ingested > 0
+            and cursor_bridge_registry.has_active_waiters()
+            and input_items_are_only_tool_outputs(raw_body.get("input"))
+        ):
+            print(
+                f"[cursor-bridge] suppress-cursor delivery ingested={ingested} "
+                "(active waiters; tool-output-only follow-up)",
+                flush=True,
+            )
+            return await self._cursor_bridge_delivery_response(request, raw_body, slug)
+
         body = self._apply_responses_input_pipeline(
             body,
             request,
@@ -2629,6 +2650,7 @@ class ShimServer:
                 )
                 if bridge_session is not None:
                     bridge_session.attach_collector(collector)
+                    bridge_session.mark_passthrough_started()
                 usage: dict[str, Any] | None = None
                 fallback_text = ""
                 async for event in iter_cursor_agent_events(
@@ -2677,6 +2699,10 @@ class ShimServer:
                     namespace: str | None = None,
                     chat_name: str | None = None,
                 ) -> None:
+                    if state.terminal_emitted or state.failed:
+                        raise BridgeError(
+                            "bridge turn already completed; cannot emit more Codex tool calls on this session"
+                        )
                     await state.emit_synthetic_function_call(
                         response,
                         name=name,
@@ -2686,7 +2712,20 @@ class ShimServer:
                         chat_name=chat_name,
                     )
 
+                async def _turn_complete() -> None:
+                    if state.terminal_emitted or state.failed:
+                        return
+                    print(
+                        f"[cursor-bridge] early-complete bridge={bridge_session.bridge_id} "
+                        "so Codex can run pending tool calls",
+                        flush=True,
+                    )
+                    await state.finish(response, upstream_saw_done=True)
+                    bridge_session.mark_turn_closed()
+
                 bridge_session.attach_stream(_stream_emit)
+                bridge_session.attach_turn_complete(_turn_complete)
+                bridge_session.mark_passthrough_started()
             try:
                 await state.start(response)
                 async for event in iter_cursor_agent_events(
@@ -2694,6 +2733,10 @@ class ShimServer:
                     upstream,
                     workspace=cursor_workspace_path,
                 ):
+                    if state.terminal_emitted or state.failed:
+                        if bridge_session is not None and event.get("type") == "text_delta":
+                            bridge_session.append_post_terminal_text(str(event.get("delta") or ""))
+                        continue
                     if event["type"] == "usage":
                         normalized_usage = normalize_responses_usage(event.get("usage"))
                         if normalized_usage:
@@ -2724,7 +2767,56 @@ class ShimServer:
             return response
         finally:
             if bridge_session is not None:
-                cursor_bridge_registry.close(bridge_session.bridge_id)
+                bridge_session.mark_passthrough_finished()
+                # Keep session alive while jobs are pending so wait/poll can resolve.
+                cursor_bridge_registry.release_if_idle(bridge_session.bridge_id)
+
+    async def _cursor_bridge_delivery_response(
+        self,
+        request: web.Request,
+        raw_body: dict[str, Any],
+        slug: str,
+    ) -> web.StreamResponse:
+        """Complete a tool-output follow-up without starting a new cursor-agent.
+
+        Waits for in-flight wait/poll callers and the early-completed Cursor turn to
+        finish so post-wait local work (e.g. writing files) can complete. Returns any
+        leftover assistant text from that turn.
+        """
+        leftover = await cursor_bridge_registry.wait_for_delivery_passthroughs(timeout_s=180.0)
+        stream = bool(raw_body.get("stream"))
+        response_id = f"resp_{int(time.time() * 1000)}"
+        message = leftover or (
+            "[codex-shim] Bridge delivered Codex tool results to the in-flight Cursor turn."
+        )
+        if not stream:
+            payload = {
+                "id": response_id,
+                "object": "response",
+                "model": slug,
+                "status": "completed",
+                "output": [
+                    {
+                        "type": "message",
+                        "id": f"msg_{int(time.time() * 1000)}",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": message}],
+                    }
+                ],
+            }
+            return web.json_response(payload)
+
+        response = _sse_response()
+        await response.prepare(request)
+        state = ResponsesStreamState(slug)
+        await state.start(response)
+        await state._text_delta(response, message)
+        await state.finish(response, upstream_saw_done=True)
+        try:
+            await response.write_eof()
+        except Exception:
+            pass
+        return response
 
     async def cursor_bridge_invoke(self, request: web.Request) -> web.Response:
         if not is_loopback_peer(request.remote):
@@ -2768,7 +2860,79 @@ class ShimServer:
 
         print(
             f"[cursor-bridge] invoke bridge={bridge_id} tool={tool} namespace={namespace or '-'} "
-            f"call_id={result.get('codex_call_id')}",
+            f"job_id={result.get('job_id')} call_id={result.get('codex_call_id')}",
+            flush=True,
+        )
+        return web.json_response(result)
+
+    async def cursor_bridge_wait(self, request: web.Request) -> web.Response:
+        if not is_loopback_peer(request.remote):
+            raise web.HTTPForbidden(text="Forbidden: bridge wait requires loopback peer")
+        try:
+            payload = await request.json()
+        except json.JSONDecodeError as exc:
+            raise web.HTTPBadRequest(text="Invalid JSON body") from exc
+        if not isinstance(payload, dict):
+            raise web.HTTPBadRequest(text="JSON body must be an object")
+
+        bridge_id = str(payload.get("bridge") or "").strip()
+        job_id = str(payload.get("job_id") or "").strip()
+        if not bridge_id:
+            raise web.HTTPBadRequest(text="bridge is required")
+        if not job_id:
+            raise web.HTTPBadRequest(text="job_id is required")
+
+        timeout_ms_raw = payload.get("timeout_ms")
+        timeout_s: float | None
+        if timeout_ms_raw is None:
+            timeout_s = None
+        else:
+            try:
+                timeout_s = max(0.0, float(timeout_ms_raw) / 1000.0)
+            except (TypeError, ValueError) as exc:
+                raise web.HTTPBadRequest(text="timeout_ms must be a number") from exc
+
+        session = cursor_bridge_registry.get(bridge_id)
+        if session is None:
+            raise web.HTTPNotFound(text="Unknown or expired bridge session")
+
+        result = await session.wait_job(job_id, timeout_s=timeout_s)
+        status = 200 if result.get("ok") else (404 if result.get("error") == "unknown_job" else 200)
+        print(
+            f"[cursor-bridge] wait bridge={bridge_id} job_id={job_id} ok={result.get('ok')} "
+            f"error={result.get('error') or '-'}",
+            flush=True,
+        )
+        return web.json_response(result, status=status)
+
+    async def cursor_bridge_poll(self, request: web.Request) -> web.Response:
+        if not is_loopback_peer(request.remote):
+            raise web.HTTPForbidden(text="Forbidden: bridge poll requires loopback peer")
+        try:
+            payload = await request.json()
+        except json.JSONDecodeError as exc:
+            raise web.HTTPBadRequest(text="Invalid JSON body") from exc
+        if not isinstance(payload, dict):
+            raise web.HTTPBadRequest(text="JSON body must be an object")
+
+        bridge_id = str(payload.get("bridge") or "").strip()
+        if not bridge_id:
+            raise web.HTTPBadRequest(text="bridge is required")
+
+        timeout_ms_raw = payload.get("timeout_ms", 0)
+        try:
+            timeout_s = max(0.0, float(timeout_ms_raw) / 1000.0)
+        except (TypeError, ValueError) as exc:
+            raise web.HTTPBadRequest(text="timeout_ms must be a number") from exc
+
+        session = cursor_bridge_registry.get(bridge_id)
+        if session is None:
+            raise web.HTTPNotFound(text="Unknown or expired bridge session")
+
+        result = await session.poll_jobs(timeout_s=timeout_s)
+        print(
+            f"[cursor-bridge] poll bridge={bridge_id} jobs={len(result.get('jobs') or [])} "
+            f"pending={result.get('pending')}",
             flush=True,
         )
         return web.json_response(result)
@@ -4116,6 +4280,7 @@ class ResponsesStreamState:
         self.message_item_id = f"msg_{int(time.time() * 1000)}"
         self.model = model
         self.failed = False
+        self.terminal_emitted = False
         self.message_index: int | None = None  # output_index for the assistant message
         self.message_text = ""
         self.message_opened = False
@@ -4149,6 +4314,7 @@ class ResponsesStreamState:
         if self.failed:
             return
         self.failed = True
+        self.terminal_emitted = True
         await self.close_turn_items(response)
         await _write_sse(
             response,
@@ -4167,7 +4333,7 @@ class ResponsesStreamState:
         await response.write(b"data: [DONE]\n\n")
 
     async def finish(self, response: web.StreamResponse, *, upstream_saw_done: bool) -> None:
-        if self.failed:
+        if self.failed or self.terminal_emitted:
             return
         await self.close_turn_items(response)
         if upstream_saw_done and not self._has_open_incomplete_items():
@@ -4176,6 +4342,7 @@ class ResponsesStreamState:
                 {"type": "response.completed", "response": self._response("completed", final=True)},
             )
             await response.write(b"data: [DONE]\n\n")
+            self.terminal_emitted = True
         elif upstream_saw_done:
             self._log_incomplete_tool_calls()
             incomplete_response = self._response("incomplete", final=True)
@@ -4186,6 +4353,7 @@ class ResponsesStreamState:
                 {"type": "response.incomplete", "response": incomplete_response},
             )
             await response.write(b"data: [DONE]\n\n")
+            self.terminal_emitted = True
         elif self._has_open_incomplete_items():
             self._log_incomplete_tool_calls()
 

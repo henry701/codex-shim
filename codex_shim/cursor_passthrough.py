@@ -582,9 +582,17 @@ def _format_shell_started(payload: dict[str, Any]) -> str:
     args = payload.get("args") or {}
     command = str(args.get("command") or args.get("cmd") or args.get("script") or "")
     if command and is_bridge_shell_command(command):
+        lower = command.lower()
+        if "/_cursor_bridge/v1/wait" in lower:
+            match = re.search(r'"job_id"\s*:\s*"([^"\\]+)"', command)
+            job = match.group(1) if match else None
+            return f"→ Codex bridge wait job=`{job}`" if job else "→ Codex bridge wait"
+        if "/_cursor_bridge/v1/poll" in lower:
+            return "→ Codex bridge poll"
         tool = parse_bridge_tool_from_shell(command)
         if tool:
             return f"→ Codex tool: `{tool}`"
+        return "→ Codex bridge invoke"
     if command:
         return f"`{_preview_text(command)}`"
     return "`(command)`"

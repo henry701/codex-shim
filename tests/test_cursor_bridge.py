@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 
 import pytest
@@ -431,3 +432,189 @@ async def test_cursor_bridge_invoke_http_handler():
     finally:
         cursor_bridge_registry.close(session.bridge_id)
         await client.close()
+
+
+@pytest.mark.asyncio
+async def test_bridge_invoke_returns_job_id_and_wait_consumes_output():
+    body = _goal_tools_body()
+    from codex_shim.translate import responses_tool_resolve_map, responses_tool_type_map
+
+    tool_types = responses_tool_type_map(body["tools"])
+    tool_resolve = responses_tool_resolve_map(body["tools"])
+    session = CursorBridgeSession.create(
+        allowed_tools=bridge_allowed_tools(body),
+        tool_types=tool_types,
+        tool_resolve=tool_resolve,
+        tool_specs=bridge_tool_specs(body),
+    )
+    collector = CursorResponseCollector(tool_types=tool_types, tool_resolve=tool_resolve)
+    session.attach_collector(collector)
+    await cursor_bridge_registry.register(session)
+    try:
+        accepted = await session.invoke(
+            tool="update_goal",
+            arguments={"status": "complete"},
+            namespace="goals",
+        )
+        assert accepted["ok"] is True
+        assert accepted["status"] == "accepted"
+        job_id = accepted["job_id"]
+        call_id = accepted["codex_call_id"]
+        assert job_id
+        assert session.has_pending_jobs()
+
+        n = cursor_bridge_registry.ingest_function_call_outputs(
+            [
+                {
+                    "type": "function_call_output",
+                    "call_id": call_id,
+                    "output": '{"status":"complete","goal_id":"g1"}',
+                }
+            ]
+        )
+        assert n == 1
+
+        result = await session.wait_job(job_id, timeout_s=1.0)
+        assert result["ok"] is True
+        assert result["job_id"] == job_id
+        assert result["status"] == "consumed"
+        assert "complete" in str(result["output"])
+        assert not session.has_pending_jobs()
+
+        again = await session.wait_job(job_id, timeout_s=0.1)
+        assert again["ok"] is False
+        assert again["error"] == "unknown_job"
+    finally:
+        cursor_bridge_registry.close(session.bridge_id)
+
+
+@pytest.mark.asyncio
+async def test_bridge_poll_returns_ready_jobs_and_clears_them():
+    body = _goal_tools_body()
+    from codex_shim.translate import responses_tool_resolve_map, responses_tool_type_map
+
+    tool_types = responses_tool_type_map(body["tools"])
+    tool_resolve = responses_tool_resolve_map(body["tools"])
+    session = CursorBridgeSession.create(
+        allowed_tools=bridge_allowed_tools(body),
+        tool_types=tool_types,
+        tool_resolve=tool_resolve,
+        tool_specs=bridge_tool_specs(body),
+    )
+    collector = CursorResponseCollector(tool_types=tool_types, tool_resolve=tool_resolve)
+    session.attach_collector(collector)
+    await cursor_bridge_registry.register(session)
+    try:
+        a = await session.invoke(tool="create_goal", arguments={"objective": "x"}, namespace="goals")
+        b = await session.invoke(tool="get_goal", arguments={}, namespace="goals")
+        cursor_bridge_registry.ingest_function_call_outputs(
+            [
+                {"type": "function_call_output", "call_id": a["codex_call_id"], "output": "goal-created"},
+                {"type": "function_call_output", "call_id": b["codex_call_id"], "output": "goal-state"},
+            ]
+        )
+        polled = await session.poll_jobs(timeout_s=0.0)
+        assert polled["ok"] is True
+        assert len(polled["jobs"]) == 2
+        ids = {job["job_id"] for job in polled["jobs"]}
+        assert ids == {a["job_id"], b["job_id"]}
+        assert not session.has_pending_jobs()
+
+        empty = await session.poll_jobs(timeout_s=0.0)
+        assert empty["jobs"] == []
+    finally:
+        cursor_bridge_registry.close(session.bridge_id)
+
+
+@pytest.mark.asyncio
+async def test_bridge_wait_http_handler_blocks_until_ingest():
+    body = _goal_tools_body()
+    from codex_shim.translate import responses_tool_resolve_map, responses_tool_type_map
+
+    tool_types = responses_tool_type_map(body["tools"])
+    tool_resolve = responses_tool_resolve_map(body["tools"])
+    session = CursorBridgeSession.create(
+        allowed_tools=bridge_allowed_tools(body),
+        tool_types=tool_types,
+        tool_resolve=tool_resolve,
+        tool_specs=bridge_tool_specs(body),
+    )
+    collector = CursorResponseCollector(tool_types=tool_types, tool_resolve=tool_resolve)
+    session.attach_collector(collector)
+    await cursor_bridge_registry.register(session)
+
+    shim = ShimServer()
+    client = TestClient(TestServer(shim.app()))
+    await client.start_server()
+    try:
+        async with client.post(
+            "/_cursor_bridge/v1/invoke",
+            json={
+                "bridge": session.bridge_id,
+                "tool": "update_goal",
+                "namespace": "goals",
+                "arguments": {"status": "complete"},
+            },
+            headers={"Host": "127.0.0.1"},
+        ) as resp:
+            accepted = await resp.json()
+        job_id = accepted["job_id"]
+        call_id = accepted["codex_call_id"]
+
+        async def _ingest_later() -> None:
+            await asyncio.sleep(0.05)
+            cursor_bridge_registry.ingest_function_call_outputs(
+                [{"type": "function_call_output", "call_id": call_id, "output": "done-via-http"}]
+            )
+
+        ingest_task = asyncio.create_task(_ingest_later())
+        async with client.post(
+            "/_cursor_bridge/v1/wait",
+            json={"bridge": session.bridge_id, "job_id": job_id, "timeout_ms": 2000},
+            headers={"Host": "127.0.0.1"},
+        ) as resp:
+            assert resp.status == 200
+            payload = await resp.json()
+            assert payload["ok"] is True
+            assert payload["output"] == "done-via-http"
+        await ingest_task
+
+        async with client.post(
+            "/_cursor_bridge/v1/poll",
+            json={"bridge": session.bridge_id, "timeout_ms": 0},
+            headers={"Host": "127.0.0.1"},
+        ) as resp:
+            polled = await resp.json()
+            assert polled["jobs"] == []
+    finally:
+        cursor_bridge_registry.close(session.bridge_id)
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_bridge_suppresses_duplicate_cursor_when_waiters_active():
+    from codex_shim.cursor_bridge import input_items_are_only_tool_outputs
+
+    assert input_items_are_only_tool_outputs(
+        [{"type": "function_call_output", "call_id": "c1", "output": "x"}]
+    )
+    assert not input_items_are_only_tool_outputs(
+        [
+            {"type": "function_call_output", "call_id": "c1", "output": "x"},
+            {"role": "user", "content": "hi"},
+        ]
+    )
+
+
+def test_build_bridge_suffix_documents_wait_and_poll():
+    body = _goal_tools_body()
+    session = CursorBridgeSession.create(
+        allowed_tools=bridge_allowed_tools(body),
+        tool_types={},
+        tool_resolve={},
+        tool_specs=bridge_tool_specs(body),
+    )
+    suffix = build_bridge_suffix(session, 8765)
+    assert "/_cursor_bridge/v1/wait" in suffix
+    assert "/_cursor_bridge/v1/poll" in suffix
+    assert "job_id" in suffix
