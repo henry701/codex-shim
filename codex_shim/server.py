@@ -2757,6 +2757,29 @@ class ShimServer:
                 bridge_session.attach_stream(_stream_emit)
                 bridge_session.attach_turn_complete(_turn_complete)
                 bridge_session.mark_passthrough_started()
+            turn_cached = False
+
+            async def _persist_turn_cache() -> None:
+                """Store this turn even if Codex hung up.
+
+                Early-complete ends the stream mid-turn, so Codex often closes the
+                connection while cursor-agent is still running. Losing the store makes
+                the next `previous_response_id` miss the cache, which strips the model's
+                history and restarts it from scratch every turn.
+                """
+                nonlocal turn_cached
+                if turn_cached:
+                    return
+                items = self._build_turn_cache_items(request, raw_body, state.output_items())
+                if not items:
+                    return
+                turn_cached = True
+                await self._store_chatgpt_passthrough_conversation_async(
+                    session_key,
+                    state.response_id,
+                    items,
+                )
+
             try:
                 await state.start(response)
                 async for event in iter_cursor_agent_events(
@@ -2779,19 +2802,15 @@ class ShimServer:
                     else:
                         await _apply_cursor_stream_event(state, response, event)
                 await state.finish(response, upstream_saw_done=True)
-                cache_items = self._build_turn_cache_items(request, raw_body, state.output_items())
-                if cache_items:
-                    await self._store_chatgpt_passthrough_conversation_async(
-                        session_key,
-                        state.response_id,
-                        cache_items,
-                    )
+                await _persist_turn_cache()
             except ClientDisconnected:
                 pass
             except Exception as exc:
                 detail = str(exc).strip() or repr(exc)
                 print(f"[err] cursor passthrough {slug}: {type(exc).__name__}: {detail}", flush=True)
                 raise web.HTTPBadGateway(text=detail) from exc
+            finally:
+                await _persist_turn_cache()
             try:
                 await response.write_eof()
             except Exception:
@@ -2821,21 +2840,37 @@ class ShimServer:
             )
         stream = bool(raw_body.get("stream"))
         response_id = f"resp_{int(time.time() * 1000)}"
+
+        async def _persist(rid: str, output_items: list[Any]) -> None:
+            # Without this the next previous_response_id misses the cache and the
+            # model loses its history.
+            if request is None:
+                return
+            items = self._build_turn_cache_items(request, raw_body, output_items)
+            if items:
+                await self._store_chatgpt_passthrough_conversation_async(
+                    self._session_key(request),
+                    rid,
+                    items,
+                )
+
         if not stream:
+            output = [
+                {
+                    "type": "message",
+                    "id": f"msg_{int(time.time() * 1000)}",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": text}],
+                }
+            ]
             payload = {
                 "id": response_id,
                 "object": "response",
                 "model": slug,
                 "status": "completed",
-                "output": [
-                    {
-                        "type": "message",
-                        "id": f"msg_{int(time.time() * 1000)}",
-                        "role": "assistant",
-                        "content": [{"type": "output_text", "text": text}],
-                    }
-                ],
+                "output": output,
             }
+            await _persist(response_id, output)
             return web.json_response(payload)
 
         response = _sse_response()
@@ -2844,6 +2879,7 @@ class ShimServer:
         await state.start(response)
         await state._text_delta(response, text)
         await state.finish(response, upstream_saw_done=True)
+        await _persist(state.response_id, state.output_items())
         try:
             await response.write_eof()
         except Exception:

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 from unittest.mock import AsyncMock
 
 import pytest
@@ -798,3 +799,47 @@ class _FakeSseContent:
         if not self._chunks:
             return b""
         return self._chunks.pop(0)
+
+
+@pytest.mark.asyncio
+async def test_cursor_passthrough_caches_turn_even_when_client_disconnects(
+    monkeypatch, tmp_path, chatgpt_cache_dir
+):
+    """The bridge early-completes a turn, so Codex often hangs up mid-stream.
+
+    If the turn is not cached anyway, the next `previous_response_id` misses, the
+    model loses its history and restarts its plan every turn (an endless loop).
+    """
+
+    async def fake_iter_cursor_agent_events(prompt, model, *, workspace=None):
+        yield {"type": "text_delta", "delta": "partial answer"}
+        raise server_module.ClientDisconnected()
+
+    monkeypatch.setattr(server_module, "cursor_passthrough_available", lambda: True)
+    monkeypatch.setattr(server_module, "iter_cursor_agent_events", fake_iter_cursor_agent_events)
+    monkeypatch.setattr(server_module, "cursor_upstream_model", lambda slug: "composer-2.5")
+
+    settings = tmp_path / "settings.json"
+    settings.write_text("{}")
+    shim = ShimServer(settings)
+    shim_client = TestClient(TestServer(shim.app()))
+    await shim_client.start_server()
+    try:
+        resp = await shim_client.post(
+            "/v1/responses",
+            json={
+                "model": "cursor-composer-2-5",
+                "stream": True,
+                "input": [{"type": "message", "role": "user", "content": "do the work"}],
+            },
+            headers={"session-id": "cursor-disconnect"},
+        )
+        body = await resp.text()
+    finally:
+        await shim_client.close()
+
+    response_ids = set(re.findall(r'"id":\s*"(resp_[0-9]+)"', body))
+    assert response_ids, "stream should announce a response id"
+    cache = shim._chatgpt_conversation_cache
+    cached = [cache.get("cursor-disconnect", rid) for rid in response_ids]
+    assert any(entry for entry in cached), "turn must be cached despite the disconnect"
