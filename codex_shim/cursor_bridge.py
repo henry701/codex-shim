@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 import re
@@ -539,6 +540,7 @@ class CursorBridgeSession:
     _post_terminal_text: list[str] = field(default_factory=list, repr=False)
     session_key: str = ""
     _handoff_disconnect_expected: bool = False
+    _seen_intent: set[str] = field(default_factory=set, repr=False)
 
     @classmethod
     def create(
@@ -698,6 +700,14 @@ class CursorBridgeSession:
         finally:
             if isinstance(delivered, asyncio.Event):
                 delivered.set()
+
+    def remember_intent(self, items: Any) -> None:
+        """Record the instructions this agent has been given, so later turns can tell
+        a result delivery apart from a genuinely new request."""
+        self._seen_intent |= user_intent_fingerprints(items)
+
+    def unseen_user_intent(self, items: Any) -> set[str]:
+        return user_intent_fingerprints(items) - self._seen_intent
 
     def has_pending_jobs(self) -> bool:
         return any(job.status in {"pending", "ready"} for job in self._jobs_by_id.values())
@@ -980,12 +990,56 @@ class CursorBridgeRegistry:
         session: CursorBridgeSession,
         *,
         session_key: str = "",
+        input_items: Any = None,
     ) -> str:
         session.session_key = str(session_key or "").strip()
+        session.remember_intent(input_items)
         async with self._lock:
             self._sessions[session.bridge_id] = session
         self.prune_expired()
         return session.bridge_id
+
+    def resolve_adoption(
+        self,
+        items: Any,
+        *,
+        session_key: str = "",
+    ) -> tuple[CursorBridgeSession | None, str]:
+        """Pick the in-flight agent a follow-up belongs to, or ``None`` to respawn.
+
+        Decided from bridge state — who is alive and what results they are owed —
+        rather than from the shape of Codex's input. Shape-matching was brittle in
+        the destructive direction: any item type the allowlist did not recognize
+        read as a steer, so the shim cancelled the very agent that owned the results
+        being delivered. Here an unrecognized item is simply not user intent, and the
+        fallback is to keep the agent alive.
+
+        Returns the session plus a reason string for the log.
+        """
+        delivered = tool_output_call_ids(items)
+        if not delivered:
+            return None, "turn carries no tool results"
+        session = self.live_session_for_call_ids(delivered)
+        if session is None:
+            return None, "no live agent is waiting on these results"
+        key = str(session_key or "").strip()
+        if key and session.session_key and session.session_key != key:
+            return None, "results belong to a different Codex session"
+        unseen = session.unseen_user_intent(items)
+        if unseen:
+            return None, f"turn adds {len(unseen)} instruction(s) the agent has not seen"
+        return session, f"delivering {len(delivered)} result(s) the agent is waiting on"
+
+    def introduces_user_intent(self, items: Any) -> bool:
+        """True when the turn carries instructions no tracked bridge session has seen."""
+        remaining = user_intent_fingerprints(items)
+        if not remaining:
+            return False
+        for session in list(self._sessions.values()):
+            remaining &= session.unseen_user_intent(items)
+            if not remaining:
+                return False
+        return True
 
     def cancel_live_agents_for_session(
         self,
@@ -1123,21 +1177,9 @@ class CursorBridgeRegistry:
             return
         self.close(bridge_id)
 
-    def inflight_session_for_tool_outputs(self, items: Any) -> CursorBridgeSession | None:
-        """Session whose cursor-agent is still running and owns these tool outputs."""
-        if not isinstance(items, list):
-            return None
-        for item in items:
-            if not isinstance(item, dict):
-                continue
-            if str(item.get("type") or "").strip() not in {
-                "function_call_output",
-                "custom_tool_call_output",
-            }:
-                continue
-            call_id = str(item.get("call_id") or "").strip()
-            if not call_id:
-                continue
+    def live_session_for_call_ids(self, call_ids: set[str]) -> CursorBridgeSession | None:
+        """Session whose cursor-agent is still running and owns any of these call_ids."""
+        for call_id in call_ids:
             bridge_id = self._call_index.get(call_id)
             session = self.get(bridge_id) if bridge_id else None
             if session is None:
@@ -1152,8 +1194,9 @@ class CursorBridgeRegistry:
     def cancel_sessions_for_call_ids(self, items: Any) -> int:
         """Kill live agents that own call_ids in ``items`` (steer/interrupt orphans).
 
-        Pure tool-output follow-ups adopt those agents instead; mixed follow-ups
-        (interrupted outputs + new user text) must not leave them blocked on wait.
+        Only reached once ``resolve_adoption`` has ruled the turn out as a delivery;
+        a steer's interrupted outputs still name the agent that must not be left
+        blocked on `wait`.
         """
         if not isinstance(items, list):
             return 0
@@ -1208,55 +1251,71 @@ class CursorBridgeRegistry:
         return "\n".join(chunks).strip()
 
 
-def input_items_are_only_tool_outputs(items: Any) -> bool:
-    """True when Codex follow-up input is tool results (+ optional reasoning), no new user text."""
-    if not isinstance(items, list) or not items:
-        return False
-    saw_tool_output = False
+TOOL_OUTPUT_ITEM_TYPES = frozenset(
+    {"function_call_output", "custom_tool_call_output", "tool_search_output"}
+)
+
+
+def _item_text(value: Any) -> str:
+    """Flatten a Responses `content` field (str, part list, or part dict) to text."""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, dict):
+        return str(value.get("text") or value.get("input_text") or value.get("output_text") or "")
+    if isinstance(value, list):
+        return "".join(_item_text(part) for part in value)
+    return ""
+
+
+def tool_output_call_ids(items: Any) -> set[str]:
+    """`call_id`s of the tool results carried by a Codex request."""
+    if not isinstance(items, list):
+        return set()
+    call_ids: set[str] = set()
     for item in items:
         if not isinstance(item, dict):
-            return False
-        item_type = str(item.get("type") or "").strip()
-        if item_type in {"function_call_output", "custom_tool_call_output", "tool_search_output"}:
-            saw_tool_output = True
             continue
-        # Expand/cache may include paired function_call items; still delivery-only.
-        if item_type in {"function_call", "custom_tool_call", "item_reference"}:
+        if str(item.get("type") or "").strip() not in TOOL_OUTPUT_ITEM_TYPES:
             continue
-        # Desktop often replays reasoning blocks alongside tool outputs.
-        if item_type in {"reasoning", "reasoning_text"} or item_type.startswith("reasoning"):
-            continue
-        return False
-    return saw_tool_output
+        call_id = str(item.get("call_id") or "").strip()
+        if call_id:
+            call_ids.add(call_id)
+    return call_ids
 
 
-def input_items_deliver_tool_outputs(items: Any) -> bool:
-    """True when the *tail* of a Codex follow-up is tool results, not new user input.
+def user_intent_fingerprints(items: Any) -> set[str]:
+    """Digests of the items in a Codex request that carry instructions for the agent.
 
-    Codex normally sends only the delta (``previous_response_id`` plus the outputs),
-    but after compaction it drops the response chain and replays the whole
-    conversation inline. Matching on the entire input therefore classified every
-    post-compaction delivery as a steer, so the shim cancelled the very agent that
-    owned those results and respawned it — which is why the agent re-announced its
-    plan every turn. Steering appends the user's text *after* the interrupted
-    outputs, so the tail still separates the two cases.
+    Only two shapes introduce work the agent has not been told about: a user-role
+    message and an inter-agent message. Everything else — reasoning, tool calls and
+    their results, compaction records, item references, developer preamble, and
+    whatever Codex adds next — is transcript machinery that says nothing new.
+
+    Digesting rather than type-matching is what makes adoption robust. Codex sends
+    only a delta most turns but replays the entire transcript after a compaction, so
+    "is this item new?" cannot be answered from the item's shape; it can only be
+    answered against what the agent has already been given.
     """
-    if not isinstance(items, list) or not items:
-        return False
-    saw_tool_output = False
-    for item in reversed(items):
+    if not isinstance(items, list):
+        return set()
+    fingerprints: set[str] = set()
+    for item in items:
         if not isinstance(item, dict):
-            break
+            continue
         item_type = str(item.get("type") or "").strip()
-        if item_type in {"function_call_output", "custom_tool_call_output", "tool_search_output"}:
-            saw_tool_output = True
+        role = str(item.get("role") or "").strip()
+        if item_type == "agent_message":
+            payload = (
+                f"agent_message|{item.get('author')}|{item.get('recipient')}"
+                f"|{_item_text(item.get('content'))}"
+            )
+        elif role == "user" and item_type in {"", "message"}:
+            payload = f"user|{_item_text(item.get('content'))}"
+        else:
             continue
-        if item_type in {"function_call", "custom_tool_call", "item_reference"}:
-            continue
-        if item_type.startswith("reasoning"):
-            continue
-        break
-    return saw_tool_output
+        normalized = " ".join(payload.split())
+        fingerprints.add(hashlib.sha256(normalized.encode("utf-8", "replace")).hexdigest()[:32])
+    return fingerprints
 
 
 # Must never appear as assistant output — ends Desktop turns and causes goal loops.
@@ -1267,13 +1326,15 @@ def decide_tool_output_followup(
     *,
     ingested: int,
     delivery_path: bool,
-    input_items: Any,
+    new_user_intent: bool,
     leftover: str,
 ) -> str:
     """How to handle a Cursor passthrough follow-up after ingesting bridge job outputs.
 
     ``delivery_path`` is True when waiters were active *before* ingest and/or an
     early-closed bridge session still has leftover Cursor text to reclaim.
+    ``new_user_intent`` is True when the turn also carries instructions no live agent
+    has seen, which makes it a steer rather than a pure delivery.
 
     Returns:
       - ``\"reuse_leftover\"`` — complete with in-flight Cursor leftover text (no new agent)
@@ -1282,9 +1343,7 @@ def decide_tool_output_followup(
 
     Never returns a synthetic stub message — that ends Desktop turns and causes goal loops.
     """
-    if ingested <= 0 or not delivery_path:
-        return "noop"
-    if not input_items_are_only_tool_outputs(input_items):
+    if ingested <= 0 or not delivery_path or new_user_intent:
         return "noop"
     if str(leftover or "").strip():
         return "reuse_leftover"

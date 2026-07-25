@@ -52,16 +52,40 @@ follow-up that is not a tool-output delivery kill the orphan still blocked on
 `wait` (including empty or steer-shaped turns). The next turn respawns from the
 conversation cache + new input.
 
-Adoption keys off the **tail** of `input`, not the whole list
-(`input_items_deliver_tool_outputs`). Codex normally sends just the delta
-(`previous_response_id` + outputs), but **after compaction it drops the response
-chain and replays the entire conversation inline**. Matching the whole input
-classified every post-compaction delivery as a steer, so the shim cancelled the
-agent that owned those very results and respawned it — the agent then
-re-announced its plan on each turn, producing a visible loop
-(`cancel bridge=X (orphaned by steer/interrupt call_id=call_X_1)` immediately
-after `early-complete bridge=X`). Steering appends the user's text *after* the
-interrupted outputs, so the tail still separates the two cases.
+### Deciding adoption
+
+`CursorBridgeRegistry.resolve_adoption` answers one question — *is this turn
+handing an agent the results it is blocked on, or giving it new work?* — from
+**bridge state**, not from the shape of `input`. It adopts when all three hold:
+
+1. The turn carries `function_call_output` items (`tool_output_call_ids`).
+2. Some **live** cursor-agent owns one of those `call_id`s.
+3. The turn adds **no instruction that agent has not already seen**.
+
+Point 3 is the only classification, and it is deliberately narrow: a user-role
+message or an `agent_message` is an instruction (`user_intent_fingerprints`);
+everything else — reasoning, tool calls and results, compaction records, item
+references, developer preamble, and any item type added to Codex later — is
+transcript machinery. Each session digests the instructions it was registered
+with, so "new" is measured against what the agent was actually told rather than
+against a position in the list.
+
+This replaced a check that required the whole `input` to be tool outputs. Codex
+normally sends only the delta (`previous_response_id` plus the outputs), but
+**after compaction it drops the response chain and replays the entire transcript
+inline**. The old check read every post-compaction delivery as a steer, so the
+shim cancelled the agent that owned the very results it was delivering and
+respawned it, and the fresh agent re-announced its plan each turn — a visible
+loop, logged as `cancel bridge=X (orphaned by steer/interrupt call_id=call_X_1)`
+directly after `early-complete bridge=X`.
+
+The failure direction matters as much as the fix. Matching item shapes fails
+*destructive*: an unrecognized type reads as a steer and kills a working agent.
+Measuring new instructions fails *safe*: an unrecognized type is simply not an
+instruction, so the agent survives. `scripts/smoke_bridge_adoption.sh` drives a
+real cursor-agent through all three follow-up shapes — `delta`, `replay`
+(post-compaction transcript plus a deliberately unknown item type), and `steer`
+— and asserts adopt / adopt / respawn-with-cancel.
 
 Handoff disconnect is recognized only **after** `finish()` completes successfully
 during early-complete — a disconnect while the stream is still open (user cancel)

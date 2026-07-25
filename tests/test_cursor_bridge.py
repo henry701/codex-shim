@@ -608,32 +608,14 @@ async def test_bridge_tool_output_followup_never_uses_delivery_stub():
     from codex_shim.cursor_bridge import (
         BRIDGE_DELIVERY_STUB_MARKER,
         decide_tool_output_followup,
-        input_items_are_only_tool_outputs,
     )
-
-    only_outputs = [
-        {"type": "function_call_output", "call_id": "c1", "output": "goal-state"},
-        {"type": "function_call_output", "call_id": "c2", "output": "agents"},
-    ]
-    desktop_shaped = [
-        {"type": "reasoning", "summary": [{"type": "summary_text", "text": "…"}]},
-        {"type": "function_call_output", "call_id": "c1", "output": "x"},
-    ]
-    with_user = [
-        {"type": "function_call_output", "call_id": "c1", "output": "x"},
-        {"role": "user", "content": "hi"},
-    ]
-
-    assert input_items_are_only_tool_outputs(only_outputs)
-    assert input_items_are_only_tool_outputs(desktop_shaped)
-    assert not input_items_are_only_tool_outputs(with_user)
 
     # Empty leftover must continue Cursor — never a stub completion.
     assert (
         decide_tool_output_followup(
             ingested=3,
             delivery_path=True,
-            input_items=only_outputs,
+            new_user_intent=False,
             leftover="",
         )
         == "continue_cursor"
@@ -642,7 +624,7 @@ async def test_bridge_tool_output_followup_never_uses_delivery_stub():
         decide_tool_output_followup(
             ingested=3,
             delivery_path=True,
-            input_items=desktop_shaped,
+            new_user_intent=False,
             leftover="   ",
         )
         == "continue_cursor"
@@ -651,7 +633,7 @@ async def test_bridge_tool_output_followup_never_uses_delivery_stub():
         decide_tool_output_followup(
             ingested=2,
             delivery_path=True,
-            input_items=only_outputs,
+            new_user_intent=False,
             leftover="Real leftover from in-flight turn",
         )
         == "reuse_leftover"
@@ -660,7 +642,7 @@ async def test_bridge_tool_output_followup_never_uses_delivery_stub():
         decide_tool_output_followup(
             ingested=2,
             delivery_path=True,
-            input_items=with_user,
+            new_user_intent=True,
             leftover="",
         )
         == "noop"
@@ -669,7 +651,7 @@ async def test_bridge_tool_output_followup_never_uses_delivery_stub():
         decide_tool_output_followup(
             ingested=2,
             delivery_path=False,
-            input_items=only_outputs,
+            new_user_intent=False,
             leftover="",
         )
         == "noop"
@@ -1346,26 +1328,117 @@ async def test_fresh_turn_after_handoff_kills_orphan_agent(monkeypatch, tmp_path
         await client.close()
 
 
-def test_replayed_history_tail_is_a_tool_output_delivery_not_a_steer():
-    """After compaction Codex drops previous_response_id and replays history inline."""
-    from codex_shim.cursor_bridge import input_items_deliver_tool_outputs
+def test_only_user_and_agent_messages_count_as_instructions():
+    """Adoption must key off new instructions, not off an allowlist of item types.
 
-    post_compaction_replay = [
-        {"type": "message", "role": "user", "content": "start goal"},
-        {"type": "compaction", "summary": "…"},
+    Anything unrecognized has to read as transcript machinery: treating it as a steer
+    is what made the shim cancel the agent that owned the results being delivered.
+    """
+    from codex_shim.cursor_bridge import user_intent_fingerprints
+
+    transcript_only = [
+        {"type": "message", "role": "developer", "content": "be concise"},
         {"type": "message", "role": "assistant", "content": "working"},
         {"type": "reasoning", "summary": [{"type": "summary_text", "text": "…"}]},
+        {"type": "compaction", "summary": "earlier work"},
+        {"type": "item_reference", "id": "itm_1"},
+        {"type": "function_call", "call_id": "c1", "name": "list_agents"},
         {"type": "function_call_output", "call_id": "c1", "output": "agents"},
-        {"type": "function_call_output", "call_id": "c2", "output": "goal-state"},
+        {"type": "some_future_codex_item", "payload": "unknown to this shim"},
     ]
-    steer = [
-        {"type": "function_call_output", "call_id": "c1", "output": "interrupted"},
-        {"role": "user", "content": "stop waiting and continue"},
-    ]
+    assert user_intent_fingerprints(transcript_only) == set()
 
-    assert input_items_deliver_tool_outputs(post_compaction_replay)
-    assert not input_items_deliver_tool_outputs(steer)
-    assert not input_items_deliver_tool_outputs([])
+    # Both Desktop shapes of a user turn fingerprint identically.
+    plain = user_intent_fingerprints([{"role": "user", "content": "merge the fork"}])
+    typed = user_intent_fingerprints(
+        [
+            {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "merge the fork"}],
+            }
+        ]
+    )
+    assert plain == typed and len(plain) == 1
+
+    assert user_intent_fingerprints([{"role": "user", "content": "something else"}]) != plain
+    assert (
+        user_intent_fingerprints(
+            [
+                {
+                    "type": "agent_message",
+                    "author": "/root/audit",
+                    "recipient": "/root",
+                    "content": [{"type": "output_text", "text": "FINAL_ANSWER"}],
+                }
+            ]
+        )
+        != set()
+    )
+    assert user_intent_fingerprints([]) == set()
+    assert user_intent_fingerprints(None) == set()
+
+
+@pytest.mark.asyncio
+async def test_adoption_ignores_unknown_item_types_but_not_new_instructions():
+    """resolve_adoption is decided by bridge state, not by the shape of the input."""
+    body = _goal_tools_body()
+    from codex_shim.translate import responses_tool_resolve_map, responses_tool_type_map
+
+    session = CursorBridgeSession.create(
+        allowed_tools=bridge_allowed_tools(body),
+        tool_types=responses_tool_type_map(body["tools"]),
+        tool_resolve=responses_tool_resolve_map(body["tools"]),
+        tool_specs=bridge_tool_specs(body),
+    )
+    await cursor_bridge_registry.register(
+        session,
+        session_key="intent-session",
+        input_items=[{"role": "user", "content": "merge the fork"}],
+    )
+    try:
+        async def _sink(**_kwargs) -> None:
+            return None
+
+        session.attach_stream(_sink)
+        await session.invoke(
+            tool="create_goal", arguments={"objective": "merge fork"}, namespace="goals"
+        )
+        call_id = next(iter(session._jobs_by_call_id))
+        _attach_sleeping_agent(session)
+
+        replayed_delivery = [
+            {"role": "user", "content": "merge the fork"},
+            {"type": "compaction", "summary": "earlier work"},
+            {"type": "some_future_codex_item", "payload": "unknown to this shim"},
+            {"type": "function_call_output", "call_id": call_id, "output": "goal-created"},
+        ]
+        adopted, reason = cursor_bridge_registry.resolve_adoption(
+            replayed_delivery, session_key="intent-session"
+        )
+        assert adopted is session, reason
+
+        steer = replayed_delivery + [{"role": "user", "content": "stop and do something else"}]
+        refused, reason = cursor_bridge_registry.resolve_adoption(
+            steer, session_key="intent-session"
+        )
+        assert refused is None and "has not seen" in reason
+
+        # Results that belong to nobody live must never adopt.
+        orphan, reason = cursor_bridge_registry.resolve_adoption(
+            [{"type": "function_call_output", "call_id": "call_unknown", "output": "x"}],
+            session_key="intent-session",
+        )
+        assert orphan is None and "no live agent" in reason
+
+        # A turn with no results at all is a fresh request, not a delivery.
+        empty, reason = cursor_bridge_registry.resolve_adoption(
+            [{"role": "user", "content": "merge the fork"}], session_key="intent-session"
+        )
+        assert empty is None and "no tool results" in reason
+    finally:
+        session.cancel_agent()
+        cursor_bridge_registry.close(session.bridge_id)
 
 
 @pytest.mark.asyncio

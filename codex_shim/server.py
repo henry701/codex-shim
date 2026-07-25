@@ -63,7 +63,6 @@ from .cursor_bridge import (
     cursor_bridge_enabled,
     cursor_bridge_registry,
     decide_tool_output_followup,
-    input_items_deliver_tool_outputs,
     BRIDGE_DELIVERY_STUB_MARKER,
     bridge_unknown_session_payload,
     is_loopback_peer,
@@ -2599,23 +2598,22 @@ class ShimServer:
         # Prefer continuing the agent that emitted these tool calls over spawning a new
         # one. Must run before ingest: completing the jobs unblocks the agent, which may
         # invoke again immediately, and it needs this turn's stream already attached.
-        if (
-            cursor_bridge_enabled()
-            and bool(raw_body.get("stream"))
-            and not force_non_stream
-            and input_items_deliver_tool_outputs(raw_body.get("input"))
-        ):
-            adopt_session = cursor_bridge_registry.inflight_session_for_tool_outputs(
-                raw_body.get("input")
+        adopt_session: CursorBridgeSession | None = None
+        adopt_reason = "bridge disabled for this turn"
+        if cursor_bridge_enabled() and bool(raw_body.get("stream")) and not force_non_stream:
+            adopt_session, adopt_reason = cursor_bridge_registry.resolve_adoption(
+                raw_body.get("input"),
+                session_key=session_key,
             )
-            if adopt_session is not None:
-                adopted = await self._cursor_adopt_inflight_turn(
-                    request, raw_body, slug, adopt_session
-                )
-                if adopted is not None:
-                    return adopted
+        if adopt_session is not None:
+            adopted = await self._cursor_adopt_inflight_turn(
+                request, raw_body, slug, adopt_session
+            )
+            if adopted is not None:
+                return adopted
+            adopt_reason = "in-flight agent had nothing left to say"
         else:
-            # Steer / interrupt follow-ups carry tool outputs plus new user text. The
+            # Steer / interrupt follow-ups carry tool outputs plus new instructions. The
             # previous agent is still blocked on wait — cancel it; this turn respawns
             # from cached history (Codex's model for mid-turn steering).
             cancelled = cursor_bridge_registry.cancel_sessions_for_call_ids(
@@ -2623,8 +2621,7 @@ class ShimServer:
             )
             if cancelled:
                 print(
-                    f"[cursor-bridge] cancel-orphans count={cancelled} "
-                    "(follow-up is not a pure tool-output adopt)",
+                    f"[cursor-bridge] cancel-orphans count={cancelled} ({adopt_reason})",
                     flush=True,
                 )
         cancelled_live = cursor_bridge_registry.cancel_live_agents_for_session(session_key)
@@ -2647,11 +2644,12 @@ class ShimServer:
         # assistant text from the in-flight Cursor turn. Never emit a stub message —
         # an empty synthetic completion ends the Desktop turn and causes goal loops.
         if ingested > 0 and delivery_path:
+            new_user_intent = cursor_bridge_registry.introduces_user_intent(raw_body.get("input"))
             # Peek decision without leftover first; only block on passthrough when needed.
             provisional = decide_tool_output_followup(
                 ingested=ingested,
                 delivery_path=True,
-                input_items=raw_body.get("input"),
+                new_user_intent=new_user_intent,
                 leftover="",
             )
             if provisional in {"reuse_leftover", "continue_cursor"}:
@@ -2659,7 +2657,7 @@ class ShimServer:
                 decision = decide_tool_output_followup(
                     ingested=ingested,
                     delivery_path=True,
-                    input_items=raw_body.get("input"),
+                    new_user_intent=new_user_intent,
                     leftover=leftover,
                 )
                 if decision == "reuse_leftover":
@@ -2712,6 +2710,7 @@ class ShimServer:
                 await cursor_bridge_registry.register(
                     bridge_session,
                     session_key=session_key,
+                    input_items=raw_body.get("input"),
                 )
                 prompt += "\n\n" + build_bridge_suffix(
                     bridge_session,
