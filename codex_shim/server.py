@@ -55,7 +55,7 @@ from .cursor_bridge import (
     BridgeToolNotAllowedError,
     CursorBridgeSession,
     build_bridge_suffix,
-    bridge_allowed_tools,
+    bridge_tool_specs,
     cursor_bridge_enabled,
     cursor_bridge_registry,
     is_loopback_peer,
@@ -2604,13 +2604,15 @@ class ShimServer:
         bridge_session: CursorBridgeSession | None = None
 
         if cursor_bridge_enabled() and body.get("tools"):
-            allowed = bridge_allowed_tools(body)
+            tool_specs = bridge_tool_specs(body)
+            allowed = frozenset(spec.chat_name for spec in tool_specs)
             if allowed:
                 port = shim_port_from_request_host(request.headers.get("Host", ""))
                 bridge_session = CursorBridgeSession.create(
                     allowed_tools=allowed,
                     tool_types=tool_types,
                     tool_resolve=tool_resolve,
+                    tool_specs=tool_specs,
                 )
                 await cursor_bridge_registry.register(bridge_session)
                 prompt += "\n\n" + build_bridge_suffix(

@@ -10,8 +10,10 @@ from codex_shim.cursor_bridge import (
     BridgeToolNotAllowedError,
     CursorBridgeSession,
     bridge_allowed_tools,
+    bridge_tool_specs,
     build_bridge_suffix,
     cursor_bridge_registry,
+    is_bridge_denied_tool,
     is_bridge_shell_command,
     parse_bridge_tool_from_shell,
 )
@@ -34,11 +36,99 @@ def _goal_tools_body() -> dict:
                 "type": "namespace",
                 "name": "goals",
                 "tools": [
-                    {"type": "function", "name": "update_goal"},
-                    {"type": "function", "name": "create_goal"},
-                    {"type": "function", "name": "get_goal"},
+                    {
+                        "type": "function",
+                        "name": "update_goal",
+                        "description": "Update goal status",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"status": {"type": "string"}},
+                            "required": ["status"],
+                        },
+                    },
+                    {"type": "function", "name": "create_goal", "description": "Create a goal"},
+                    {"type": "function", "name": "get_goal", "description": "Read goal state"},
                 ],
             }
+        ],
+    }
+
+
+def _mixed_codex_tools_body() -> dict:
+    return {
+        "model": "cursor-grok-4-5-high",
+        "tools": [
+            {"type": "function", "name": "exec_command", "description": "Run shell"},
+            {"type": "function", "name": "write_stdin", "description": "Write stdin"},
+            {"type": "apply_patch"},
+            {"type": "function", "name": "list_mcp_resources", "description": "MCP resources"},
+            {"type": "function", "name": "tool_search", "description": "Search deferred MCP"},
+            {
+                "type": "function",
+                "name": "update_plan",
+                "description": "Update the plan",
+                "parameters": {"type": "object", "properties": {"plan": {"type": "string"}}},
+            },
+            {
+                "type": "function",
+                "name": "create_goal",
+                "description": "Create a goal with objective",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"objective": {"type": "string", "description": "Goal text"}},
+                    "required": ["objective"],
+                },
+            },
+            {
+                "type": "namespace",
+                "name": "collaboration",
+                "description": "Tools for spawning and managing sub-agents.",
+                "tools": [
+                    {
+                        "type": "function",
+                        "name": "spawn_agent",
+                        "description": "Spawns an agent to work on the specified task.",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "task_name": {"type": "string", "description": "Task name"},
+                                "message": {"type": "string", "description": "Initial task"},
+                            },
+                            "required": ["task_name", "message"],
+                        },
+                    },
+                    {
+                        "type": "function",
+                        "name": "wait_agent",
+                        "description": "Wait for a mailbox update from any live agent.",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"timeout_ms": {"type": "number"}},
+                        },
+                    },
+                    {
+                        "type": "function",
+                        "name": "send_message",
+                        "description": "Send a message to an existing agent.",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "target": {"type": "string"},
+                                "message": {"type": "string"},
+                            },
+                            "required": ["target", "message"],
+                        },
+                    },
+                    {"type": "function", "name": "list_agents", "description": "List live agents"},
+                    {"type": "function", "name": "followup_task", "description": "Follow up a child"},
+                    {"type": "function", "name": "interrupt_agent", "description": "Interrupt a child"},
+                ],
+            },
+            {
+                "type": "namespace",
+                "name": "mcp__codebase_memory_mcp",
+                "tools": [{"type": "function", "name": "search_graph"}],
+            },
         ],
     }
 
@@ -50,13 +140,51 @@ def test_bridge_allowed_tools_from_request():
     assert "goals_get_goal" in allowed
 
 
+def test_bridge_denylist_excludes_cursor_like_tools():
+    assert is_bridge_denied_tool(chat_name="exec_command")
+    assert is_bridge_denied_tool(chat_name="apply_patch", tool_type="apply_patch")
+    assert is_bridge_denied_tool(chat_name="list_mcp_resources")
+    assert is_bridge_denied_tool(chat_name="mcp__exa__web_search_exa")
+    assert is_bridge_denied_tool(chat_name="search_graph", namespace="mcp__codebase_memory_mcp")
+    assert not is_bridge_denied_tool(chat_name="collaboration_spawn_agent", namespace="collaboration")
+    assert not is_bridge_denied_tool(chat_name="create_goal")
+
+    allowed = bridge_allowed_tools(_mixed_codex_tools_body())
+    assert "collaboration_spawn_agent" in allowed
+    assert "collaboration_wait_agent" in allowed
+    assert "collaboration_send_message" in allowed
+    assert "collaboration_list_agents" in allowed
+    assert "collaboration_followup_task" in allowed
+    assert "collaboration_interrupt_agent" in allowed
+    assert "create_goal" in allowed
+    assert "update_plan" in allowed
+    assert "exec_command" not in allowed
+    assert "write_stdin" not in allowed
+    assert "apply_patch" not in allowed
+    assert "list_mcp_resources" not in allowed
+    assert "tool_search" not in allowed
+    assert not any(name.startswith("mcp__") for name in allowed)
+
+
+def test_bridge_tool_specs_include_descriptions():
+    specs = bridge_tool_specs(_mixed_codex_tools_body())
+    by_name = {spec.chat_name: spec for spec in specs}
+    spawn = by_name["collaboration_spawn_agent"]
+    assert spawn.namespace == "collaboration"
+    assert "Spawns an agent" in spawn.description
+    assert spawn.parameters.get("required") == ["task_name", "message"]
+    assert "task_name" in (spawn.parameters.get("properties") or {})
+
+
 def test_build_bridge_suffix_appends_after_stable_prompt():
     body = _goal_tools_body()
     prefix = build_cursor_prompt(body)
+    specs = bridge_tool_specs(body)
     session = CursorBridgeSession.create(
         allowed_tools=bridge_allowed_tools(body),
         tool_types={},
         tool_resolve={},
+        tool_specs=specs,
     )
     suffix = build_bridge_suffix(session, 8765, workspace="/tmp/ws")
     full = prefix + "\n\n" + suffix
@@ -65,9 +193,30 @@ def test_build_bridge_suffix_appends_after_stable_prompt():
     assert BRIDGE_SUFFIX_TAG in suffix
     assert session.bridge_id in suffix
     assert "http://127.0.0.1:8765/_cursor_bridge/v1/invoke" in suffix
-    assert "goals_update_goal" in suffix
+    assert "goals.update_goal" in suffix or "goals_update_goal" in suffix
+    assert "Update goal status" in suffix
+    assert "Parameters schema:" in suffix
     assert "Codex workspace path: /tmp/ws" in suffix
     assert "create_goal requires" in suffix
+    assert "Sub-agent protocol" in suffix
+
+
+def test_build_bridge_suffix_lists_collaboration_before_denylisted_noise():
+    body = _mixed_codex_tools_body()
+    specs = bridge_tool_specs(body)
+    session = CursorBridgeSession.create(
+        allowed_tools=frozenset(spec.chat_name for spec in specs),
+        tool_types={},
+        tool_resolve={},
+        tool_specs=specs,
+    )
+    suffix = build_bridge_suffix(session, 8765)
+    assert "collaboration.spawn_agent" in suffix
+    assert "wait_agent" in suffix
+    assert "send_message" in suffix
+    assert "exec_command" not in suffix
+    assert "list_mcp_resources" not in suffix
+    assert suffix.index("collaboration.spawn_agent") < suffix.index("update_plan")
 
 
 def test_resolve_cursor_workspace_from_prompt():
@@ -120,11 +269,39 @@ async def test_bridge_invoke_rejects_disallowed_tool():
         allowed_tools=bridge_allowed_tools(body),
         tool_types={},
         tool_resolve={},
+        tool_specs=bridge_tool_specs(body),
     )
     collector = CursorResponseCollector()
     session.attach_collector(collector)
     with pytest.raises(BridgeToolNotAllowedError):
         await session.invoke(tool="exec_command", arguments={"cmd": "ls"})
+
+
+@pytest.mark.asyncio
+async def test_bridge_invoke_rejects_denylisted_even_if_present_in_body():
+    body = _mixed_codex_tools_body()
+    from codex_shim.translate import responses_tool_resolve_map, responses_tool_type_map
+
+    tool_types = responses_tool_type_map(body["tools"])
+    tool_resolve = responses_tool_resolve_map(body["tools"])
+    session = CursorBridgeSession.create(
+        allowed_tools=bridge_allowed_tools(body),
+        tool_types=tool_types,
+        tool_resolve=tool_resolve,
+        tool_specs=bridge_tool_specs(body),
+    )
+    collector = CursorResponseCollector()
+    session.attach_collector(collector)
+    with pytest.raises(BridgeToolNotAllowedError):
+        await session.invoke(tool="exec_command", arguments={"cmd": "ls"})
+    result = await session.invoke(
+        tool="spawn_agent",
+        namespace="collaboration",
+        arguments={"task_name": "child_1", "message": "do the thing"},
+    )
+    assert result["ok"] is True
+    assert result["namespace"] == "collaboration"
+    assert result["tool"] == "spawn_agent"
 
 
 @pytest.mark.asyncio
@@ -138,6 +315,7 @@ async def test_bridge_invoke_collector_appends_function_call():
         allowed_tools=bridge_allowed_tools(body),
         tool_types=tool_types,
         tool_resolve=tool_resolve,
+        tool_specs=bridge_tool_specs(body),
     )
     collector = CursorResponseCollector(tool_types=tool_types, tool_resolve=tool_resolve)
     session.attach_collector(collector)
@@ -211,6 +389,7 @@ async def test_cursor_bridge_invoke_http_handler():
         allowed_tools=bridge_allowed_tools(body),
         tool_types=tool_types,
         tool_resolve=tool_resolve,
+        tool_specs=bridge_tool_specs(body),
     )
     collector = CursorResponseCollector(tool_types=tool_types, tool_resolve=tool_resolve)
     session.attach_collector(collector)

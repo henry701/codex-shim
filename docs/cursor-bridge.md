@@ -25,7 +25,7 @@ cursor-agent (Composer)
     │ Shell: curl POST /_cursor_bridge/v1/invoke
     ▼
 codex-shim bridge handler
-    │ validate bridge id + tool allowlist
+    │ validate bridge id + denylist / turn tool set
     │ emit function_call SSE to Codex
     ▼
 Codex Desktop executes tool locally
@@ -38,11 +38,14 @@ block tagged `[CODEX_SHIM_CURSOR_BRIDGE v1]` containing:
 
 - A random **bridge session id** (16 alphanumeric characters)
 - The invoke URL (`http://127.0.0.1:<port>/_cursor_bridge/v1/invoke`)
-- An exact **curl** command template
-- The **allowed tool list** derived from `body.tools`
+- An exact **curl** command template (supports optional `namespace`)
+- A **bridged tool catalog** with Codex descriptions + compact JSON parameter
+  schemas (collaboration/goals sorted first)
+- Sub-agent and goal protocol notes
 
-Composer must use its **Shell** tool with that curl pattern. Only `TOOL` and
-`ARGUMENTS` may be substituted.
+Composer must use its **Shell** tool with that curl pattern. Only `TOOL`,
+`NAMESPACE_OR_EMPTY`, and `ARGUMENTS` may be substituted. File/shell/search/MCP
+work stays on Cursor-native tools — never via the bridge.
 
 ## HTTP API
 
@@ -89,12 +92,26 @@ Errors:
 | 400 | Invalid JSON, missing fields, disallowed tool |
 | 404 | Unknown or expired bridge session |
 
-## Allowlist
+## Bridged tool set (denylist)
 
-Any tool present in the Codex request `body.tools` is allowed — including
-namespace tools (stored internally as sanitized chat names like
-`goals_update_goal`). The server enforces the full allowlist even when the
-suffix truncates the displayed list.
+The bridge starts from every tool in the Codex request `body.tools`, then
+**denies** Cursor-overlapping / hosted / MCP runners:
+
+| Denied | Examples |
+|--------|----------|
+| Shell / command | `exec_command`, `write_stdin`, `local_shell`, `exec`, `wait` |
+| File patch | `apply_patch` |
+| Web / computer | `web_search*`, `computer_use*`, `image_generation` |
+| MCP | `list_mcp_resources`, `read_mcp_resource`, `tool_search`, `mcp__*` namespaces |
+
+Everything else stays bridged — including **collaboration/sub-agent** tools
+(`spawn_agent`, `wait_agent`, `send_message`, `list_agents`, `followup_task`,
+`interrupt_agent`), **goals**, `update_plan`, `request_user_input`, and future
+Codex-native control-plane tools that appear in `body.tools`.
+
+The server enforces the denylist even when the suffix truncates the displayed
+catalog (`CODEX_SHIM_CURSOR_BRIDGE_TOOL_LIST_CAP`, default 40).
+
 
 ## Environment variables
 
@@ -113,9 +130,14 @@ Injection is always driven by the HTTP invoke, not by parsing NDJSON.
 ## Troubleshooting
 
 - **curl returns 404** — passthrough finished or bridge TTL expired; start a new Codex turn.
-- **curl returns 400 tool not allowed** — tool was not in the original Codex `body.tools`.
+- **curl returns 400 tool not available** — tool is denylisted (shell/file/web/MCP)
+  or was not in this turn's Codex `body.tools`.
 - **Goals still loop** — confirm Composer actually ran the bridge curl (check reasoning / shell output) and that `update_goal` was invoked with `status: complete` or `blocked`.
+- **Sub-agents appear stuck** — use `send_message` / `followup_task` with a real
+  `target` from `spawn_agent`/`list_agents`, then `wait_agent`; do not busy-loop
+  `list_agents`/`get_goal` alone.
 - **`create_goal` fails validation** — Codex requires an `objective` string, not `name`/`description`.
+- **`spawn_agent` fails validation** — requires `task_name` + `message`.
 
 ## Verified in live session (2026-06-28)
 
