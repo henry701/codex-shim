@@ -2034,6 +2034,7 @@ class ShimServer:
             expand_enabled=expand,
             context=context,
             strip_previous_response_id=expand,
+            name_resolver=cursor_bridge_registry.tool_name_for_call,
         )
 
     def _expand_responses_stripped_input(

@@ -703,6 +703,7 @@ class CursorBridgeSession:
             self._jobs_by_id[job_id] = job
             self._jobs_by_call_id[call_id] = job
             cursor_bridge_registry.index_call(call_id, self.bridge_id)
+            cursor_bridge_registry.remember_call_tool(call_id, chat_name)
 
             if self._stream_emit is not None:
                 await self._stream_emit(
@@ -837,10 +838,14 @@ class CursorBridgeSession:
             self._waiter_count = max(0, self._waiter_count - 1)
 
 
+_CALL_TOOL_NAME_MEMO_CAP = 512
+
+
 class CursorBridgeRegistry:
     def __init__(self) -> None:
         self._sessions: dict[str, CursorBridgeSession] = {}
         self._call_index: dict[str, str] = {}
+        self._call_tool_names: dict[str, str] = {}
         self._lock = asyncio.Lock()
 
     async def register(self, session: CursorBridgeSession) -> str:
@@ -879,6 +884,22 @@ class CursorBridgeRegistry:
         clean = str(call_id or "").strip()
         if clean:
             self._call_index[clean] = bridge_id
+
+    def remember_call_tool(self, call_id: str, chat_name: str) -> None:
+        """Retain call_id -> tool name after the job is consumed.
+
+        Bridge results reach Codex detached from the synthetic `function_call`, so the
+        input pipeline needs the real name to avoid labelling them `unknown_tool`.
+        """
+        clean = str(call_id or "").strip()
+        if not clean or not chat_name:
+            return
+        self._call_tool_names[clean] = chat_name
+        while len(self._call_tool_names) > _CALL_TOOL_NAME_MEMO_CAP:
+            self._call_tool_names.pop(next(iter(self._call_tool_names)))
+
+    def tool_name_for_call(self, call_id: str) -> str | None:
+        return self._call_tool_names.get(str(call_id or "").strip())
 
     def unindex_call(self, call_id: str) -> None:
         self._call_index.pop(str(call_id or "").strip(), None)

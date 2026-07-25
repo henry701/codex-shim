@@ -874,3 +874,30 @@ def test_build_bridge_suffix_documents_wait_and_poll():
     assert "/_cursor_bridge/v1/wait" in suffix
     assert "/_cursor_bridge/v1/poll" in suffix
     assert "job_id" in suffix
+
+
+@pytest.mark.asyncio
+async def test_registry_remembers_tool_name_after_job_is_consumed():
+    body = _goal_tools_body()
+    session = CursorBridgeSession.create(
+        allowed_tools=bridge_allowed_tools(body),
+        tool_types={},
+        tool_resolve={},
+        tool_specs=bridge_tool_specs(body),
+    )
+    session.attach_collector(CursorResponseCollector(tool_types={}, tool_resolve={}))
+    await cursor_bridge_registry.register(session)
+    try:
+        accepted = await session.invoke(
+            tool="create_goal", arguments={"objective": "x"}, namespace="goals"
+        )
+        call_id = accepted["codex_call_id"]
+        cursor_bridge_registry.ingest_function_call_outputs(
+            [{"type": "function_call_output", "call_id": call_id, "output": "made"}]
+        )
+        await session.wait_job(accepted["job_id"], timeout_s=1.0)
+        # Job is consumed, but the name must survive for orphan repair.
+        assert "create_goal" in str(cursor_bridge_registry.tool_name_for_call(call_id))
+        assert cursor_bridge_registry.tool_name_for_call("call_missing") is None
+    finally:
+        cursor_bridge_registry.close(session.bridge_id)

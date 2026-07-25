@@ -11,6 +11,7 @@ the upstream connection already holds the prior tool call.
 from __future__ import annotations
 
 import copy
+from collections.abc import Callable
 from typing import Any, Protocol
 
 from .compaction.input_audit import CompactionSanitizationAudit, compaction_input_item_ref
@@ -42,24 +43,38 @@ def _tool_item_call_id(item: dict[str, Any]) -> str | None:
     return None
 
 
-def _synthetic_tool_call_item(call_id: str, *, output_type: str) -> dict[str, Any]:
+def _synthetic_tool_call_item(
+    call_id: str,
+    *,
+    output_type: str,
+    name: str | None = None,
+) -> dict[str, Any]:
     if output_type == "custom_tool_call_output":
         return {
             "type": "custom_tool_call",
             "call_id": call_id,
-            "name": UNKNOWN_CUSTOM_TOOL_NAME,
+            "name": name or UNKNOWN_CUSTOM_TOOL_NAME,
             "input": "",
         }
     return {
         "type": "function_call",
         "call_id": call_id,
-        "name": UNKNOWN_FUNCTION_TOOL_NAME,
+        "name": name or UNKNOWN_FUNCTION_TOOL_NAME,
         "arguments": "{}",
     }
 
 
-def synthesize_orphan_tool_calls(input_items: list[Any]) -> tuple[list[Any], list[str]]:
-    """Insert synthetic tool calls before orphan tool outputs in Responses input."""
+def synthesize_orphan_tool_calls(
+    input_items: list[Any],
+    *,
+    name_resolver: Callable[[str], str | None] | None = None,
+) -> tuple[list[Any], list[str]]:
+    """Insert synthetic tool calls before orphan tool outputs in Responses input.
+
+    Bridge results arrive detached from the ``function_call`` the shim emitted on an
+    earlier, early-completed stream. ``name_resolver`` recovers the real tool name so
+    the model does not see the result attributed to a placeholder.
+    """
     if not input_items:
         return [], []
 
@@ -88,7 +103,10 @@ def synthesize_orphan_tool_calls(input_items: list[Any]) -> tuple[list[Any], lis
         if item_type in _TOOL_OUTPUT_ITEM_TYPES:
             call_id = _tool_item_call_id(raw)
             if call_id and call_id not in seen_call_ids:
-                synth = _synthetic_tool_call_item(call_id, output_type=item_type)
+                resolved = name_resolver(call_id) if name_resolver else None
+                synth = _synthetic_tool_call_item(
+                    call_id, output_type=item_type, name=resolved
+                )
                 repaired.append(copy.deepcopy(synth))
                 seen_call_ids.add(call_id)
                 ref = compaction_input_item_ref(index, raw)
@@ -170,6 +188,7 @@ def prepare_responses_input_items(
     expand_enabled: bool,
     context: str,
     orphan_synthesis: bool = True,
+    name_resolver: Callable[[str], str | None] | None = None,
 ) -> tuple[list[Any], list[str]]:
     expanded = expand_cached_responses_input(
         cache=cache,
@@ -181,7 +200,7 @@ def prepare_responses_input_items(
     )
     if not orphan_synthesis:
         return expanded, []
-    return synthesize_orphan_tool_calls(expanded)
+    return synthesize_orphan_tool_calls(expanded, name_resolver=name_resolver)
 
 
 def _log_pipeline_warnings(warnings: list[str]) -> None:
@@ -199,6 +218,7 @@ def apply_responses_input_pipeline_to_body(
     context: str,
     strip_previous_response_id: bool = False,
     orphan_synthesis: bool = True,
+    name_resolver: Callable[[str], str | None] | None = None,
 ) -> dict[str, Any]:
     prepared = dict(body)
     raw_input = prepared.get("input")
@@ -211,6 +231,7 @@ def apply_responses_input_pipeline_to_body(
             expand_enabled=expand_enabled,
             context=context,
             orphan_synthesis=orphan_synthesis,
+            name_resolver=name_resolver,
         )
         _log_pipeline_warnings(warnings)
         prepared["input"] = repaired

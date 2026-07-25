@@ -84,3 +84,18 @@ def test_prepare_responses_input_items_expands_then_synthesizes():
     assert repaired[2]["call_id"] == "call_2"
     assert repaired[3]["call_id"] == "call_2"
     assert len(warnings) == 1
+
+
+def test_synthesize_orphan_tool_calls_uses_resolved_bridge_tool_name():
+    """Bridge results arrive detached from their function_call; keep the real name."""
+    input_items = [
+        {"type": "function_call_output", "call_id": "call_bridge_1", "output": "goal"},
+        {"type": "function_call_output", "call_id": "call_other", "output": "x"},
+    ]
+    names = {"call_bridge_1": "create_goal"}
+    repaired, warnings = synthesize_orphan_tool_calls(
+        input_items, name_resolver=names.get
+    )
+    assert repaired[0]["name"] == "create_goal"
+    assert repaired[2]["name"] == UNKNOWN_FUNCTION_TOOL_NAME
+    assert len(warnings) == 2
