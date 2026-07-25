@@ -240,6 +240,16 @@ def test_smoke_cursor_bridge_tmux_script_is_valid_bash():
     subprocess.run(["bash", "-n", str(script)], check=True)
 
 
+def test_smoke_bridge_adoption_script_is_valid_bash():
+    import subprocess
+    from pathlib import Path
+
+    script = Path(__file__).resolve().parents[1] / "scripts" / "smoke_bridge_adoption.sh"
+    assert script.is_file()
+    assert script.stat().st_mode & 0o111
+    subprocess.run(["bash", "-n", str(script)], check=True)
+
+
 def test_bridge_shell_recognizer():
     curl = (
         "curl -sS -X POST 'http://127.0.0.1:8765/_cursor_bridge/v1/invoke' "
