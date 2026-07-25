@@ -1132,3 +1132,104 @@ async def test_adopted_agent_can_invoke_more_tools_on_later_turns(monkeypatch, t
         assert agent.spawns == 1, "three Codex turns must share one cursor-agent"
     finally:
         await client.close()
+
+
+@pytest.mark.asyncio
+async def test_cursor_thinking_reopens_after_tool_boundary(monkeypatch):
+    """Each think→tool→think cycle must be a separate reasoning item for Desktop."""
+    import codex_shim.server as server_module
+
+    writes: list[dict] = []
+
+    async def fake_write(_response, payload):
+        writes.append(payload)
+
+    monkeypatch.setattr(server_module, "_write_sse", fake_write)
+
+    state = ResponsesStreamState("cursor-composer-2-5")
+    response = object()
+    await state.append_cursor_thinking_activity(response, "plan A")
+    await state.close_cursor_thinking_activity(response)
+    await state.open_cursor_tool_activity(response, "t1", "**cursor-agent · shell**\n\n> ls\n")
+    await state.close_cursor_tool_activity(response, "t1")
+    await state.append_cursor_thinking_activity(response, "plan B")
+    await state.close_cursor_thinking_activity(response)
+
+    reasoning_added = [
+        event
+        for event in writes
+        if event.get("type") == "response.output_item.added"
+        and (event.get("item") or {}).get("type") == "reasoning"
+    ]
+    assert len(reasoning_added) == 3  # think, tool, think
+    texts = [
+        state.reasoning_blocks[key]["text"]
+        for key in sorted(
+            state.reasoning_blocks,
+            key=lambda k: state.reasoning_blocks[k]["output_index"],
+        )
+    ]
+    assert any("plan A" in text for text in texts)
+    assert any("plan B" in text for text in texts)
+    assert any("shell" in text for text in texts)
+
+
+@pytest.mark.asyncio
+async def test_steer_follow_up_cancels_orphaned_agent_instead_of_adopting(monkeypatch, tmp_path):
+    """Codex steer keeps history and sends new user text + interrupted tool output.
+
+    The previous cursor-agent is still blocked on wait; adopting it would ignore the
+    steer. Cancel it and let this turn respawn from the cached prompt.
+    """
+    import codex_shim.server as server_module
+
+    agent = _FakeBridgeAgent()
+    monkeypatch.setattr(server_module, "cursor_passthrough_available", lambda: True)
+    monkeypatch.setattr(server_module, "iter_cursor_agent_events", agent)
+    monkeypatch.setattr(server_module, "cursor_upstream_model", lambda slug: "composer-2.5")
+
+    settings = tmp_path / "settings.json"
+    settings.write_text("{}")
+    client = TestClient(TestServer(ShimServer(settings).app()))
+    await client.start_server()
+    try:
+        tools = _goal_tools_body()["tools"]
+        first = await _post_cursor_turn(
+            client,
+            {
+                "model": "cursor-composer-2-5",
+                "stream": True,
+                "tools": tools,
+                "input": [{"role": "user", "content": "start goal"}],
+            },
+        )
+        call_ids = [
+            event["item"]["call_id"]
+            for event in _sse_events(first)
+            if event.get("type") == "response.output_item.added"
+            and (event.get("item") or {}).get("type") == "function_call"
+        ]
+        assert len(call_ids) == 1
+        assert agent.spawns == 1
+
+        # Steer-shaped follow-up: interrupted tool output + new user text.
+        second = await _post_cursor_turn(
+            client,
+            {
+                "model": "cursor-composer-2-5",
+                "stream": True,
+                "tools": tools,
+                "input": [
+                    {
+                        "type": "function_call_output",
+                        "call_id": call_ids[0],
+                        "output": '{"message":"Wait interrupted by new input.","timed_out":false}',
+                    },
+                    {"role": "user", "content": "stop waiting and continue"},
+                ],
+            },
+        )
+        assert agent.spawns == 2, "steer must spawn a fresh agent from history, not adopt"
+        assert "Inventorying" in second or "Codex said" in second or len(second) > 0
+    finally:
+        await client.close()

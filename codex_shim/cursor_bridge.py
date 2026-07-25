@@ -589,6 +589,10 @@ class CursorBridgeSession:
     def mark_turn_closed(self) -> None:
         self._turn_closed = True
 
+    @property
+    def turn_closed(self) -> bool:
+        return self._turn_closed
+
     def reopen_turn(self) -> None:
         """Let the same agent emit more Codex tool calls on the next turn.
 
@@ -1084,6 +1088,44 @@ class CursorBridgeRegistry:
             if session is not None and session.agent_alive():
                 return session
         return None
+
+    def cancel_sessions_for_call_ids(self, items: Any) -> int:
+        """Kill live agents that own call_ids in ``items`` (steer/interrupt orphans).
+
+        Pure tool-output follow-ups adopt those agents instead; mixed follow-ups
+        (interrupted outputs + new user text) must not leave them blocked on wait.
+        """
+        if not isinstance(items, list):
+            return 0
+        cancelled = 0
+        seen: set[str] = set()
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            if str(item.get("type") or "").strip() not in {
+                "function_call_output",
+                "custom_tool_call_output",
+            }:
+                continue
+            call_id = str(item.get("call_id") or "").strip()
+            if not call_id:
+                continue
+            bridge_id = self._call_index.get(call_id)
+            session = self.get(bridge_id) if bridge_id else None
+            if session is None:
+                continue
+            if session.bridge_id in seen:
+                continue
+            seen.add(session.bridge_id)
+            if session.agent_alive():
+                print(
+                    f"[cursor-bridge] cancel bridge={session.bridge_id} "
+                    f"(orphaned by steer/interrupt call_id={call_id})",
+                    flush=True,
+                )
+                session.cancel_agent()
+                cancelled += 1
+        return cancelled
 
     def has_active_waiters(self) -> bool:
         return any(session.has_active_waiters() for session in self._sessions.values())

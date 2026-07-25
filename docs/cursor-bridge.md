@@ -38,16 +38,20 @@ Codex Desktop executes tool locally; result returns via wait/poll JSON.
 ## One agent per session
 
 Codex only runs tool calls once the response stream ends, so a bridged turn is
-early-completed while cursor-agent is still mid-thought. The agent is **not**
-killed: the bridge session owns the process, buffers whatever it emits while no
-Codex turn is attached, and a tool-output-only follow-up **adopts** it —
-replaying the buffered output and then streaming live. The turn reopens, so the
-same agent keeps invoking tools across as many Codex round-trips as it needs.
+early-completed while cursor-agent is still mid-thought. That early-complete is
+the **only** case where we keep the process alive: the bridge session owns it,
+buffers whatever it emits, and a tool-output-only follow-up **adopts** it —
+replaying the buffer, reopening the turn, and streaming live.
 
-Respawning per turn instead would rebuild the prompt from the cached history and
-restart the agent from a blank slate, which made it re-announce the same plan
-every turn instead of making progress. A fresh agent is spawned only when there
-is no live one to adopt.
+Steer / interrupt / user-cancel are different. Codex drops the HTTP request,
+records whatever was already streamed (thinking + tool text) into history, and
+sends a new turn with that history plus the steer text (see CLI
+`steer_interrupts_wait_agent_and_is_sent_in_follow_up_request`). The shim
+mirrors that: cancel the live cursor-agent on unexpected disconnect, and on any
+follow-up that is not a pure tool-output adopt kill the orphan still blocked on
+`wait`. The next turn respawns from the conversation cache + new input.
+
+A fresh agent is also spawned when there is no live one to adopt.
 
 ## Suffix protocol
 

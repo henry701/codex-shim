@@ -2613,6 +2613,19 @@ class ShimServer:
                 )
                 if adopted is not None:
                     return adopted
+        else:
+            # Steer / interrupt follow-ups carry tool outputs plus new user text. The
+            # previous agent is still blocked on wait — cancel it; this turn respawns
+            # from cached history (Codex's model for mid-turn steering).
+            cancelled = cursor_bridge_registry.cancel_sessions_for_call_ids(
+                raw_body.get("input")
+            )
+            if cancelled:
+                print(
+                    f"[cursor-bridge] cancel-orphans count={cancelled} "
+                    "(follow-up is not a pure tool-output adopt)",
+                    flush=True,
+                )
         # Snapshot waiter/early-close state BEFORE ingest: completing jobs wakes waiters
         # and can clear has_active_waiters() before we decide the delivery path.
         delivery_path = cursor_bridge_registry.has_active_waiters() or bool(
@@ -2841,7 +2854,16 @@ class ShimServer:
                 await state.finish(response, upstream_saw_done=True)
                 await _persist_turn_cache()
             except ClientDisconnected:
-                pass
+                # Steer / interrupt / user-cancel: Codex drops the HTTP request. That is
+                # not our early-complete handoff — kill the agent and let the next turn
+                # rebuild from cached history + the steer text (Codex's own model).
+                if bridge_session is not None and not bridge_session.turn_closed:
+                    print(
+                        f"[cursor-bridge] cancel bridge={bridge_session.bridge_id} "
+                        "(Codex disconnected before early-complete)",
+                        flush=True,
+                    )
+                    bridge_session.cancel_agent()
             except Exception as exc:
                 detail = str(exc).strip() or repr(exc)
                 print(f"[err] cursor passthrough {slug}: {type(exc).__name__}: {detail}", flush=True)
@@ -2963,7 +2985,14 @@ class ShimServer:
             else:
                 agent_done = not session.agent_alive()
         except ClientDisconnected:
-            pass
+            # Mid-adopt disconnect is a steer/interrupt, not a tool-result handoff.
+            if not session.turn_closed:
+                print(
+                    f"[cursor-bridge] cancel bridge={session.bridge_id} "
+                    "(Codex disconnected mid-adopt)",
+                    flush=True,
+                )
+                session.cancel_agent()
         except Exception as exc:
             detail = str(exc).strip() or repr(exc)
             print(f"[err] cursor adopt {slug}: {type(exc).__name__}: {detail}", flush=True)
@@ -4538,6 +4567,10 @@ class ResponsesStreamState:
         self.tool_search_calls: dict[int, dict[str, Any]] = {}
         # Reasoning (extended thinking) blocks, keyed by upstream index.
         self.reasoning_blocks: dict[Any, dict[str, Any]] = {}
+        # Cursor thinking is split at tool/text boundaries into separate items so
+        # Desktop can render them as distinct bubbles; a singleton key would drop
+        # every thought after the first tool.
+        self._cursor_thinking_seq = 0
         self.finished_messages: list[tuple[int, dict[str, Any]]] = []
         self.next_output_index = 0
         self.completed_turns: list[dict[str, Any]] = []
@@ -5352,8 +5385,12 @@ class ResponsesStreamState:
     ) -> None:
         if not delta:
             return
-        key = ("cursor_thinking",)
+        key = ("cursor_thinking", self._cursor_thinking_seq)
         state = self.reasoning_blocks.get(key)
+        if state is not None and state.get("closed"):
+            self._cursor_thinking_seq += 1
+            key = ("cursor_thinking", self._cursor_thinking_seq)
+            state = None
         if state is None:
             await self._open_reasoning(
                 response,
@@ -5361,13 +5398,11 @@ class ResponsesStreamState:
                 initial_text=f"**cursor-agent · thinking**\n\n{delta}",
             )
             return
-        if state.get("closed"):
-            return
         state["text"] = str(state.get("text") or "") + delta
         await self._emit_reasoning_summary_deltas(response, state, delta)
 
     async def close_cursor_thinking_activity(self, response: web.StreamResponse) -> None:
-        key = ("cursor_thinking",)
+        key = ("cursor_thinking", self._cursor_thinking_seq)
         state = self.reasoning_blocks.get(key)
         if state is not None and not state.get("closed"):
             await self._close_reasoning(response, state)
