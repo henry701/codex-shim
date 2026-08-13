@@ -79,6 +79,8 @@ def build_summarization_compact_body(
         compact["tools"] = body.get("tools")
     if body.get("parallel_tool_calls") is not None:
         compact["parallel_tool_calls"] = body.get("parallel_tool_calls")
+    if body.get("reasoning") is not None:
+        compact["reasoning"] = body.get("reasoning")
     compact["model"] = requested_slug
     return compact
 

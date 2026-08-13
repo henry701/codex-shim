@@ -158,7 +158,28 @@ async def test_relay_records_usage_on_completed(monkeypatch):
     assert observed[0]["usage"]["input_tokens_details"]["cached_tokens"] == 2
 
 
-def test_chatgpt_expand_applied_before_upstream_send():
+def test_chatgpt_collector_keeps_output_item_done_when_completed_output_empty():
+    collector = ChatgptPassthroughResponseCollector({"input": []})
+    collector.record(
+        {
+            "type": "response.output_item.done",
+            "item": {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "## Goal\n- Compact"}],
+            },
+        }
+    )
+    collector.record(
+        {
+            "type": "response.completed",
+            "response": {"id": "resp_lite", "status": "completed", "output": []},
+        }
+    )
+    output = collector.output_items()
+    assert output[0]["type"] == "message"
+    assert output[0]["content"][0]["text"] == "## Goal\n- Compact"
+
     first_input = [{"type": "message", "role": "user", "content": "run"}]
     tool_call = {"type": "function_call", "id": "fc_1", "call_id": "call_1", "name": "exec_command", "arguments": "{}"}
     tool_output = {"type": "function_call_output", "call_id": "call_1", "output": "ok"}

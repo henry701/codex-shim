@@ -212,6 +212,25 @@ def test_finalize_chatgpt_passthrough_body_strips_token_limits_and_forces_store_
     assert "max_tokens" not in sanitized
     assert "service_tier" not in sanitized
     assert sanitized["store"] is False
+    assert sanitized["parallel_tool_calls"] is False
+    assert sanitized["reasoning"] == {"context": "all_turns"}
+
+
+def test_finalize_chatgpt_passthrough_body_forces_lite_reasoning_context():
+    from codex_shim.server import _finalize_chatgpt_passthrough_body
+
+    sanitized = _finalize_chatgpt_passthrough_body(
+        {
+            "model": "gpt-5.6-luna",
+            "parallel_tool_calls": True,
+            "reasoning": {"effort": "high", "summary": "auto", "context": "last_turn"},
+        }
+    )
+
+    assert sanitized["reasoning"]["effort"] == "high"
+    assert sanitized["reasoning"]["summary"] == "auto"
+    assert sanitized["reasoning"]["context"] == "all_turns"
+    assert sanitized["parallel_tool_calls"] is False
 
 
 def test_finalize_chatgpt_compact_passthrough_body_omits_store_and_stream():
@@ -228,6 +247,7 @@ def test_finalize_chatgpt_compact_passthrough_body_omits_store_and_stream():
     )
 
     assert sanitized["instructions"] == "Compact."
+    assert sanitized["parallel_tool_calls"] is False
     assert "max_output_tokens" not in sanitized
     assert "store" not in sanitized
     assert "stream" not in sanitized
@@ -2777,6 +2797,191 @@ async def test_chatgpt_compact_passthrough_falls_back_to_summarization_on_native
         assert "Compacted thread summary." in summary
         assert any(url.endswith("/responses/compact") for url in calls)
         assert any("/codex/responses" in url and not url.endswith("/compact") for url in calls)
+    finally:
+        await shim_client.close()
+
+
+async def test_chatgpt_compact_summarization_sets_reasoning_context_all_turns_after_native_404(
+    monkeypatch, tmp_path, auth_present
+):
+    """Native /codex/responses/compact is gone (404). Summarization hits /codex/responses
+    with Desktop's Responses-Lite header, which 400s unless reasoning.context=all_turns.
+    """
+    captured: dict[str, Any] = {}
+
+    class MissingCompactUpstream:
+        status = 404
+        content_type = "application/json"
+        headers = {"Content-Type": "application/json"}
+
+        async def text(self):
+            return '{"detail":"Not Found"}'
+
+        def release(self):
+            pass
+
+    class SummarizationUpstream:
+        status = 200
+        content_type = "text/event-stream"
+        headers = {"Content-Type": "text/event-stream"}
+
+        def __init__(self):
+            completed = {
+                "type": "response.completed",
+                "response": {
+                    "id": "resp_summarize",
+                    "model": "gpt-5.6-luna",
+                    "status": "completed",
+                    "output": [
+                        {
+                            "type": "message",
+                            "role": "assistant",
+                            "content": [{"type": "output_text", "text": "Luna thread summary."}],
+                        }
+                    ],
+                    "usage": {"input_tokens": 3, "output_tokens": 2, "total_tokens": 5},
+                },
+            }
+            self.content = _FakeSseContent(
+                [
+                    b'data: {"type":"response.created","response":{"id":"resp_summarize","model":"gpt-5.6-luna","status":"in_progress"}}\n\n',
+                    f"data: {json.dumps(completed)}\n\n".encode(),
+                    b"data: [DONE]\n\n",
+                ]
+            )
+
+        def release(self):
+            pass
+
+    async def fake_post(self, url, json=None, headers=None):
+        if str(url).endswith("/responses/compact"):
+            return MissingCompactUpstream()
+        if "chatgpt.com/backend-api/codex/responses" in str(url):
+            captured["summarization_body"] = json
+            captured["summarization_headers"] = headers
+            return SummarizationUpstream()
+        raise AssertionError(f"unexpected url: {url}")
+
+    monkeypatch.setattr("codex_shim.server.ClientSession.post", fake_post)
+
+    settings = tmp_path / "settings.json"
+    settings.write_text("{}")
+    shim_client = TestClient(TestServer(ShimServer(settings).app()))
+    await shim_client.start_server()
+    try:
+        resp = await shim_client.post(
+            "/v1/responses",
+            json={
+                "model": "codex-gpt-5-6-luna",
+                "stream": True,
+                "parallel_tool_calls": True,
+                "reasoning": {"effort": "high", "context": "last_turn"},
+                "input": [
+                    {"type": "message", "role": "user", "content": "long thread"},
+                    {"type": "compaction_trigger"},
+                ],
+            },
+            headers={"X-OpenAI-Internal-Codex-Responses-Lite": "1"},
+        )
+        assert resp.status == 200
+        body = captured["summarization_body"]
+        assert body["reasoning"]["context"] == "all_turns"
+        assert body["reasoning"]["effort"] == "high"
+        assert body["parallel_tool_calls"] is False
+        events = _sse_events(await resp.text())
+        done = next(event for event in events if event.get("type") == "response.output_item.done")
+        summary = decode_shim_compaction_summary(done["item"]["encrypted_content"])
+        assert "Luna thread summary." in summary
+    finally:
+        await shim_client.close()
+
+
+async def test_chatgpt_compact_summarization_reads_lite_output_item_when_completed_output_empty(
+    monkeypatch, tmp_path, auth_present
+):
+    """Responses Lite leaves response.completed.output empty; the summary is on
+    response.output_item.done. collect_stream must harvest that item or compaction
+    reports a false empty summary after a 200.
+    """
+    captured: dict[str, Any] = {}
+
+    class MissingCompactUpstream:
+        status = 404
+        content_type = "application/json"
+        headers = {"Content-Type": "application/json"}
+
+        async def text(self):
+            return '{"detail":"Not Found"}'
+
+        def release(self):
+            pass
+
+    class SummarizationUpstream:
+        status = 200
+        content_type = "text/event-stream"
+        headers = {"Content-Type": "text/event-stream"}
+
+        def __init__(self):
+            message_item = {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "## Goal\n- List two files"}],
+            }
+            completed = {
+                "type": "response.completed",
+                "response": {
+                    "id": "resp_lite_summarize",
+                    "model": "gpt-5.6-luna",
+                    "status": "completed",
+                    "output": [],
+                    "usage": {"input_tokens": 3, "output_tokens": 8, "total_tokens": 11},
+                },
+            }
+            self.content = _FakeSseContent(
+                [
+                    b'data: {"type":"response.created","response":{"id":"resp_lite_summarize","model":"gpt-5.6-luna","status":"in_progress","output":[]}}\n\n',
+                    f'data: {json.dumps({"type": "response.output_item.done", "item": message_item})}\n\n'.encode(),
+                    f"data: {json.dumps(completed)}\n\n".encode(),
+                    b"data: [DONE]\n\n",
+                ]
+            )
+
+        def release(self):
+            pass
+
+    async def fake_post(self, url, json=None, headers=None):
+        if str(url).endswith("/responses/compact"):
+            return MissingCompactUpstream()
+        if "chatgpt.com/backend-api/codex/responses" in str(url):
+            captured["summarization_body"] = json
+            return SummarizationUpstream()
+        raise AssertionError(f"unexpected url: {url}")
+
+    monkeypatch.setattr("codex_shim.server.ClientSession.post", fake_post)
+
+    settings = tmp_path / "settings.json"
+    settings.write_text("{}")
+    shim_client = TestClient(TestServer(ShimServer(settings).app()))
+    await shim_client.start_server()
+    try:
+        resp = await shim_client.post(
+            "/v1/responses",
+            json={
+                "model": "codex-gpt-5-6-luna",
+                "stream": True,
+                "input": [
+                    {"type": "message", "role": "user", "content": "long thread"},
+                    {"type": "compaction_trigger"},
+                ],
+            },
+            headers={"X-OpenAI-Internal-Codex-Responses-Lite": "1"},
+        )
+        assert resp.status == 200
+        events = _sse_events(await resp.text())
+        done = next(event for event in events if event.get("type") == "response.output_item.done")
+        summary = decode_shim_compaction_summary(done["item"]["encrypted_content"])
+        assert "## Goal" in summary
+        assert "List two files" in summary
     finally:
         await shim_client.close()
 

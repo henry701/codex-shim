@@ -2335,6 +2335,7 @@ class ShimServer:
             if collect_stream:
                 completed: dict[str, Any] | None = None
                 failed_message = ""
+                collector = ChatgptPassthroughResponseCollector(forwarded)
                 try:
                     async for line in _sse_lines(upstream, request):
                         if line == "[DONE]":
@@ -2343,6 +2344,7 @@ class ShimServer:
                             payload = json.loads(line)
                         except json.JSONDecodeError:
                             continue
+                        collector.record(payload)
                         if payload.get("type") == "response.failed":
                             response_obj = payload.get("response")
                             if isinstance(response_obj, dict):
@@ -2364,6 +2366,9 @@ class ShimServer:
                         detail,
                         content_type="text/plain",
                     )
+                collected_output = collector.output_items()
+                if collected_output and not compaction_summary_from_output(completed.get("output")):
+                    completed["output"] = collected_output
                 usage = completed.get("usage") if isinstance(completed.get("usage"), dict) else None
                 upstream_forward_headers = upstream_headers_from_response(upstream)
                 log_upstream_response(
@@ -4130,7 +4135,7 @@ def _finalize_chatgpt_passthrough_body(body: dict[str, Any]) -> dict[str, Any]:
     for key in _CHATGPT_UNSUPPORTED_REQUEST_KEYS:
         forwarded.pop(key, None)
     forwarded["store"] = False
-    return forwarded
+    return _apply_chatgpt_lite_constraints(forwarded)
 
 
 _CHATGPT_COMPACT_UNSUPPORTED_REQUEST_KEYS = (
@@ -4144,6 +4149,30 @@ def _finalize_chatgpt_compact_passthrough_body(body: dict[str, Any]) -> dict[str
     forwarded = dict(body)
     for key in _CHATGPT_COMPACT_UNSUPPORTED_REQUEST_KEYS:
         forwarded.pop(key, None)
+    return _apply_chatgpt_lite_constraints(forwarded)
+
+
+CHATGPT_LITE_REASONING_CONTEXT = "all_turns"
+
+
+def _apply_chatgpt_lite_constraints(body: dict[str, Any]) -> dict[str, Any]:
+    """Codex Desktop sends ``X-OpenAI-Internal-Codex-Responses-Lite``.
+
+    Lite ``/codex/responses`` requires ``reasoning.context=all_turns`` and an
+    explicit ``parallel_tool_calls=false`` (omitting the field still 400s).
+    Native ``/codex/responses/compact`` now 404s, so compaction falls back to a
+    synthetic summarization POST that previously omitted both and 400'd.
+    Keep effort/summary; force the Lite-required fields.
+    """
+    forwarded = dict(body)
+    reasoning = forwarded.get("reasoning")
+    if isinstance(reasoning, dict):
+        updated = dict(reasoning)
+        updated["context"] = CHATGPT_LITE_REASONING_CONTEXT
+        forwarded["reasoning"] = updated
+    else:
+        forwarded["reasoning"] = {"context": CHATGPT_LITE_REASONING_CONTEXT}
+    forwarded["parallel_tool_calls"] = False
     return forwarded
 
 
