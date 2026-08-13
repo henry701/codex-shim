@@ -9,6 +9,14 @@ from codex_shim.upstream_io_trace import (
 )
 
 
+def test_summarize_upstream_body_includes_service_tier():
+    summary = summarize_upstream_body(
+        {"model": "codex-gpt-5-6-luna", "service_tier": "priority", "max_output_tokens": 128}
+    )
+    assert summary["service_tier"] == "priority"
+    assert summary["max_output_tokens"] == 128
+
+
 def test_summarize_upstream_body_lists_all_input_item_types():
     body = {
         "model": "codex-gpt-5-5",

@@ -37,6 +37,10 @@ and this project does not yet follow semantic versioning (pre-1.0).
 
 ### Changed
 
+- ChatGPT passthrough no longer strips `service_tier`, `max_output_tokens`, or
+  `max_tokens`. Fast mode (`priority`) and output caps are forwarded. Legacy
+  `/compact` still omits `store`/`stream`.
+
 - ChatGPT passthrough compaction is a thin proxy: `compaction_trigger` on
   `/v1/responses` is forwarded to `/codex/responses` (Desktop remote compact v2)
   instead of the shim orchestrator. Legacy `/v1/responses/compact` maps 1:1 to

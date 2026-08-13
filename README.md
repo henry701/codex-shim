@@ -934,7 +934,9 @@ fallback, or turn-level `passthrough_error_fallback` on those ChatGPT compact
 requests. It still rewrites ChatGPT-illegal fields: model slug, `store: false`,
 Lite `reasoning.context=all_turns` / `parallel_tool_calls=false`, cache
 expansion of `previous_response_id`, and stripping shim-opaque
-`encrypted_content`.
+`encrypted_content`. Client `service_tier` (Fast/`priority`) and token caps
+pass through unless ChatGPT 400s on them. Legacy `/compact` still omits
+`store` and `stream`.
 
 Cursor, BYOK, and OpenCode-style custom models still share the
 `codex_shim.compaction` orchestrator: prepare input (orphan sanitization,

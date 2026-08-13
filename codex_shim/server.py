@@ -4026,24 +4026,16 @@ def _sanitize_chatgpt_passthrough_body(body: dict[str, Any], *, strip_previous_r
     return _finalize_chatgpt_passthrough_body(sanitized)
 
 
-_CHATGPT_UNSUPPORTED_REQUEST_KEYS = (
-    "max_output_tokens",
-    "max_tokens",
-    "service_tier",
-    # Prompt cache fields (see prompt_cache.PROMPT_CACHE_BODY_KEYS) are forwarded as-is.
-)
-
-
 def _finalize_chatgpt_passthrough_body(body: dict[str, Any]) -> dict[str, Any]:
+    # Force store=false (ChatGPT Codex). Forward service_tier and token caps;
+    # only rewrite fields that have 400'd.
     forwarded = dict(body)
-    for key in _CHATGPT_UNSUPPORTED_REQUEST_KEYS:
-        forwarded.pop(key, None)
     forwarded["store"] = False
     return _apply_chatgpt_lite_constraints(forwarded)
 
 
+# /codex/responses/compact 400s on store and stream.
 _CHATGPT_COMPACT_UNSUPPORTED_REQUEST_KEYS = (
-    *_CHATGPT_UNSUPPORTED_REQUEST_KEYS,
     "store",
     "stream",
 )

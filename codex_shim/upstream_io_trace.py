@@ -114,6 +114,7 @@ def summarize_upstream_body(body: dict[str, Any], *, full_input_types: bool | No
         "messages": message_count,
         "instructions_chars": len(str(body.get("instructions") or "")),
         "max_output_tokens": body.get("max_output_tokens"),
+        "service_tier": body.get("service_tier"),
         "previous_response_id": body.get("previous_response_id"),
     }
 

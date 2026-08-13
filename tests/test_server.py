@@ -195,7 +195,7 @@ def test_sanitize_chatgpt_passthrough_body_can_strip_previous_response_id_for_le
     assert body["previous_response_id"] == "resp_previous"
 
 
-def test_finalize_chatgpt_passthrough_body_strips_token_limits_and_forces_store_false():
+def test_finalize_chatgpt_passthrough_body_forwards_fast_tier_and_token_caps():
     from codex_shim.server import _finalize_chatgpt_passthrough_body
 
     sanitized = _finalize_chatgpt_passthrough_body(
@@ -203,14 +203,14 @@ def test_finalize_chatgpt_passthrough_body_strips_token_limits_and_forces_store_
             "model": "gpt-5.5",
             "max_output_tokens": 4096,
             "max_tokens": 2048,
-            "service_tier": "default",
+            "service_tier": "priority",
             "store": True,
         }
     )
 
-    assert "max_output_tokens" not in sanitized
-    assert "max_tokens" not in sanitized
-    assert "service_tier" not in sanitized
+    assert sanitized["max_output_tokens"] == 4096
+    assert sanitized["max_tokens"] == 2048
+    assert sanitized["service_tier"] == "priority"
     assert sanitized["store"] is False
     assert sanitized["parallel_tool_calls"] is False
     assert sanitized["reasoning"] == {"context": "all_turns"}
@@ -240,6 +240,8 @@ def test_finalize_chatgpt_compact_passthrough_body_omits_store_and_stream():
         {
             "model": "gpt-5.5",
             "max_output_tokens": 4096,
+            "max_tokens": 2048,
+            "service_tier": "priority",
             "store": False,
             "stream": False,
             "instructions": "Compact.",
@@ -248,7 +250,9 @@ def test_finalize_chatgpt_compact_passthrough_body_omits_store_and_stream():
 
     assert sanitized["instructions"] == "Compact."
     assert sanitized["parallel_tool_calls"] is False
-    assert "max_output_tokens" not in sanitized
+    assert sanitized["max_output_tokens"] == 4096
+    assert sanitized["max_tokens"] == 2048
+    assert sanitized["service_tier"] == "priority"
     assert "store" not in sanitized
     assert "stream" not in sanitized
 
@@ -419,6 +423,52 @@ async def test_chatgpt_passthrough_http_always_expands_even_when_expand_env_disa
     assert "previous_response_id" not in captured["body"]
     assert captured["headers"]["session_id"] == "sess-abc"
     assert resp.headers["x-request-id"] == "req_1"
+
+    await shim_client.close()
+
+
+async def test_chatgpt_passthrough_http_forwards_service_tier_and_output_caps(
+    monkeypatch, tmp_path, auth_present
+):
+    captured = {}
+
+    class FakeUpstream:
+        status = 200
+        content_type = "application/json"
+        headers = {}
+
+        async def json(self, content_type=None):
+            return {"id": "resp_1", "model": "gpt-5.5", "output": []}
+
+        def release(self):
+            pass
+
+    async def fake_post(self, url, json=None, headers=None):
+        captured["body"] = json
+        return FakeUpstream()
+
+    monkeypatch.setattr("codex_shim.server.ClientSession.post", fake_post)
+    settings = tmp_path / "settings.json"
+    settings.write_text("{}")
+    shim_client = TestClient(TestServer(ShimServer(settings).app()))
+    await shim_client.start_server()
+
+    resp = await shim_client.post(
+        "/v1/responses",
+        json={
+            "model": "codex-gpt-5-6-luna",
+            "input": "hi",
+            "service_tier": "priority",
+            "max_output_tokens": 4096,
+            "max_tokens": 2048,
+        },
+    )
+
+    assert resp.status == 200
+    assert captured["body"]["service_tier"] == "priority"
+    assert captured["body"]["max_output_tokens"] == 4096
+    assert captured["body"]["max_tokens"] == 2048
+    assert captured["body"]["store"] is False
 
     await shim_client.close()
 
@@ -776,14 +826,22 @@ async def test_chatgpt_compact_passthrough_requests_advertise_zstd_encoding(monk
 
     resp = await shim_client.post(
         "/v1/responses/compact",
-        json={"model": "codex-gpt-5-5", "input": "summarize"},
+        json={
+            "model": "codex-gpt-5-5",
+            "input": "summarize",
+            "service_tier": "priority",
+            "max_output_tokens": 4096,
+            "store": False,
+            "stream": False,
+        },
         headers={"Accept-Encoding": "zstd, gzip"},
     )
 
     assert resp.status == 200
     assert captured["url"] == "https://chatgpt.com/backend-api/codex/responses/compact"
     assert captured["headers"]["Accept-Encoding"] == "zstd, gzip"
-    assert "max_output_tokens" not in captured["body"]
+    assert captured["body"]["service_tier"] == "priority"
+    assert captured["body"]["max_output_tokens"] == 4096
     assert "store" not in captured["body"]
     assert "stream" not in captured["body"]
 
@@ -2723,6 +2781,8 @@ async def test_chatgpt_http_compaction_v2_proxies_to_codex_responses(monkeypatch
             json={
                 "model": "codex-gpt-5-6-luna",
                 "stream": True,
+                "service_tier": "priority",
+                "max_output_tokens": 4096,
                 "parallel_tool_calls": True,
                 "reasoning": {"effort": "high", "context": "last_turn"},
                 "input": [
@@ -2741,6 +2801,8 @@ async def test_chatgpt_http_compaction_v2_proxies_to_codex_responses(monkeypatch
         assert captured["body"]["reasoning"]["effort"] == "high"
         assert captured["body"]["parallel_tool_calls"] is False
         assert captured["body"]["store"] is False
+        assert captured["body"]["service_tier"] == "priority"
+        assert captured["body"]["max_output_tokens"] == 4096
         assert '"type": "compaction"' in text or '"type":"compaction"' in text.replace(" ", "")
         assert "openai-native-compaction-blob" in text
         assert "Remote native compaction failed" not in text
@@ -3127,15 +3189,24 @@ async def test_responses_compact_chatgpt_passthrough_uses_compact_endpoint(monke
     shim_client = TestClient(TestServer(ShimServer(settings).app()))
     await shim_client.start_server()
 
-    resp = await shim_client.post("/v1/responses/compact", json={"model": "openai-gpt-5-5-codex-max", "input": "hi", "stream": True})
+    resp = await shim_client.post(
+        "/v1/responses/compact",
+        json={
+            "model": "openai-gpt-5-5-codex-max",
+            "input": "hi",
+            "stream": True,
+            "service_tier": "priority",
+            "max_output_tokens": 4096,
+        },
+    )
     assert resp.status == 200
     payload = await resp.json()
     assert payload["model"] == "openai-gpt-5-5-codex-max"
     assert payload["output"][0]["model"] == "openai-gpt-5-5-codex-max"
     assert captured["url"] == "https://chatgpt.com/backend-api/codex/responses/compact"
     assert captured["body"]["model"] == "gpt-5.5"
-    assert "stream" not in captured["body"]
-    assert "max_output_tokens" not in captured["body"]
+    assert captured["body"]["service_tier"] == "priority"
+    assert captured["body"]["max_output_tokens"] == 4096
     assert "store" not in captured["body"]
     assert "stream" not in captured["body"]
     assert captured["headers"]["Accept"] == "application/json"
