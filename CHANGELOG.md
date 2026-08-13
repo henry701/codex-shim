@@ -37,6 +37,12 @@ and this project does not yet follow semantic versioning (pre-1.0).
 
 ### Changed
 
+- ChatGPT passthrough compaction is a thin proxy: `compaction_trigger` on
+  `/v1/responses` is forwarded to `/codex/responses` (Desktop remote compact v2)
+  instead of the shim orchestrator. Legacy `/v1/responses/compact` maps 1:1 to
+  `/codex/responses/compact` and returns upstream status with no summarization
+  fallback. Cursor and BYOK still use the compaction orchestrator.
+
 - Compaction prep collapses consecutive duplicate `message(role=user)` items
   before sanitization (client compaction retry artifact).
 

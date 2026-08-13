@@ -21,7 +21,6 @@ from aiohttp import ClientError, ClientSession, ClientTimeout, WSMsgType, web
 from .compaction import (
     CompactionTriggerError,
     SHIM_COMPACTION_PREFIX,
-    apply_compaction_fallback_notice,
     compact_response_payload,
     compaction_item_from_response_payload,
     compaction_output_item,
@@ -1530,12 +1529,14 @@ class ShimServer:
         request: web.Request,
         body: dict[str, Any],
     ) -> web.StreamResponse | web.Response | None:
+        model = str(body.get("model") or "")
+        if is_chatgpt_passthrough_slug(model):
+            return None
         try:
             stripped_input = strip_terminal_compaction_trigger(body.get("input"))
         except CompactionTriggerError as exc:
-            model = str(body.get("model") or "unknown")
             return web.json_response(
-                _responses_error_payload(model, "invalid_request_error", str(exc)),
+                _responses_error_payload(model or "unknown", "invalid_request_error", str(exc)),
                 status=400,
             )
         if stripped_input is None:
@@ -1551,6 +1552,9 @@ class ShimServer:
     ) -> bool:
         body = {k: v for k, v in payload.items() if k != "type"}
         body = await self._maybe_apply_auto_router(body)
+        model = str(body.get("model") or "")
+        if is_chatgpt_passthrough_slug(model):
+            return False
         try:
             stripped_input = strip_terminal_compaction_trigger(body.get("input"))
         except CompactionTriggerError as exc:
@@ -1847,9 +1851,9 @@ class ShimServer:
             return web.json_response(compact_response_payload(requested_slug, summary, result.usage))
 
         if is_chatgpt_passthrough_slug(model):
-            return await _compact_json_response(
-                provider="chatgpt",
-                requested_slug=model,
+            return await self._chatgpt_compact_passthrough(
+                request,
+                body,
                 upstream_model=chatgpt_upstream_model(model),
             )
         if is_cursor_passthrough_slug(model):
@@ -2206,35 +2210,39 @@ class ShimServer:
         first-class models alongside configured BYOK entries.
         """
         requested = response_model_override or str(body.get("model") or "")
+        if allow_byok_fallback and _input_has_compaction_trigger(body.get("input")):
+            allow_byok_fallback = False
         auth_path = DEFAULT_CODEX_AUTH.expanduser()
         try:
             auth = json.loads(auth_path.read_text())
         except FileNotFoundError:
-            fallback = await self._maybe_passthrough_byok_fallback(
-                request,
-                body,
-                requested=requested,
-                response_slug=requested,
-                status=401,
-                detail="~/.codex/auth.json not found",
-            )
-            if fallback is not None:
-                return fallback
+            if allow_byok_fallback:
+                fallback = await self._maybe_passthrough_byok_fallback(
+                    request,
+                    body,
+                    requested=requested,
+                    response_slug=requested,
+                    status=401,
+                    detail="~/.codex/auth.json not found",
+                )
+                if fallback is not None:
+                    return fallback
             raise web.HTTPUnauthorized(text="~/.codex/auth.json not found")
         tokens = auth.get("tokens") or {}
         access_token = tokens.get("access_token")
         account_id = tokens.get("account_id") or ""
         if not access_token:
-            fallback = await self._maybe_passthrough_byok_fallback(
-                request,
-                body,
-                requested=requested,
-                response_slug=requested,
-                status=401,
-                detail="auth.json has no access_token",
-            )
-            if fallback is not None:
-                return fallback
+            if allow_byok_fallback:
+                fallback = await self._maybe_passthrough_byok_fallback(
+                    request,
+                    body,
+                    requested=requested,
+                    response_slug=requested,
+                    status=401,
+                    detail="auth.json has no access_token",
+                )
+                if fallback is not None:
+                    return fallback
             raise web.HTTPUnauthorized(text="auth.json has no access_token")
         session_key = self._session_key(request)
         await self._invalidate_chatgpt_ws_native_chains(thread_id=thread_id_from_headers(request.headers))
@@ -2472,115 +2480,11 @@ class ShimServer:
             raise web.HTTPUnauthorized(text="auth.json has no access_token")
         forwarded = _sanitize_chatgpt_compact_passthrough_body(body)
         original_model = str(forwarded.get("model") or "")
-        response = await self._post_chatgpt_native_compact(
+        return await self._post_chatgpt_native_compact(
             request,
             forwarded,
             upstream_model=upstream_model or CHATGPT_MODEL_SLUG,
             requested_slug=original_model or requested,
-        )
-        if response.status >= 400:
-            text = response.text or ""
-            _, message = parse_upstream_error(text, response.status)
-            input_items = body.get("input") or []
-            if not isinstance(input_items, list):
-                input_items = [input_items] if input_items is not None else []
-            try:
-                result = await self._run_compaction_orchestrator(
-                    request,
-                    body,
-                    input_items,
-                    provider="chatgpt",
-                    requested_slug=original_model or requested,
-                    upstream_model=upstream_model,
-                    transport="legacy_compact",
-                    skip_native=True,
-                    preset_native_message=message,
-                )
-            except CompactionOrchestratorError as exc:
-                enriched = _compaction_orchestrator_error_response(original_model or requested, exc)
-                fallback = await self._maybe_passthrough_byok_fallback(
-                    request,
-                    body,
-                    requested=requested,
-                    response_slug=original_model or requested,
-                    status=response.status,
-                    detail=text,
-                    compact=True,
-                )
-                if fallback is not None:
-                    return self._apply_native_compaction_notice_to_compact_response(
-                        fallback,
-                        response_slug=original_model or requested,
-                        native_message=message,
-                    )
-                return enriched
-            summary = decode_shim_compaction_summary(result.item.get("encrypted_content")) or ""
-            return web.json_response(
-                compact_response_payload(original_model or requested, summary, result.usage)
-            )
-        return response
-
-    async def _chatgpt_summarization_compact_response(
-        self,
-        request: web.Request,
-        body: dict[str, Any],
-        *,
-        upstream_model: str | None,
-        response_slug: str,
-        native_message: str,
-    ) -> web.Response | None:
-        input_items = body.get("input")
-        if not isinstance(input_items, list):
-            input_items = [input_items] if input_items is not None else []
-        try:
-            result = await self._run_compaction_orchestrator(
-                request,
-                body,
-                input_items,
-                provider="chatgpt",
-                requested_slug=response_slug,
-                upstream_model=upstream_model or CHATGPT_MODEL_SLUG,
-                transport="legacy_compact",
-                skip_native=True,
-                preset_native_message=native_message,
-            )
-        except CompactionOrchestratorError:
-            return None
-        summary = decode_shim_compaction_summary(result.item.get("encrypted_content")) or ""
-        if not summary.strip():
-            return None
-        print(
-            f"[fallback] {response_slug} native compaction -> ChatGPT summarization",
-            flush=True,
-        )
-        return web.json_response(
-            compact_response_payload(response_slug, summary, result.usage)
-        )
-
-    def _apply_native_compaction_notice_to_compact_response(
-        self,
-        response: web.StreamResponse | web.Response,
-        *,
-        response_slug: str,
-        native_message: str,
-    ) -> web.StreamResponse | web.Response:
-        if not isinstance(response, web.Response) or response.status >= 400:
-            return response
-        try:
-            payload = json.loads(response.text or "{}")
-        except json.JSONDecodeError:
-            return response
-        if not isinstance(payload, dict):
-            return response
-        summary = self._summary_from_compact_upstream_payload(payload)
-        if not summary.strip():
-            return response
-        return web.json_response(
-            compact_response_payload(
-                response_slug,
-                apply_compaction_fallback_notice(summary, native_message),
-                payload.get("usage"),
-            )
         )
 
     async def _cursor_passthrough(
@@ -4160,9 +4064,8 @@ def _apply_chatgpt_lite_constraints(body: dict[str, Any]) -> dict[str, Any]:
 
     Lite ``/codex/responses`` requires ``reasoning.context=all_turns`` and an
     explicit ``parallel_tool_calls=false`` (omitting the field still 400s).
-    Native ``/codex/responses/compact`` now 404s, so compaction falls back to a
-    synthetic summarization POST that previously omitted both and 400'd.
-    Keep effort/summary; force the Lite-required fields.
+    Keep effort/summary; force the Lite-required fields on every ChatGPT
+    passthrough turn, including forwarded remote-compact v2 requests.
     """
     forwarded = dict(body)
     reasoning = forwarded.get("reasoning")

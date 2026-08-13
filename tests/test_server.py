@@ -531,21 +531,15 @@ async def test_chatgpt_compaction_expands_previous_response_id_from_cache(
             pass
 
     async def fake_post(self, url, json=None, headers=None):
-        if str(url).endswith("/responses/compact"):
-            captured["compact_input"] = (json or {}).get("input")
-            return FakeUpstream(
-                {
-                    "id": "resp_compact",
-                    "status": "completed",
-                    "output": [
-                        {
-                            "type": "compaction",
-                            "encrypted_content": encode_shim_compaction_summary("Expanded compact."),
-                        }
-                    ],
-                }
-            )
+        assert not str(url).endswith("/responses/compact"), url
         captured.setdefault("turn_calls", []).append(json)
+        input_items = (json or {}).get("input") or []
+        if isinstance(input_items, list) and input_items and input_items[-1].get("type") == "compaction_trigger":
+            captured["compact_url"] = str(url)
+            captured["compact_input"] = input_items
+            return _FakeSseUpstream(
+                _chatgpt_compaction_v2_sse_chunks(encrypted_content="openai-native-compaction-blob")
+            )
         if len(captured["turn_calls"]) == 1:
             return FakeUpstream({"id": "resp_previous", "model": "gpt-5.5", "output": [tool_call]})
         return FakeUpstream({"id": "resp_next", "model": "gpt-5.5", "output": []})
@@ -585,6 +579,7 @@ async def test_chatgpt_compaction_expands_previous_response_id_from_cache(
         headers=session_headers,
     )
     assert compact.status == 200
+    assert captured.get("compact_url") == "https://chatgpt.com/backend-api/codex/responses"
     compact_input = captured.get("compact_input")
     assert isinstance(compact_input, list)
     synth_call_2 = {
@@ -593,7 +588,14 @@ async def test_chatgpt_compaction_expands_previous_response_id_from_cache(
         "name": UNKNOWN_FUNCTION_TOOL_NAME,
         "arguments": "{}",
     }
-    assert compact_input == [*first_input, tool_call, tool_output, synth_call_2, tail_output]
+    assert compact_input == [
+        *first_input,
+        tool_call,
+        tool_output,
+        synth_call_2,
+        tail_output,
+        {"type": "compaction_trigger"},
+    ]
 
     await shim_client.close()
 
@@ -797,6 +799,68 @@ class _FakeSseContent:
         if not self._chunks:
             return b""
         return self._chunks.pop(0)
+
+
+def _sse_chunk(payload: dict[str, Any]) -> bytes:
+    return f"data: {json.dumps(payload)}\n\n".encode()
+
+
+def _chatgpt_compaction_v2_sse_chunks(
+    *,
+    response_id: str = "resp_compact",
+    model: str = "gpt-5.5",
+    encrypted_content: str = "openai-native-compaction-blob",
+    completed_output: list[Any] | None = None,
+) -> list[bytes]:
+    item = {"type": "compaction", "encrypted_content": encrypted_content}
+    output = [item] if completed_output is None else completed_output
+    return [
+        _sse_chunk(
+            {
+                "type": "response.created",
+                "response": {"id": response_id, "model": model, "status": "in_progress", "output": []},
+            }
+        ),
+        _sse_chunk({"type": "response.output_item.done", "item": item}),
+        _sse_chunk(
+            {
+                "type": "response.completed",
+                "response": {
+                    "id": response_id,
+                    "model": model,
+                    "status": "completed",
+                    "output": output,
+                },
+            }
+        ),
+        b"data: [DONE]\n\n",
+    ]
+
+
+class _FakeSseUpstream:
+    status = 200
+    content_type = "text/event-stream"
+    headers = {"Content-Type": "text/event-stream"}
+
+    def __init__(self, chunks: list[bytes] | None = None):
+        self.content = _FakeSseContent(chunks or _chatgpt_compaction_v2_sse_chunks())
+
+    def release(self):
+        pass
+
+
+class _FakeHttpErrorUpstream:
+    def __init__(self, status: int, text: str, content_type: str = "application/json"):
+        self.status = status
+        self.content_type = content_type
+        self.headers = {"Content-Type": content_type}
+        self._text = text
+
+    async def text(self):
+        return self._text
+
+    def release(self):
+        pass
 
 
 async def test_chatgpt_passthrough_websocket_relays_sse_events(monkeypatch, tmp_path, auth_present):
@@ -2589,33 +2653,14 @@ async def test_responses_compaction_v2_emits_single_compaction_stream_item(tmp_p
     await upstream_client.close()
 
 
-async def test_chatgpt_ws_compaction_v2_emits_single_compaction_item(monkeypatch, tmp_path, auth_present):
+async def test_chatgpt_ws_compaction_v2_proxies_to_codex_responses(monkeypatch, tmp_path, auth_present):
+    monkeypatch.setenv("CODEX_SHIM_WS_PASSTHROUGH", "0")
     captured = {}
 
-    class FakeUpstream:
-        status = 200
-        content_type = "application/json"
-
-        async def json(self, content_type=None):
-            return {
-                "id": "resp_compact",
-                "model": "gpt-5.5",
-                "output": [
-                    {
-                        "type": "compaction",
-                        "encrypted_content": "openai-native-compaction-blob",
-                    }
-                ],
-                "usage": {"input_tokens": 5, "output_tokens": 2, "total_tokens": 7},
-            }
-
-        def release(self):
-            pass
-
     async def fake_post(self, url, json=None, headers=None):
-        captured["url"] = url
+        captured["url"] = str(url)
         captured["body"] = json
-        return FakeUpstream()
+        return _FakeSseUpstream()
 
     monkeypatch.setattr("codex_shim.server.ClientSession.post", fake_post)
 
@@ -2644,223 +2689,27 @@ async def test_chatgpt_ws_compaction_v2_emits_single_compaction_item(monkeypatch
             events.append(payload)
             if payload.get("type") == "response.completed":
                 break
-        assert captured["url"] == "https://chatgpt.com/backend-api/codex/responses/compact"
-        assert "compaction_trigger" not in json.dumps(captured["body"])
-        assert len(events) == 2
-        assert events[0]["type"] == "response.output_item.done"
-        assert events[0]["item"]["type"] == "compaction"
-        assert events[1]["response"]["output"] == [events[0]["item"]]
-        assert events[1]["response"]["model"] == "codex-gpt-5-5"
+        assert captured["url"] == "https://chatgpt.com/backend-api/codex/responses"
+        assert captured["body"]["input"][-1]["type"] == "compaction_trigger"
+        types = [event.get("type") for event in events]
+        assert "response.output_item.done" in types
+        done = next(event for event in events if event.get("type") == "response.output_item.done")
+        assert done["item"]["type"] == "compaction"
+        assert done["item"]["encrypted_content"] == "openai-native-compaction-blob"
+        assert events[-1]["response"]["model"] == "codex-gpt-5-5"
         await ws.close()
     finally:
         await shim_client.close()
 
 
-async def test_chatgpt_http_compaction_v2_before_passthrough(monkeypatch, tmp_path, auth_present):
+async def test_chatgpt_http_compaction_v2_proxies_to_codex_responses(monkeypatch, tmp_path, auth_present):
     captured = {}
 
-    class FakeUpstream:
-        status = 200
-        content_type = "application/json"
-
-        async def json(self, content_type=None):
-            return {
-                "id": "resp_compact",
-                "model": "gpt-5.5",
-                "output": [
-                    {
-                        "type": "compaction",
-                        "encrypted_content": "openai-native-compaction-blob",
-                    }
-                ],
-            }
-
-        def release(self):
-            pass
-
     async def fake_post(self, url, json=None, headers=None):
-        captured["url"] = url
-        return FakeUpstream()
-
-    monkeypatch.setattr("codex_shim.server.ClientSession.post", fake_post)
-
-    settings = tmp_path / "settings.json"
-    settings.write_text("{}")
-    shim_client = TestClient(TestServer(ShimServer(settings).app()))
-    await shim_client.start_server()
-    try:
-        resp = await shim_client.post(
-            "/v1/responses",
-            json={
-                "model": "codex-gpt-5-5",
-                "stream": True,
-                "input": [
-                    {"type": "message", "role": "user", "content": "long thread"},
-                    {"type": "compaction_trigger"},
-                ],
-            },
-        )
-        assert resp.status == 200
-        text = await resp.text()
-        assert captured["url"] == "https://chatgpt.com/backend-api/codex/responses/compact"
-        assert '"type":"compaction"' in text.replace(" ", "")
-        assert "reasoning" not in text
-        await shim_client.close()
-    finally:
-        await shim_client.close()
-
-
-async def test_chatgpt_compact_passthrough_falls_back_to_summarization_on_native_error(
-    monkeypatch, tmp_path, auth_present
-):
-    calls: list[str] = []
-
-    class FailingCompactUpstream:
-        status = 503
-        content_type = "application/json"
-        headers = {"Content-Type": "application/json"}
-
-        async def text(self):
-            return (
-                '{"error":{"message":"We\'re currently experiencing high demand, '
-                'which may cause temporary errors."}}'
-            )
-
-        def release(self):
-            pass
-
-    class SummarizationUpstream:
-        status = 200
-        content_type = "text/event-stream"
-        headers = {"Content-Type": "text/event-stream"}
-
-        def __init__(self):
-            completed = {
-                "type": "response.completed",
-                "response": {
-                    "id": "resp_summarize",
-                    "model": "gpt-5.5",
-                    "status": "completed",
-                    "output": [
-                        {
-                            "type": "message",
-                            "role": "assistant",
-                            "content": [{"type": "output_text", "text": "Compacted thread summary."}],
-                        }
-                    ],
-                    "usage": {"input_tokens": 3, "output_tokens": 2, "total_tokens": 5},
-                },
-            }
-            self.content = _FakeSseContent(
-                [
-                    b'data: {"type":"response.created","response":{"id":"resp_summarize","model":"gpt-5.5","status":"in_progress"}}\n\n',
-                    f"data: {json.dumps(completed)}\n\n".encode(),
-                    b"data: [DONE]\n\n",
-                ]
-            )
-
-        def release(self):
-            pass
-
-    async def fake_post(self, url, json=None, headers=None):
-        calls.append(str(url))
-        if str(url).endswith("/responses/compact"):
-            return FailingCompactUpstream()
-        if "chatgpt.com/backend-api/codex/responses" in str(url):
-            return SummarizationUpstream()
-        raise AssertionError(f"unexpected url: {url}")
-
-    monkeypatch.setattr("codex_shim.server.ClientSession.post", fake_post)
-
-    settings = tmp_path / "settings.json"
-    settings.write_text("{}")
-    shim_client = TestClient(TestServer(ShimServer(settings).app()))
-    await shim_client.start_server()
-    try:
-        resp = await shim_client.post(
-            "/v1/responses",
-            json={
-                "model": "codex-gpt-5-5",
-                "stream": True,
-                "input": [
-                    {"type": "message", "role": "user", "content": "long thread"},
-                    {"type": "compaction_trigger"},
-                ],
-            },
-        )
-        assert resp.status == 200
-        events = _sse_events(await resp.text())
-        done = next(event for event in events if event.get("type") == "response.output_item.done")
-        summary = decode_shim_compaction_summary(done["item"]["encrypted_content"])
-        assert "Remote native compaction failed" in summary
-        assert "high demand" in summary
-        assert "Compacted thread summary." in summary
-        assert any(url.endswith("/responses/compact") for url in calls)
-        assert any("/codex/responses" in url and not url.endswith("/compact") for url in calls)
-    finally:
-        await shim_client.close()
-
-
-async def test_chatgpt_compact_summarization_sets_reasoning_context_all_turns_after_native_404(
-    monkeypatch, tmp_path, auth_present
-):
-    """Native /codex/responses/compact is gone (404). Summarization hits /codex/responses
-    with Desktop's Responses-Lite header, which 400s unless reasoning.context=all_turns.
-    """
-    captured: dict[str, Any] = {}
-
-    class MissingCompactUpstream:
-        status = 404
-        content_type = "application/json"
-        headers = {"Content-Type": "application/json"}
-
-        async def text(self):
-            return '{"detail":"Not Found"}'
-
-        def release(self):
-            pass
-
-    class SummarizationUpstream:
-        status = 200
-        content_type = "text/event-stream"
-        headers = {"Content-Type": "text/event-stream"}
-
-        def __init__(self):
-            completed = {
-                "type": "response.completed",
-                "response": {
-                    "id": "resp_summarize",
-                    "model": "gpt-5.6-luna",
-                    "status": "completed",
-                    "output": [
-                        {
-                            "type": "message",
-                            "role": "assistant",
-                            "content": [{"type": "output_text", "text": "Luna thread summary."}],
-                        }
-                    ],
-                    "usage": {"input_tokens": 3, "output_tokens": 2, "total_tokens": 5},
-                },
-            }
-            self.content = _FakeSseContent(
-                [
-                    b'data: {"type":"response.created","response":{"id":"resp_summarize","model":"gpt-5.6-luna","status":"in_progress"}}\n\n',
-                    f"data: {json.dumps(completed)}\n\n".encode(),
-                    b"data: [DONE]\n\n",
-                ]
-            )
-
-        def release(self):
-            pass
-
-    async def fake_post(self, url, json=None, headers=None):
-        if str(url).endswith("/responses/compact"):
-            return MissingCompactUpstream()
-        if "chatgpt.com/backend-api/codex/responses" in str(url):
-            captured["summarization_body"] = json
-            captured["summarization_headers"] = headers
-            return SummarizationUpstream()
-        raise AssertionError(f"unexpected url: {url}")
+        captured["url"] = str(url)
+        captured["body"] = json
+        captured["headers"] = headers
+        return _FakeSseUpstream()
 
     monkeypatch.setattr("codex_shim.server.ClientSession.post", fake_post)
 
@@ -2884,78 +2733,128 @@ async def test_chatgpt_compact_summarization_sets_reasoning_context_all_turns_af
             headers={"X-OpenAI-Internal-Codex-Responses-Lite": "1"},
         )
         assert resp.status == 200
-        body = captured["summarization_body"]
-        assert body["reasoning"]["context"] == "all_turns"
-        assert body["reasoning"]["effort"] == "high"
-        assert body["parallel_tool_calls"] is False
-        events = _sse_events(await resp.text())
-        done = next(event for event in events if event.get("type") == "response.output_item.done")
-        summary = decode_shim_compaction_summary(done["item"]["encrypted_content"])
-        assert "Luna thread summary." in summary
+        text = await resp.text()
+        assert captured["url"] == "https://chatgpt.com/backend-api/codex/responses"
+        assert not str(captured["url"]).endswith("/compact")
+        assert captured["body"]["input"][-1]["type"] == "compaction_trigger"
+        assert captured["body"]["reasoning"]["context"] == "all_turns"
+        assert captured["body"]["reasoning"]["effort"] == "high"
+        assert captured["body"]["parallel_tool_calls"] is False
+        assert captured["body"]["store"] is False
+        assert '"type": "compaction"' in text or '"type":"compaction"' in text.replace(" ", "")
+        assert "openai-native-compaction-blob" in text
+        assert "Remote native compaction failed" not in text
     finally:
         await shim_client.close()
 
 
-async def test_chatgpt_compact_summarization_reads_lite_output_item_when_completed_output_empty(
+async def test_chatgpt_http_compaction_v2_returns_upstream_error_without_summarization(
     monkeypatch, tmp_path, auth_present
 ):
-    """Responses Lite leaves response.completed.output empty; the summary is on
-    response.output_item.done. collect_stream must harvest that item or compaction
-    reports a false empty summary after a 200.
-    """
+    calls: list[str] = []
+
+    async def fake_post(self, url, json=None, headers=None):
+        calls.append(str(url))
+        if str(url).endswith("/responses/compact"):
+            raise AssertionError("ChatGPT compaction v2 must not POST /compact")
+        return _FakeHttpErrorUpstream(400, '{"detail":"Bad Request"}')
+
+    monkeypatch.setattr("codex_shim.server.ClientSession.post", fake_post)
+
+    settings = tmp_path / "settings.json"
+    settings.write_text("{}")
+    shim_client = TestClient(TestServer(ShimServer(settings).app()))
+    await shim_client.start_server()
+    try:
+        resp = await shim_client.post(
+            "/v1/responses",
+            json={
+                "model": "codex-gpt-5-5",
+                "stream": True,
+                "input": [
+                    {"type": "message", "role": "user", "content": "long thread"},
+                    {"type": "compaction_trigger"},
+                ],
+            },
+        )
+        assert resp.status == 400
+        text = await resp.text()
+        assert "Bad Request" in text
+        assert "Compaction failed for" not in text
+        assert calls == ["https://chatgpt.com/backend-api/codex/responses"]
+    finally:
+        await shim_client.close()
+
+
+async def test_chatgpt_legacy_compact_returns_upstream_404_without_summarization(
+    monkeypatch, tmp_path, auth_present
+):
+    calls: list[str] = []
+
+    async def fake_post(self, url, json=None, headers=None):
+        calls.append(str(url))
+        if str(url).endswith("/responses/compact"):
+            return _FakeHttpErrorUpstream(404, '{"detail":"Not Found"}')
+        raise AssertionError(f"legacy compact must not fall back to {url}")
+
+    monkeypatch.setattr("codex_shim.server.ClientSession.post", fake_post)
+
+    settings = tmp_path / "settings.json"
+    settings.write_text("{}")
+    shim_client = TestClient(TestServer(ShimServer(settings).app()))
+    await shim_client.start_server()
+    try:
+        resp = await shim_client.post(
+            "/v1/responses/compact",
+            json={"model": "codex-gpt-5-5", "input": [{"type": "message", "role": "user", "content": "long thread"}]},
+        )
+        assert resp.status == 404
+        assert "Not Found" in await resp.text()
+        assert calls == ["https://chatgpt.com/backend-api/codex/responses/compact"]
+    finally:
+        await shim_client.close()
+
+
+async def test_chatgpt_http_compaction_v2_relays_lite_output_item_done(
+    monkeypatch, tmp_path, auth_present
+):
     captured: dict[str, Any] = {}
-
-    class MissingCompactUpstream:
-        status = 404
-        content_type = "application/json"
-        headers = {"Content-Type": "application/json"}
-
-        async def text(self):
-            return '{"detail":"Not Found"}'
-
-        def release(self):
-            pass
-
-    class SummarizationUpstream:
-        status = 200
-        content_type = "text/event-stream"
-        headers = {"Content-Type": "text/event-stream"}
-
-        def __init__(self):
-            message_item = {
-                "type": "message",
-                "role": "assistant",
-                "content": [{"type": "output_text", "text": "## Goal\n- List two files"}],
+    item = {
+        "type": "compaction",
+        "encrypted_content": "openai-native-compaction-blob",
+    }
+    chunks = [
+        _sse_chunk(
+            {
+                "type": "response.created",
+                "response": {
+                    "id": "resp_lite_compact",
+                    "model": "gpt-5.6-luna",
+                    "status": "in_progress",
+                    "output": [],
+                },
             }
-            completed = {
+        ),
+        _sse_chunk({"type": "response.output_item.done", "item": item}),
+        _sse_chunk(
+            {
                 "type": "response.completed",
                 "response": {
-                    "id": "resp_lite_summarize",
+                    "id": "resp_lite_compact",
                     "model": "gpt-5.6-luna",
                     "status": "completed",
                     "output": [],
                     "usage": {"input_tokens": 3, "output_tokens": 8, "total_tokens": 11},
                 },
             }
-            self.content = _FakeSseContent(
-                [
-                    b'data: {"type":"response.created","response":{"id":"resp_lite_summarize","model":"gpt-5.6-luna","status":"in_progress","output":[]}}\n\n',
-                    f'data: {json.dumps({"type": "response.output_item.done", "item": message_item})}\n\n'.encode(),
-                    f"data: {json.dumps(completed)}\n\n".encode(),
-                    b"data: [DONE]\n\n",
-                ]
-            )
-
-        def release(self):
-            pass
+        ),
+        b"data: [DONE]\n\n",
+    ]
 
     async def fake_post(self, url, json=None, headers=None):
-        if str(url).endswith("/responses/compact"):
-            return MissingCompactUpstream()
-        if "chatgpt.com/backend-api/codex/responses" in str(url):
-            captured["summarization_body"] = json
-            return SummarizationUpstream()
-        raise AssertionError(f"unexpected url: {url}")
+        captured["url"] = str(url)
+        captured["body"] = json
+        return _FakeSseUpstream(chunks)
 
     monkeypatch.setattr("codex_shim.server.ClientSession.post", fake_post)
 
@@ -2977,48 +2876,26 @@ async def test_chatgpt_compact_summarization_reads_lite_output_item_when_complet
             headers={"X-OpenAI-Internal-Codex-Responses-Lite": "1"},
         )
         assert resp.status == 200
+        assert captured["url"] == "https://chatgpt.com/backend-api/codex/responses"
         events = _sse_events(await resp.text())
         done = next(event for event in events if event.get("type") == "response.output_item.done")
-        summary = decode_shim_compaction_summary(done["item"]["encrypted_content"])
-        assert "## Goal" in summary
-        assert "List two files" in summary
+        assert done["item"]["encrypted_content"] == "openai-native-compaction-blob"
+        completed = next(event for event in events if event.get("type") == "response.completed")
+        assert completed["response"]["output"] == []
     finally:
         await shim_client.close()
 
 
-async def test_chatgpt_compact_orphan_tool_output_synthesizes_call_for_native_compact(
+async def test_chatgpt_http_compaction_v2_synthesizes_orphan_tool_call(
     monkeypatch, tmp_path, auth_present, capsys
 ):
     captured: dict[str, Any] = {}
 
-    class CompactUpstream:
-        status = 200
-        content_type = "application/json"
-        headers = {"Content-Type": "application/json"}
-
-        async def json(self, content_type=None):
-            return {
-                "id": "resp_compact",
-                "status": "completed",
-                "output": [
-                    {
-                        "type": "compaction",
-                        "encrypted_content": encode_shim_compaction_summary("Compacted tail output."),
-                    }
-                ],
-            }
-
-        async def text(self):
-            return json.dumps(await self.json())
-
-        def release(self):
-            pass
-
     async def fake_post(self, url, json=None, headers=None):
-        if str(url).endswith("/responses/compact"):
-            captured["compact_input"] = (json or {}).get("input")
-            return CompactUpstream()
-        raise AssertionError(f"unexpected upstream call: {url}")
+        assert not str(url).endswith("/responses/compact"), url
+        captured["url"] = str(url)
+        captured["input"] = (json or {}).get("input")
+        return _FakeSseUpstream()
 
     monkeypatch.setattr("codex_shim.server.ClientSession.post", fake_post)
 
@@ -3043,233 +2920,31 @@ async def test_chatgpt_compact_orphan_tool_output_synthesizes_call_for_native_co
             },
         )
         assert resp.status == 200
-        events = _sse_events(await resp.text())
-        done = next(event for event in events if event.get("type") == "response.output_item.done")
-        summary = decode_shim_compaction_summary(done["item"]["encrypted_content"])
-        assert summary == "Compacted tail output."
-        compact_input = captured.get("compact_input")
-        assert isinstance(compact_input, list)
-        assert len(compact_input) == 2
-        assert compact_input[0]["type"] == "function_call"
-        assert compact_input[0]["call_id"] == "call_orphan"
-        assert compact_input[1]["call_id"] == "call_orphan"
+        assert captured["url"] == "https://chatgpt.com/backend-api/codex/responses"
+        forwarded = captured.get("input")
+        assert isinstance(forwarded, list)
+        assert len(forwarded) == 3
+        assert forwarded[0]["type"] == "function_call"
+        assert forwarded[0]["call_id"] == "call_orphan"
+        assert forwarded[1]["call_id"] == "call_orphan"
+        assert forwarded[2]["type"] == "compaction_trigger"
         captured_out = capsys.readouterr().out
         assert "synthesized" in captured_out
     finally:
         await shim_client.close()
 
 
-async def test_chatgpt_compact_synthesizes_orphan_before_native_compact(
+async def test_chatgpt_ws_compaction_v2_synthesizes_orphan_tool_call(
     monkeypatch, tmp_path, auth_present, capsys
 ):
+    monkeypatch.setenv("CODEX_SHIM_WS_PASSTHROUGH", "0")
     captured: dict[str, Any] = {}
 
-    class CompactUpstream:
-        status = 200
-        content_type = "application/json"
-        headers = {"Content-Type": "application/json"}
-
-        async def json(self, content_type=None):
-            return {
-                "id": "resp_compact",
-                "status": "completed",
-                "output": [
-                    {
-                        "type": "message",
-                        "content": [{"type": "output_text", "text": "Native compact ok."}],
-                    }
-                ],
-            }
-
-        async def text(self):
-            return json.dumps(await self.json())
-
-        def release(self):
-            pass
-
     async def fake_post(self, url, json=None, headers=None):
-        if str(url).endswith("/responses/compact"):
-            captured["compact_input"] = (json or {}).get("input")
-            return CompactUpstream()
-        raise AssertionError(f"unexpected url: {url}")
-
-    monkeypatch.setattr("codex_shim.server.ClientSession.post", fake_post)
-
-    settings = tmp_path / "settings.json"
-    settings.write_text("{}")
-    shim_client = TestClient(TestServer(ShimServer(settings).app()))
-    await shim_client.start_server()
-    try:
-        resp = await shim_client.post(
-            "/v1/responses",
-            json={
-                "model": "codex-gpt-5-5",
-                "stream": True,
-                "input": [
-                    {"type": "message", "role": "user", "content": "keep this thread"},
-                    {
-                        "type": "function_call_output",
-                        "call_id": "call_orphan",
-                        "output": "orphan",
-                    },
-                    {"type": "compaction_trigger"},
-                ],
-            },
-        )
-        assert resp.status == 200
-        compact_input = captured.get("compact_input")
-        assert isinstance(compact_input, list)
-        assert len(compact_input) == 3
-        assert compact_input[0]["type"] == "message"
-        assert compact_input[1]["type"] == "function_call"
-        assert compact_input[1]["call_id"] == "call_orphan"
-        assert compact_input[2]["call_id"] == "call_orphan"
-        captured_out = capsys.readouterr().out
-        assert "synthesized" in captured_out
-        assert "call_orphan" in captured_out
-    finally:
-        await shim_client.close()
-
-
-async def test_chatgpt_compact_upstream_orphan_error_routes_to_summarization_with_warnings(
-    monkeypatch, tmp_path, auth_present, capsys
-):
-    calls: list[str] = []
-
-    from codex_shim.compaction.input_audit import CompactionSanitizationAudit
-
-    monkeypatch.setattr(
-        "codex_shim.compaction.pipeline.sanitize_compaction_input_items",
-        lambda items: (items, [], CompactionSanitizationAudit(incoming_items=len(items), outgoing_items=len(items))),
-    )
-
-    class OrphanErrorCompactUpstream:
-        status = 400
-        content_type = "application/json"
-        headers = {"Content-Type": "application/json"}
-
-        async def text(self):
-            return (
-                '{"error":{"message":"No tool call found for function call output '
-                'with call_id call_VF4XLxSPXoTfOfVgV0jDqbXq."}}'
-            )
-
-        def release(self):
-            pass
-
-    class SummarizationUpstream:
-        status = 200
-        content_type = "text/event-stream"
-        headers = {"Content-Type": "text/event-stream"}
-
-        def __init__(self):
-            completed = {
-                "type": "response.completed",
-                "response": {
-                    "id": "resp_summarize",
-                    "model": "gpt-5.5",
-                    "status": "completed",
-                    "output": [
-                        {
-                            "type": "message",
-                            "role": "assistant",
-                            "content": [{"type": "output_text", "text": "Summarized after upstream orphan error."}],
-                        }
-                    ],
-                },
-            }
-            self.content = _FakeSseContent(
-                [
-                    b'data: {"type":"response.created","response":{"id":"resp_summarize","model":"gpt-5.5","status":"in_progress"}}\n\n',
-                    f"data: {json.dumps(completed)}\n\n".encode(),
-                    b"data: [DONE]\n\n",
-                ]
-            )
-
-        def release(self):
-            pass
-
-    async def fake_post(self, url, json=None, headers=None):
-        calls.append(str(url))
-        if str(url).endswith("/responses/compact"):
-            return OrphanErrorCompactUpstream()
-        if "chatgpt.com/backend-api/codex/responses" in str(url):
-            return SummarizationUpstream()
-        raise AssertionError(f"unexpected url: {url}")
-
-    monkeypatch.setattr("codex_shim.server.ClientSession.post", fake_post)
-
-    settings = tmp_path / "settings.json"
-    settings.write_text("{}")
-    shim_client = TestClient(TestServer(ShimServer(settings).app()))
-    await shim_client.start_server()
-    try:
-        resp = await shim_client.post(
-            "/v1/responses",
-            json={
-                "model": "codex-gpt-5-5",
-                "stream": True,
-                "input": [
-                    {"type": "message", "role": "user", "content": "keep this thread"},
-                    {
-                        "type": "function_call_output",
-                        "call_id": "call_VF4XLxSPXoTfOfVgV0jDqbXq",
-                        "output": "truncated",
-                    },
-                    {"type": "compaction_trigger"},
-                ],
-            },
-        )
-        assert resp.status == 200
-        events = _sse_events(await resp.text())
-        done = next(event for event in events if event.get("type") == "response.output_item.done")
-        summary = decode_shim_compaction_summary(done["item"]["encrypted_content"])
-        assert "fallback summarization" in summary
-        assert "Compaction warnings:" in summary
-        assert "upstream rejected orphaned tool output" in summary
-        assert "Summarized after upstream orphan error." in summary
-        assert any(url.endswith("/responses/compact") for url in calls)
-        assert any("/codex/responses" in url and not url.endswith("/compact") for url in calls)
-        captured = capsys.readouterr().out
-        assert "[fallback]" in captured
-        assert "[warn] compaction:" in captured
-    finally:
-        await shim_client.close()
-
-
-async def test_chatgpt_ws_compaction_orphan_only_synthesizes_call_for_native_compact(
-    monkeypatch, tmp_path, auth_present, capsys
-):
-    captured: dict[str, Any] = {}
-
-    class CompactUpstream:
-        status = 200
-        content_type = "application/json"
-        headers = {"Content-Type": "application/json"}
-
-        async def json(self, content_type=None):
-            return {
-                "id": "resp_compact",
-                "status": "completed",
-                "output": [
-                    {
-                        "type": "compaction",
-                        "encrypted_content": encode_shim_compaction_summary("WS compacted tail."),
-                    }
-                ],
-            }
-
-        async def text(self):
-            return json.dumps(await self.json())
-
-        def release(self):
-            pass
-
-    async def fake_post(self, url, json=None, headers=None):
-        if str(url).endswith("/responses/compact"):
-            captured["compact_input"] = (json or {}).get("input")
-            return CompactUpstream()
-        raise AssertionError(f"unexpected upstream call: {url}")
+        assert not str(url).endswith("/responses/compact"), url
+        captured["url"] = str(url)
+        captured["input"] = (json or {}).get("input")
+        return _FakeSseUpstream()
 
     monkeypatch.setattr("codex_shim.server.ClientSession.post", fake_post)
 
@@ -3294,23 +2969,20 @@ async def test_chatgpt_ws_compaction_orphan_only_synthesizes_call_for_native_com
                 ],
             }
         )
-        events = []
         while True:
             msg = await ws.receive(timeout=2)
             assert msg.type == WSMsgType.TEXT
             payload = json.loads(msg.data)
-            events.append(payload)
             if payload.get("type") == "response.completed":
                 break
-        done = next(event for event in events if event.get("type") == "response.output_item.done")
-        summary = decode_shim_compaction_summary(done["item"]["encrypted_content"])
-        assert summary == "WS compacted tail."
-        compact_input = captured.get("compact_input")
-        assert isinstance(compact_input, list)
-        assert len(compact_input) == 2
-        assert compact_input[0]["type"] == "function_call"
-        assert compact_input[0]["call_id"] == "call_VF4XLxSPXoTfOfVgV0jDqbXq"
-        assert compact_input[1]["call_id"] == "call_VF4XLxSPXoTfOfVgV0jDqbXq"
+        assert captured["url"] == "https://chatgpt.com/backend-api/codex/responses"
+        forwarded = captured.get("input")
+        assert isinstance(forwarded, list)
+        assert len(forwarded) == 3
+        assert forwarded[0]["type"] == "function_call"
+        assert forwarded[0]["call_id"] == "call_VF4XLxSPXoTfOfVgV0jDqbXq"
+        assert forwarded[1]["call_id"] == "call_VF4XLxSPXoTfOfVgV0jDqbXq"
+        assert forwarded[2]["type"] == "compaction_trigger"
         captured_out = capsys.readouterr().out
         assert "synthesized" in captured_out
         await ws.close()
@@ -3318,27 +2990,37 @@ async def test_chatgpt_ws_compaction_orphan_only_synthesizes_call_for_native_com
         await shim_client.close()
 
 
-async def test_chatgpt_compact_passthrough_reports_error_when_all_fallbacks_fail(
+async def test_chatgpt_http_compaction_v2_does_not_use_passthrough_error_fallback(
     monkeypatch, tmp_path, auth_present
 ):
-    class FailingUpstream:
-        status = 400
-        content_type = "application/json"
-        headers = {"Content-Type": "application/json"}
-
-        async def text(self):
-            return '{"detail":"Bad Request"}'
-
-        def release(self):
-            pass
+    calls: list[str] = []
 
     async def fake_post(self, url, json=None, headers=None):
-        return FailingUpstream()
+        calls.append(str(url))
+        if "chatgpt.com" in str(url):
+            return _FakeHttpErrorUpstream(400, '{"detail":"Bad Request"}')
+        raise AssertionError(f"compaction v2 must not fall back to {url}")
 
     monkeypatch.setattr("codex_shim.server.ClientSession.post", fake_post)
 
     settings = tmp_path / "settings.json"
-    settings.write_text("{}")
+    settings.write_text(
+        json.dumps(
+            {
+                "passthrough_error_fallback": {"gpt-5.5": "or-free-router"},
+                "customModels": [
+                    {
+                        "model": "openrouter/free",
+                        "displayName": "OpenRouter Free",
+                        "slug": "or-free-router",
+                        "provider": "generic-chat-completion-api",
+                        "baseUrl": "http://127.0.0.1:9/v1",
+                        "apiKey": "secret",
+                    }
+                ],
+            }
+        )
+    )
     shim_client = TestClient(TestServer(ShimServer(settings).app()))
     await shim_client.start_server()
     try:
@@ -3353,15 +3035,11 @@ async def test_chatgpt_compact_passthrough_reports_error_when_all_fallbacks_fail
                 ],
             },
         )
-        assert resp.status == 200
-        events = _sse_events(await resp.text())
-        failed = next(event for event in events if event.get("type") == "response.failed")
-        message = failed["response"]["error"]["message"]
-        assert "Compaction failed for codex-gpt-5-5" in message
-        assert "Bad Request" in message
+        assert resp.status == 400
+        assert "Bad Request" in await resp.text()
+        assert calls == ["https://chatgpt.com/backend-api/codex/responses"]
     finally:
         await shim_client.close()
-
 
 async def test_responses_routes_openai_responses_provider_to_upstream_responses(tmp_path):
     captured = {}

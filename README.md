@@ -923,22 +923,35 @@ Known edge cases:
 ## Compaction
 
 Codex can compact long sessions through compaction v2 (`compaction_trigger` on
-`POST /v1/responses`) or legacy `POST /v1/responses/compact`. All routes share
-the `codex_shim.compaction` orchestrator: prepare input (orphan sanitization,
+`POST /v1/responses`) or legacy `POST /v1/responses/compact`.
+
+**ChatGPT passthrough is a thin proxy.** Desktop owns remote compact v2: the
+shim forwards `compaction_trigger` on `/v1/responses` to ChatGPT
+`/backend-api/codex/responses` and maps `/v1/responses/compact` 1:1 to
+`/codex/responses/compact`, returning upstream status (the compact endpoint
+currently 404s). It does not run the compaction orchestrator, summarization
+fallback, or turn-level `passthrough_error_fallback` on those ChatGPT compact
+requests. It still rewrites ChatGPT-illegal fields: model slug, `store: false`,
+Lite `reasoning.context=all_turns` / `parallel_tool_calls=false`, cache
+expansion of `previous_response_id`, and stripping shim-opaque
+`encrypted_content`.
+
+Cursor, BYOK, and OpenCode-style custom models still share the
+`codex_shim.compaction` orchestrator: prepare input (orphan sanitization,
 optional tool-output rewrite, optional recent-user-turn exclusion for
 summarization), native compact, then OpenCode-style summarization fallback, then
 optional BYOK tertiary fallback (`compaction.tertiary_fallback_slug` in
 `models.json`). Turn-level `passthrough_error_fallback` is separate: it only
-applies when ChatGPT/Cursor passthrough turns fail, not to compaction phases.
-Compaction summarization always stays on the passthrough route for ChatGPT/Cursor.
+applies when ChatGPT/Cursor passthrough **turns** fail, not to compaction
+phases.
 
-ChatGPT passthrough expands compaction requests from the conversation cache when
-`previous_response_id` is set, and preserves detached tail tool outputs Codex
-sends without in-batch `function_call` items.
+ChatGPT passthrough expands compact-v2 requests from the conversation cache when
+`previous_response_id` is set, and synthesizes missing `function_call` items for
+detached tail tool outputs Codex sends without in-batch calls.
 
 | route | native | summarization fallback |
 |---|---|---|
-| ChatGPT passthrough | ChatGPT `/backend-api/codex/responses/compact` | ChatGPT `/codex/responses` stream with anchored compaction prompt |
+| ChatGPT passthrough | Thin proxy: `/codex/responses` (v2) or `/codex/responses/compact` (legacy); no shim fallback | — |
 | Cursor passthrough | Cursor agent passthrough | Same summarization prompt via Cursor passthrough |
 | BYOK OpenAI Responses / chat / Anthropic | Provider compact request | Same route with structured summarization body |
 
@@ -972,8 +985,9 @@ continues with a warning.
 `codex-shim doctor` prints compaction model, prompt version, and fallback status.
 
 The BYOK path strips provider-hostile fields such as `stream` and `service_tier`
-before forwarding when required. ChatGPT native compact forwards client
-`instructions`, `tools`, and `parallel_tool_calls` when present.
+before forwarding when required. ChatGPT compact-v2 passthrough forwards client
+`instructions`, `tools`, and `reasoning` when present, with Lite constraints
+applied.
 
 ---
 
