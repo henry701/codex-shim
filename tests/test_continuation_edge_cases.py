@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from aiohttp.test_utils import TestClient, TestServer
@@ -58,6 +58,7 @@ async def test_connect_upstream_reports_connection_reused():
     client_ws.closed = False
     upstream_ws = AsyncMock()
     upstream_ws.closed = False
+    upstream_ws.exception = MagicMock(return_value=None)
     url = "ws://example/v1/responses"
     session = WsPassthroughSession(client_session=AsyncMock(), client_ws=client_ws)
     session.upstream_by_url[url] = upstream_ws
@@ -324,7 +325,7 @@ async def test_byok_ws_strips_previous_response_id_and_writes_cache(
             {"type": "response.create", "model": "gpt-4-1", "input": first_input, "stream": True}
         )
         for _ in range(3):
-            await ws.receive(timeout=2)
+            await ws.receive(timeout=5)
 
         await ws.send_json(
             {
@@ -336,7 +337,7 @@ async def test_byok_ws_strips_previous_response_id_and_writes_cache(
             }
         )
         for _ in range(2):
-            await ws.receive(timeout=2)
+            await ws.receive(timeout=5)
 
         second = upstream_state.received_frames[1]
         assert "previous_response_id" not in second

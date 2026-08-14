@@ -25,7 +25,17 @@ from codex_shim.cursor_passthrough import (
     resolve_cursor_workspace,
 )
 from codex_shim.server import ResponsesStreamState, ShimServer
-from tests.test_server import _sse_events
+
+
+def _sse_events(text: str) -> list[dict]:
+    events = []
+    for block in text.split("\n\n"):
+        if not block.startswith("data:"):
+            continue
+        data = block.removeprefix("data:").strip()
+        if data and data != "[DONE]":
+            events.append(json.loads(data))
+    return events
 
 
 def _goal_tools_body() -> dict:

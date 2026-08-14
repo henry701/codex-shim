@@ -12,6 +12,7 @@ import signal
 import socket
 import subprocess
 import sys
+import threading
 import time
 import hashlib
 import json
@@ -142,7 +143,8 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("stop")
     sub.add_parser("disable")
     sub.add_parser("restart")
-    sub.add_parser("run", help="Run the shim in the foreground (for systemd and debugging).")
+    sub.add_parser("serve", help="Run the HTTP server only (systemd ExecStart; no catalog sync).")
+    sub.add_parser("run", help="Sync desktop catalog then run the HTTP server (interactive).")
     sub.add_parser(
         "sync-desktop",
         help="Regenerate catalogs under ~/.codex (does not modify ~/.codex/config.toml).",
@@ -162,6 +164,16 @@ def main(argv: list[str] | None = None) -> int:
     )
     sub.add_parser("status")
     sub.add_parser("doctor", help="Print a read-only local diagnostics report.")
+    prune_parser = sub.add_parser(
+        "prune-chatgpt-cache",
+        help="Evict cold ChatGPT expansion-cache entries down to a fraction of the byte cap.",
+    )
+    prune_parser.add_argument(
+        "--target",
+        type=float,
+        default=0.8,
+        help="Keep at most this fraction of CODEX_SHIM_CHATGPT_CACHE_MAX_BYTES (default 0.8).",
+    )
     sub.add_parser("patch-app", help="Patch Codex Desktop picker/sidebar handling for custom shim models.")
     sub.add_parser("restore-app", help="Restore Codex Desktop app.asar from the pre-patch backup.")
     migrate_threads_parser = sub.add_parser(
@@ -223,11 +235,9 @@ def main(argv: list[str] | None = None) -> int:
             restore_codex_config()
         return stop()
     if args.command == "restart":
-        if stop() != 0:
-            print("Restart aborted: could not stop the running shim.", file=sys.stderr)
-            return 1
-        generate(args.settings, args.port)
-        return start(args.settings, args.port)
+        return restart(args.settings, args.port)
+    if args.command == "serve":
+        return serve_foreground(args.settings, args.port)
     if args.command == "run":
         return run_foreground(args.settings, args.port)
     if args.command == "sync-desktop":
@@ -240,6 +250,8 @@ def main(argv: list[str] | None = None) -> int:
         return status(args.port)
     if args.command == "doctor":
         return doctor(args.settings, args.port)
+    if args.command == "prune-chatgpt-cache":
+        return prune_chatgpt_cache(target=args.target)
     if args.command == "patch-app":
         return patch_codex_app()
     if args.command == "restore-app":
@@ -307,6 +319,26 @@ def _load_models(settings_path: Path):
         ) from exc
     except json.JSONDecodeError as exc:
         raise SystemExit(f"Settings file is not valid JSON: {expanded}: {exc}") from exc
+
+
+def _load_models_with_budget(settings_path: Path, budget_s: float):
+    box: list = []
+    errors: list[BaseException] = []
+
+    def worker() -> None:
+        try:
+            box.append(_load_models(settings_path))
+        except BaseException as exc:
+            errors.append(exc)
+
+    thread = threading.Thread(target=worker, daemon=True)
+    thread.start()
+    thread.join(max(0.0, float(budget_s)))
+    if thread.is_alive():
+        raise TimeoutError(f"model discovery exceeded {budget_s}s")
+    if errors:
+        raise errors[0]
+    return box[0]
 
 
 def _active_router(models, settings_path: Path):
@@ -548,8 +580,9 @@ def _doctor_chatgpt_conversation_cache() -> list[DoctorCheck]:
                     section,
                     "WARN",
                     f"cache near size limit ({usage_pct}% of max)",
-                    "Oldest entries are evicted FIFO when over "
-                    "CODEX_SHIM_CHATGPT_CACHE_MAX_BYTES (default 512M).",
+                    "Oldest entries are evicted LRU when over "
+                    "CODEX_SHIM_CHATGPT_CACHE_MAX_BYTES (default 512M). "
+                    "Run `codex-shim prune-chatgpt-cache` to shrink now.",
                 )
             )
         checks.append(
@@ -564,22 +597,74 @@ def _doctor_chatgpt_conversation_cache() -> list[DoctorCheck]:
     return checks
 
 
+def prune_chatgpt_cache(*, target: float = 0.8) -> int:
+    if target < 0:
+        print("--target must be >= 0", file=sys.stderr)
+        return 1
+    root = Path(
+        os.environ.get("CODEX_SHIM_CHATGPT_CONVERSATIONS_DIR", DEFAULT_CHATGPT_CONVERSATIONS_DIR)
+    ).expanduser()
+    cache = ChatgptConversationCache(root)
+    before = cache.stats()
+    limit = int(before["max_bytes"] * target)
+    after = cache.prune_until(limit)
+    print(
+        f"pruned chatgpt cache {before['total_bytes']} -> {after['total_bytes']} bytes "
+        f"(target {limit} of {after['max_bytes']})",
+        flush=True,
+    )
+    return 0
+
+
 def _doctor_daemon(port: int) -> list[DoctorCheck]:
     checks = [DoctorCheck("Shim daemon", "INFO", f"health URL: http://{DEFAULT_HOST}:{port}/health")]
+    systemd_state = _systemd_active_state()
+    systemd_managed = systemd_state in {"active", "activating"}
     pid = _read_pid()
     if pid is None:
         checks.append(DoctorCheck("Shim daemon", "INFO", f"pid file missing or unreadable: {PID_PATH}"))
     elif _pid_running(pid):
         checks.append(DoctorCheck("Shim daemon", "OK", f"pid {pid} is running"))
+    elif systemd_managed:
+        checks.append(DoctorCheck("Shim daemon", "INFO", f"pid file {pid} is unused under systemd"))
     else:
         checks.append(DoctorCheck("Shim daemon", "WARN", f"pid {pid} is not running"))
     health = _health(port)
     if health is None:
+        if systemd_managed:
+            systemd_pid = _systemd_main_pid()
+            pid_note = f" pid {systemd_pid}" if systemd_pid else ""
+            checks.append(
+                DoctorCheck(
+                    "Shim daemon",
+                    "INFO",
+                    f"systemd unit {systemd_state}{pid_note}",
+                )
+            )
         checks.append(DoctorCheck("Shim daemon", "WARN", "health endpoint unavailable"))
         return checks
+    if systemd_managed:
+        systemd_pid = _systemd_main_pid()
+        pid_note = f" pid {systemd_pid}" if systemd_pid else ""
+        checks.append(
+            DoctorCheck(
+                "Shim daemon",
+                "OK" if systemd_state == "active" else "INFO",
+                f"systemd unit {systemd_state}{pid_note}",
+            )
+        )
     listener_pid = _listener_pid(port)
     if listener_pid is not None:
-        if pid is None or not _pid_running(pid):
+        pid_stale = pid is None or not _pid_running(pid)
+        if systemd_managed and (pid_stale or pid != listener_pid):
+            checks.append(
+                DoctorCheck(
+                    "Shim daemon",
+                    "INFO",
+                    f"pid file unused; systemd-managed listener is pid {listener_pid}",
+                )
+            )
+        elif pid_stale:
             checks.append(
                 DoctorCheck(
                     "Shim daemon",
@@ -618,7 +703,16 @@ def _doctor_chatgpt() -> list[DoctorCheck]:
         return [DoctorCheck("ChatGPT passthrough", "INFO", "disabled via CODEX_SHIM_DISABLE_CHATGPT")]
     auth_path = Path(DEFAULT_CODEX_AUTH).expanduser()
     if chatgpt_passthrough_available():
-        return [DoctorCheck("ChatGPT passthrough", "OK", f"available via {auth_path}")]
+        return [
+            DoctorCheck("ChatGPT passthrough", "OK", f"available via {auth_path}"),
+            DoctorCheck(
+                "ChatGPT passthrough",
+                "INFO",
+                "legacy POST /v1/responses/compact maps to chatgpt.com .../compact which currently 404s",
+                "Desktop owns remote compact v2 via compaction_trigger on /v1/responses. "
+                "The shim will not synthesize compact.",
+            ),
+        ]
     detail = "Run `codex login` if you want ChatGPT/Codex passthrough."
     if auth_path.exists():
         detail = "Run `codex login` again if you want ChatGPT/Codex passthrough."
@@ -753,7 +847,14 @@ def _bool_text(value: object) -> str:
 
 
 def sync_desktop(settings_path: Path, port: int, model_slug: str | None = None, *, install_config: bool = False) -> int:
-    models = _load_models(settings_path)
+    try:
+        models = _load_models_with_budget(settings_path, SYNC_DESKTOP_BUDGET_S)
+    except TimeoutError:
+        print(
+            "sync-desktop timed out waiting for model discovery; keeping existing Desktop catalog.",
+            flush=True,
+        )
+        return 0
     try:
         default_model_slug(models)
     except ValueError as exc:
@@ -952,8 +1053,7 @@ def list_models(settings_path: Path) -> int:
     return 0
 
 
-def run_foreground(settings_path: Path, port: int) -> int:
-    sync_desktop(settings_path, port, install_config=False)
+def serve_foreground(settings_path: Path, port: int) -> int:
     from .server import main as server_main
 
     server_main(
@@ -969,9 +1069,18 @@ def run_foreground(settings_path: Path, port: int) -> int:
     return 0
 
 
+def run_foreground(settings_path: Path, port: int) -> int:
+    sync_desktop(settings_path, port, install_config=False)
+    return serve_foreground(settings_path, port)
+
+
 SYSTEMD_USER_UNIT = Path.home() / ".config/systemd/user/codex-shim.service"
 # Production service log path (home runtime), distinct from repo-local LOG_PATH used by `start`.
 SERVICE_LOG_PATH = Path.home() / ".codex-shim" / "shim.log"
+SYSTEMD_TIMEOUT_START_SEC = 180
+SYNC_DESKTOP_BUDGET_S = 45.0
+SYSTEMD_HEALTH_WAIT_S = 90.0
+_SYSTEMD_STOP_STATES = frozenset({"active", "activating", "deactivating", "reloading", "failed"})
 LOGROTATE_CONF_PATH = Path.home() / ".config" / "logrotate.d" / "codex-shim"
 LOGROTATE_STATE_DIR = Path.home() / ".local" / "state" / "codex-shim"
 LOGROTATE_STATE_PATH = LOGROTATE_STATE_DIR / "logrotate.status"
@@ -998,15 +1107,16 @@ def _systemd_unit_content(
     settings = Path(settings_path).expanduser()
     common_args = f"--settings {settings} --port {port}"
     sync_cmd = _systemd_shell_command(codex_shim_bin, common_args, "sync-desktop")
-    run_cmd = _systemd_shell_command(codex_shim_bin, common_args, "run")
+    serve_cmd = _systemd_shell_command(codex_shim_bin, common_args, "serve")
     log = Path(log_path or SERVICE_LOG_PATH).expanduser()
     return f"""[Unit]
 Description=Codex BYOK shim
 
 [Service]
 Type=simple
+TimeoutStartSec={SYSTEMD_TIMEOUT_START_SEC}
 ExecStartPre={sync_cmd}
-ExecStart={run_cmd}
+ExecStart={serve_cmd}
 Restart=on-failure
 RestartSec=3
 StandardOutput=append:{log}
@@ -1227,8 +1337,107 @@ def _wait_for_pid_exit(pid: int, timeout_s: float) -> bool:
     return not _pid_running(pid)
 
 
+def _systemd_active_state() -> str | None:
+    if os.name == "nt" or not shutil.which("systemctl"):
+        return None
+    if not SYSTEMD_USER_UNIT.is_file():
+        return None
+    result = subprocess.run(
+        ["systemctl", "--user", "show", "-p", "ActiveState", "--value", "codex-shim.service"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        return None
+    state = (result.stdout or "").strip()
+    if not state or state == "unknown":
+        return None
+    return state
+
+
+def _systemd_main_pid() -> int | None:
+    if os.name == "nt" or not shutil.which("systemctl"):
+        return None
+    if not SYSTEMD_USER_UNIT.is_file():
+        return None
+    result = subprocess.run(
+        ["systemctl", "--user", "show", "-p", "MainPID", "--value", "codex-shim.service"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        return None
+    raw = (result.stdout or "").strip()
+    if not raw.isdigit():
+        return None
+    pid = int(raw)
+    return pid if pid > 0 else None
+
+
+def _stop_systemd_unit_if_active() -> bool:
+    state = _systemd_active_state()
+    if state not in _SYSTEMD_STOP_STATES:
+        return False
+    result = subprocess.run(["systemctl", "--user", "stop", "codex-shim.service"], check=False)
+    if result.returncode != 0:
+        print("Failed to stop systemd unit codex-shim.service.", file=sys.stderr)
+        return False
+    if state == "failed":
+        subprocess.run(["systemctl", "--user", "reset-failed", "codex-shim.service"], check=False)
+    return True
+
+
+def _restart_systemd_service(port: int) -> int:
+    for cmd in (
+        ["systemctl", "--user", "daemon-reload"],
+        ["systemctl", "--user", "restart", "codex-shim.service"],
+    ):
+        result = subprocess.run(cmd, check=False)
+        if result.returncode != 0:
+            print(f"Command failed: {' '.join(cmd)}", file=sys.stderr)
+            return result.returncode
+    deadline = time.monotonic() + SYSTEMD_HEALTH_WAIT_S
+    while time.monotonic() < deadline:
+        if _healthy(port):
+            print(f"Shim restarted via systemd on http://{DEFAULT_HOST}:{port}.")
+            return 0
+        time.sleep(_STARTUP_POLL_INTERVAL_S)
+    print("systemd restart completed but health check timed out.", file=sys.stderr)
+    return 1
+
+
+def restart(settings_path: Path, port: int) -> int:
+    if (
+        os.name != "nt"
+        and port == DEFAULT_PORT
+        and SYSTEMD_USER_UNIT.is_file()
+        and shutil.which("systemctl")
+    ):
+        return _restart_systemd_service(port)
+    if port != DEFAULT_PORT:
+        listener_pid = _listener_pid(port)
+        if listener_pid is not None and not _stop_pid(listener_pid, port):
+            print(f"Restart aborted: could not stop the shim on port {port}.", file=sys.stderr)
+            return 1
+        return start(settings_path, port)
+    if stop() != 0:
+        print("Restart aborted: could not stop the running shim.", file=sys.stderr)
+        return 1
+    generate(settings_path, port)
+    return start(settings_path, port)
+
+
 def stop() -> int:
     port = DEFAULT_PORT
+    systemd_stopped = _stop_systemd_unit_if_active()
+    if systemd_stopped:
+        PID_PATH.unlink(missing_ok=True)
+        _wait_for_port_free(port, _PORT_FREE_WAIT_S)
+        if _health(port) is None:
+            print("Shim stopped.")
+            return 0
     pid = _read_pid()
     if not _pid_running(pid):
         if _health(port) is not None:

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import errno
+import inspect
 import json
 import os
 import re
@@ -8,6 +10,7 @@ from typing import Any, Awaitable, Callable
 from urllib.parse import urljoin, urlparse, urlunparse
 
 from aiohttp import ClientSession, ClientWebSocketResponse, WSMsgType, web
+from aiohttp.client_exceptions import ClientConnectionResetError, ClientError
 
 from .header_passthrough import (
     forwardable_ws_upgrade_headers,
@@ -16,8 +19,27 @@ from .header_passthrough import (
 )
 
 CHATGPT_WS_URL = "wss://chatgpt.com/backend-api/codex/responses"
+UPSTREAM_WS_HEARTBEAT = 30
 _VERSIONED_BASE_RE = re.compile(r"/v\d+$")
 _TERMINAL_EVENT_TYPES = frozenset({"response.completed", "response.failed", "error"})
+
+
+def _upstream_lane_reusable(ws: Any) -> bool:
+    if getattr(ws, "closed", True):
+        return False
+    getter = getattr(ws, "exception", None)
+    if not callable(getter):
+        return True
+    try:
+        exc = getter()
+    except Exception:
+        return False
+    if inspect.isawaitable(exc):
+        close = getattr(exc, "close", None)
+        if callable(close):
+            close()
+        return True
+    return not isinstance(exc, BaseException)
 
 
 def ws_passthrough_enabled() -> bool:
@@ -38,10 +60,30 @@ def responses_websocket_url(base_url: str) -> str:
     return urlunparse(parsed._replace(scheme=scheme))
 
 
+_DEAD_TRANSPORT_ERRNOS = frozenset(
+    {
+        errno.ECONNRESET,
+        errno.EPIPE,
+        errno.ECONNABORTED,
+        errno.ETIMEDOUT,
+    }
+)
+
+
 class WsPassthroughConnectError(Exception):
     def __init__(self, message: str, *, status: int | None = None) -> None:
         super().__init__(message)
         self.status = status
+
+
+def _is_upstream_transport_dead(exc: BaseException) -> bool:
+    if isinstance(exc, (ClientConnectionResetError, ConnectionResetError, ConnectionError)):
+        return True
+    if isinstance(exc, ClientError) and "closing transport" in str(exc).lower():
+        return True
+    if isinstance(exc, OSError) and getattr(exc, "errno", None) in _DEAD_TRANSPORT_ERRNOS:
+        return True
+    return "closing transport" in str(exc).lower()
 
 
 @dataclass
@@ -92,10 +134,16 @@ class WsPassthroughSession:
 
     async def connect_upstream(self, url: str, headers: dict[str, str]) -> tuple[dict[str, str], bool]:
         existing = self.upstream_by_url.get(url)
-        if existing is not None and not existing.closed:
+        if existing is not None and _upstream_lane_reusable(existing):
             return {}, True
+        if existing is not None:
+            await self.close_upstream(url)
         try:
-            upstream_ws = await self.client_session.ws_connect(url, headers=headers)
+            upstream_ws = await self.client_session.ws_connect(
+                url,
+                headers=headers,
+                heartbeat=UPSTREAM_WS_HEARTBEAT,
+            )
         except Exception as exc:
             raise WsPassthroughConnectError(str(exc)) from exc
         self.upstream_by_url[url] = upstream_ws
@@ -109,7 +157,11 @@ class WsPassthroughSession:
         if upstream_ws is None or upstream_ws.closed:
             raise WsPassthroughConnectError("upstream websocket is not connected")
         payload = {"type": "response.create", **body}
-        await upstream_ws.send_str(json.dumps(payload, separators=(",", ":")))
+        try:
+            await upstream_ws.send_str(json.dumps(payload, separators=(",", ":")))
+        except Exception as exc:
+            await self.close_upstream(upstream_url)
+            raise WsPassthroughConnectError(str(exc)) from exc
 
     async def relay_until_terminal(
         self,
@@ -134,40 +186,52 @@ class WsPassthroughSession:
             else:
                 await self.client_ws.send_str(json.dumps(event, separators=(",", ":")))
 
-        async for msg in upstream_ws:
-            if msg.type == WSMsgType.TEXT:
-                try:
-                    event = json.loads(msg.data)
-                except json.JSONDecodeError:
-                    await _write_error(
-                        self.client_ws,
-                        502,
-                        "upstream_protocol_error",
-                        "upstream emitted non-JSON websocket data",
-                    )
-                    continue
-                if not isinstance(event, dict):
-                    continue
-                if on_event is not None:
-                    on_event(event)
-                if rewrite_model is not None and model_override:
-                    rewrite_model(event, model_override)
-                if event.get("type") == "response.completed":
-                    response_obj = event.get("response")
-                    usage = response_obj.get("usage") if isinstance(response_obj, dict) else None
-                    observe_upstream_response(
-                        source,
-                        upstream_ws,
-                        usage=usage if isinstance(usage, dict) else None,
-                    )
-                if event.get("type") in _TERMINAL_EVENT_TYPES:
-                    terminal_event = event
-                    if forward_terminal is None or forward_terminal(event):
-                        await _write_event(event)
+        try:
+            async for msg in upstream_ws:
+                if msg.type == WSMsgType.TEXT:
+                    try:
+                        event = json.loads(msg.data)
+                    except json.JSONDecodeError:
+                        await _write_error(
+                            self.client_ws,
+                            502,
+                            "upstream_protocol_error",
+                            "upstream emitted non-JSON websocket data",
+                        )
+                        continue
+                    if not isinstance(event, dict):
+                        continue
+                    if on_event is not None:
+                        on_event(event)
+                    if rewrite_model is not None and model_override:
+                        rewrite_model(event, model_override)
+                    if event.get("type") == "response.completed":
+                        response_obj = event.get("response")
+                        usage = response_obj.get("usage") if isinstance(response_obj, dict) else None
+                        observe_upstream_response(
+                            source,
+                            upstream_ws,
+                            usage=usage if isinstance(usage, dict) else None,
+                        )
+                    if event.get("type") in _TERMINAL_EVENT_TYPES:
+                        terminal_event = event
+                        if forward_terminal is None or forward_terminal(event):
+                            await _write_event(event)
+                        break
+                    await _write_event(event)
+                elif msg.type in {WSMsgType.CLOSE, WSMsgType.CLOSED, WSMsgType.ERROR}:
                     break
-                await _write_event(event)
-            elif msg.type in {WSMsgType.CLOSE, WSMsgType.CLOSED, WSMsgType.ERROR}:
-                break
+        except Exception as exc:
+            if not _is_upstream_transport_dead(exc):
+                raise
+            try:
+                await self.close_upstream(upstream_url)
+            except Exception:
+                self.upstream_by_url.pop(upstream_url, None)
+                self.last_chained_response_id_by_url.pop(upstream_url, None)
+            raise WsPassthroughConnectError(str(exc)) from exc
+        if terminal_event is None:
+            await self.close_upstream(upstream_url)
         return terminal_event
 
     async def close_upstream(self, upstream_url: str | None = None) -> None:

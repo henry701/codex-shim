@@ -314,11 +314,13 @@ def test_tmux_visualizer_renders_in_pane_when_available():
 
 @pytest.mark.integration
 def test_live_cursor_agent_smoke_optional():
-    """Run only when explicitly requested: pytest -m integration."""
-    pytest.importorskip("shutil")
+    """Run only when explicitly requested: CODEX_SHIM_LIVE_CURSOR=1."""
+    import os
     import shutil
     import subprocess
 
+    if os.environ.get("CODEX_SHIM_LIVE_CURSOR") != "1":
+        pytest.skip("set CODEX_SHIM_LIVE_CURSOR=1 to run live cursor-agent smoke")
     if not shutil.which("cursor-agent"):
         pytest.skip("cursor-agent not installed")
     proc = subprocess.run(["cursor-agent", "status"], capture_output=True, text=True, timeout=20)

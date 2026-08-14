@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from codex_shim import cli
+from codex_shim import server as shim_server
 
 
 def test_systemd_unit_runs_sync_desktop_then_foreground(monkeypatch, tmp_path):
@@ -14,15 +15,128 @@ def test_systemd_unit_runs_sync_desktop_then_foreground(monkeypatch, tmp_path):
         settings_path=Path("/home/user/.codex-shim/models.json"),
         port=8765,
     )
-    assert "sync-desktop" in unit
+    pre = next(line for line in unit.splitlines() if line.startswith("ExecStartPre="))
+    start = next(line for line in unit.splitlines() if line.startswith("ExecStart="))
+    assert "sync-desktop" in pre
+    assert " serve" in start
+    assert " run" not in start
     assert f'source "{load_env}"' in unit
-    assert "ExecStart=" in unit
     assert "WantedBy=graphical-session.target" in unit
     assert "network-online.target" not in unit
     assert "network-ready-user.service" not in unit
     assert "StandardOutput=append:" in unit
     assert "StandardError=append:" in unit
     assert str(cli.SERVICE_LOG_PATH) in unit
+    timeout = next(line for line in unit.splitlines() if line.startswith("TimeoutStartSec="))
+    assert timeout == f"TimeoutStartSec={cli.SYSTEMD_TIMEOUT_START_SEC}"
+    assert cli.SYSTEMD_TIMEOUT_START_SEC >= 180
+
+
+def test_startup_refresh_timeout_is_bounded_so_serve_can_bind():
+    assert shim_server._STARTUP_REFRESH_TIMEOUT_SEC <= 15
+
+
+def _completed(returncode=0, stdout="", stderr=""):
+    return type("R", (), {"returncode": returncode, "stdout": stdout, "stderr": stderr})()
+
+
+def test_stop_stops_systemd_unit_when_active(monkeypatch, tmp_path):
+    unit = tmp_path / "codex-shim.service"
+    unit.write_text("[Service]\n")
+    monkeypatch.setattr(cli, "SYSTEMD_USER_UNIT", unit)
+    monkeypatch.setattr(cli, "PID_PATH", tmp_path / "shim.pid")
+    monkeypatch.setattr(cli, "_read_pid", lambda: None)
+    monkeypatch.setattr(cli, "_pid_running", lambda _pid: False)
+    monkeypatch.setattr(cli, "_health", lambda _port: None)
+    monkeypatch.setattr(cli.shutil, "which", lambda name: "/usr/bin/systemctl" if name == "systemctl" else None)
+
+    calls: list[list[str]] = []
+
+    def fake_run(cmd, check=False, capture_output=False, text=False):
+        del check, capture_output, text
+        calls.append(list(cmd))
+        if cmd[:4] == ["systemctl", "--user", "show", "-p"]:
+            return _completed(stdout="active\n")
+        return _completed()
+
+    monkeypatch.setattr(cli.subprocess, "run", fake_run)
+    monkeypatch.setattr(cli, "_wait_for_port_free", lambda *_args: True)
+    assert cli.stop() == 0
+    assert ["systemctl", "--user", "stop", "codex-shim.service"] in calls
+
+
+def test_restart_restarts_systemd_unit_when_installed(monkeypatch, tmp_path):
+    unit = tmp_path / "codex-shim.service"
+    unit.write_text("[Service]\n")
+    monkeypatch.setattr(cli, "SYSTEMD_USER_UNIT", unit)
+    monkeypatch.setattr(cli.shutil, "which", lambda name: "/usr/bin/systemctl" if name == "systemctl" else "/usr/bin/codex-shim")
+
+    calls: list[list[str]] = []
+
+    def fake_run(cmd, check=False, capture_output=False, text=False):
+        del check, capture_output, text
+        calls.append(list(cmd))
+        return _completed()
+
+    monkeypatch.setattr(cli.subprocess, "run", fake_run)
+    monkeypatch.setattr(cli, "_healthy", lambda _port: True)
+    monkeypatch.setattr(
+        cli,
+        "start",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("pid-file start must not run")),
+    )
+    monkeypatch.setattr(
+        cli,
+        "stop",
+        lambda: (_ for _ in ()).throw(AssertionError("pid-file stop must not run")),
+    )
+    assert cli.restart(tmp_path / "models.json", 8765) == 0
+    assert ["systemctl", "--user", "daemon-reload"] in calls
+    assert ["systemctl", "--user", "restart", "codex-shim.service"] in calls
+
+
+def test_restart_on_alternate_port_does_not_bounce_systemd(monkeypatch, tmp_path):
+    unit = tmp_path / "codex-shim.service"
+    unit.write_text("[Service]\n")
+    monkeypatch.setattr(cli, "SYSTEMD_USER_UNIT", unit)
+    monkeypatch.setattr(cli.shutil, "which", lambda name: "/usr/bin/systemctl" if name == "systemctl" else "/usr/bin/codex-shim")
+
+    calls: list[list[str]] = []
+
+    def fake_run(cmd, check=False, capture_output=False, text=False):
+        del check, capture_output, text
+        calls.append(list(cmd))
+        return _completed()
+
+    monkeypatch.setattr(cli.subprocess, "run", fake_run)
+    monkeypatch.setattr(cli, "_listener_pid", lambda _port: None)
+
+    def fail_stop() -> int:
+        raise AssertionError("systemd/default stop must not run for 8766")
+
+    def fail_generate(*_args, **_kwargs) -> None:
+        raise AssertionError("generate must not rewrite Desktop catalog for 8766")
+
+    started: list[int] = []
+
+    def fake_start(_settings, port: int) -> int:
+        started.append(port)
+        return 0
+
+    monkeypatch.setattr(cli, "stop", fail_stop)
+    monkeypatch.setattr(cli, "generate", fail_generate)
+    monkeypatch.setattr(cli, "start", fake_start)
+    assert cli.restart(tmp_path / "models.json", 8766) == 0
+    assert started == [8766]
+    assert not any(cmd[:3] == ["systemctl", "--user", "restart"] for cmd in calls)
+
+
+def test_run_foreground_syncs_then_serves(monkeypatch, tmp_path):
+    calls: list[str] = []
+    monkeypatch.setattr(cli, "sync_desktop", lambda *_args, **_kwargs: calls.append("sync") or 0)
+    monkeypatch.setattr(cli, "serve_foreground", lambda *_args, **_kwargs: calls.append("serve") or 0)
+    assert cli.run_foreground(tmp_path / "models.json", 8765) == 0
+    assert calls == ["sync", "serve"]
 
 
 def test_logrotate_conf_rotates_by_size_with_copytruncate():

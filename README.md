@@ -37,7 +37,7 @@ multi-provider local catalog that stays in sync with Codex Desktop.
 | **Auto-discovery** | `codex-shim discover` lists models pulled from provider APIs/CLIs: OpenCode Zen (free + paid), OpenRouter `:free` models, NVIDIA Integrate, and local OpenAI-compatible endpoints. `discover --refresh` busts cached Cursor catalog metadata. |
 | **Provider-prefixed slugs** | Discovered routes get stable prefixes (`or-`, `zen-`, `nvidia-`, `oc-free-`, …) so hundreds of models stay identifiable in the picker and logs. |
 | **`sync-desktop`** | Writes `~/.codex/custom_model_catalog.json` only. Does **not** change `~/.codex/config.toml` — use `codex-shim enable` (or `app`) to wire OpenAI-provider shim routing. |
-| **systemd user service** | `codex-shim install-service` installs a user unit that runs `sync-desktop` then `run` in the foreground (catalog refresh only; CLI config stays untouched until `enable`). Targets `graphical-session.target` and, when present, a local `network-ready-user.service` drop-in so model refresh waits for NM + DNS. Also installs an hourly user logrotate timer for `~/.codex-shim/shim.log` (30M, keep 10 compressed). |
+| **systemd user service** | `codex-shim install-service` installs a user unit with `ExecStartPre=sync-desktop` (45s discovery budget; keeps the existing catalog on timeout) and `ExecStart=serve`. `TimeoutStartSec=180`. `codex-shim restart` reloads and restarts the user unit when it is installed. CLI `run` still syncs then serves for interactive use. Config stays untouched until `enable`. Targets `graphical-session.target` and, when present, a local `network-ready-user.service` drop-in so model refresh waits for NM + DNS. Also installs an hourly user logrotate timer for `~/.codex-shim/shim.log` (30M, keep 10 compressed). |
 | **Namespace tools (dot notation)** | Responses `type: "namespace"` tools (including `multi_agent_v1` / multi-agent V2) expand to `namespace.tool` on BYOK chat/anthropic routes and round-trip back to `namespace` + `name` on responses and streams. MCP refs accept `mcp__srv__tool` and `mcp__srv.tool`. |
 | **`openai-responses` provider** | Raw passthrough to upstream `/v1/responses` (no chat-completions translation) for providers that speak the Responses API natively. |
 | **BYOK agent-loop parity** | Codex-native `tool_search_call` / deferred MCP, namespaced MCP `function_call` items, streaming narration before tool calls, and fuller tool-output round-trips on BYOK routes (see changelog for the full fix list). |
@@ -721,7 +721,8 @@ Debug env knobs:
 | `CODEX_SHIM_WS_PASSTHROUGH=0` | Force legacy HTTP+SSE upstream for ChatGPT/BYOK WS routes (default: on) |
 | `CODEX_SHIM_CHATGPT_WS_FORCE_EXPAND=1` | Force cache expansion on ChatGPT Codex WS (default: native passthrough on reused upstream WS) |
 | `CODEX_SHIM_CHATGPT_CONVERSATIONS_DIR` | Root for persisted expansion cache (default: `~/.codex-shim/chatgpt-conversations`) |
-| `CODEX_SHIM_CHATGPT_CACHE_MAX_BYTES` | Global disk cap for expansion cache; oldest entries evicted FIFO (default: `512M`) |
+| `CODEX_SHIM_CHATGPT_CACHE_MAX_BYTES` | Global disk cap for expansion cache; coldest entries evicted LRU (default: `512M`) |
+| `CODEX_SHIM_CHATGPT_CACHE_MAX_MEMORY_ENTRIES` | In-memory LRU cap for deserialized snapshots (default: `256`) |
 
 Live smoke test (alternate port, `codex exec` with tool call + cache check):
 
@@ -731,7 +732,7 @@ SMOKE_PORT=8766 bash scripts/smoke_chatgpt_passthrough.sh
 
 **Two different caches:** ChatGPT **prefix cache** (`cached_tokens` in upstream usage) is
 server-side and keyed by stable session/thread headers the shim forwards. The shim
-**conversation cache** (1024 responses per session, global byte cap default 512M, JSON on disk under
+**conversation cache** (1024 responses per session, global byte cap default 512M, in-memory LRU default 256, JSON on disk under
 `~/.codex-shim/chatgpt-conversations/`) replays delta continuations when upstream cannot
 accept native `previous_response_id`.
 
@@ -929,9 +930,18 @@ Codex can compact long sessions through compaction v2 (`compaction_trigger` on
 shim forwards `compaction_trigger` on `/v1/responses` to ChatGPT
 `/backend-api/codex/responses` and maps `/v1/responses/compact` 1:1 to
 `/codex/responses/compact`, returning upstream status (the compact endpoint
-currently 404s). It does not run the compaction orchestrator, summarization
+currently 404s; logs `chatgpt-compact upstream missing (known)` and doctor
+records the same). It does not run the compaction orchestrator, summarization
 fallback, or turn-level `passthrough_error_fallback` on those ChatGPT compact
-requests. It still rewrites ChatGPT-illegal fields: model slug, `store: false`,
+requests. Probe without OAuth (expects 401 from the shim if `auth.json` is
+missing, or 404 from ChatGPT when logged in):
+
+```bash
+curl -sS -o /dev/null -w "%{http_code}\n" \
+  -X POST http://127.0.0.1:8765/v1/responses/compact \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"codex-gpt-5-5","input":[]}'
+``` It still rewrites ChatGPT-illegal fields: model slug, `store: false`,
 Lite `reasoning.context=all_turns` / `parallel_tool_calls=false`, cache
 expansion of `previous_response_id`, and stripping shim-opaque
 `encrypted_content`. Client `service_tier` (Fast/`priority`) and token caps
@@ -1182,9 +1192,12 @@ codex-shim discover          fork: list auto-discoverable provider models
 codex-shim discover --refresh
                             fork: refresh discovery caches (e.g. Cursor catalog)
 codex-shim start             regenerate catalog and start local shim daemon
-codex-shim run               run shim in foreground (systemd / debugging)
+codex-shim serve             run HTTP server only (systemd ExecStart; no catalog sync)
+codex-shim run               sync desktop catalog then run HTTP server (interactive)
 codex-shim install-service   fork: install+enable user systemd unit
 codex-shim install-logrotate fork: user logrotate for ~/.codex-shim/shim.log (30M/10)
+codex-shim prune-chatgpt-cache [--target 0.8]
+                            evict cold expansion-cache files down to a fraction of the byte cap
 codex-shim enable            start daemon; write managed ~/.codex/config.toml (model, provider, feature flags)
 codex-shim status            health check + model count
 codex-shim doctor            read-only diagnostics for settings, daemon, passthrough, and Codex config

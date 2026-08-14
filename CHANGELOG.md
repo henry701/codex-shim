@@ -21,7 +21,56 @@ and this project does not yet follow semantic versioning (pre-1.0).
   systemd user timer. `install-service` installs it automatically and restores
   `StandardOutput`/`StandardError` append to the service log path.
 
+- `codex-shim serve` binds the HTTP server without catalog sync. The systemd
+  user unit uses `ExecStartPre=sync-desktop` and `ExecStart=serve` so a restart
+  is reachable before Desktop's request timeout. `codex-shim run` still syncs
+  then serves for interactive use.
+
+- `codex-shim prune-chatgpt-cache [--target 0.8]` evicts cold expansion-cache
+  files down to a fraction of `CODEX_SHIM_CHATGPT_CACHE_MAX_BYTES`. Doctor WARN
+  at ≥90% disk points at this command.
+
 ### Fixed
+
+- ChatGPT conversation cache is an LRU (RAM + disk) with an incremental size
+  index: `get()` promotes entries, eviction no longer walks the tree on every
+  write, and passthrough stores run on the event loop instead of
+  `asyncio.to_thread(put)` (that worker-thread mutation raced with eviction).
+  Cache store failures still do not abort an already-streamed turn.
+  `codex-shim prune-chatgpt-cache` shrinks a full disk cache without raising
+  the 512M default.
+
+- ChatGPT passthrough retries edge blips (HTTP 408/425/429/5xx, HTML
+  “Unable to load site” 403, connect timeout/`ECONNRESET`/`EPIPE`) on a fresh
+  TCP connection. Exhausted HTML site-down becomes a short 502 instead of an
+  HTML blob. JSON 403/401 are not retried. Compact 404 stays non-retryable.
+
+- HTTP SSE to Desktop writes `: ping` every 15s while ChatGPT is silent, so
+  Luna think no longer trips Desktop’s idle request timeout.
+
+- Upstream ChatGPT/BYOK websockets enable aiohttp ping/pong (`heartbeat=30`).
+  Lanes with `exception()` set are not reused; a failed `send_str` or
+  CLOSE/ERROR during relay drops the lane. Missing model tokens are not treated
+  as a dead socket. If heartbeat pong hits a closing transport
+  (`ClientConnectionResetError`), the lane is dropped and ChatGPT WS falls back
+  to HTTP+SSE instead of 500ing the Desktop request.
+
+- `codex-shim stop` / `restart` talk to the systemd user unit when it is
+  installed, so `install-service --now` actually replaces a running `serve`.
+  `sync-desktop` as ExecStartPre has a 45s discovery budget (keeps the existing
+  catalog on timeout) and `TimeoutStartSec=180`. `serve` binds a cached health
+  snapshot without a live ChatGPT `/models` fetch (explicit settings models only,
+  no provider discovery).
+
+- ChatGPT passthrough maps ``reasoning.effort=max`` to ``xhigh``. Codex CLI
+  defaults to ``max``; several ChatGPT Codex models 400 that value.
+
+- Doctor treats a systemd-managed listener as INFO when the pid file is unused,
+  instead of warning “stale pid file; run stop”.
+
+- `codex-shim --port <not 8765> restart` no longer bounces the systemd user unit.
+  ChatGPT e2e smoke starts `serve` on 8766 so it cannot rewrite Desktop’s catalog
+  or restart the live session.
 
 - ChatGPT/BYOK upstream forwarding no longer relays client `Content-Encoding`.
   Desktop may zstd-compress the body to the shim; after decompress + JSON rewrite
@@ -45,7 +94,8 @@ and this project does not yet follow semantic versioning (pre-1.0).
   `/v1/responses` is forwarded to `/codex/responses` (Desktop remote compact v2)
   instead of the shim orchestrator. Legacy `/v1/responses/compact` maps 1:1 to
   `/codex/responses/compact` and returns upstream status with no summarization
-  fallback. Cursor and BYOK still use the compaction orchestrator.
+  fallback. A compact 404 is logged as a known upstream gap rather than a
+  verbose io-resp dump. Cursor and BYOK still use the compaction orchestrator.
 
 - Compaction prep collapses consecutive duplicate `message(role=user)` items
   before sanitization (client compaction retry artifact).

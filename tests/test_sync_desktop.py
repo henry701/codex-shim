@@ -80,3 +80,32 @@ def test_sync_desktop_can_install_config(monkeypatch, tmp_path):
     assert "[model_providers.codex_shim]" not in config_text
     assert "supports_websockets" not in config_text
     assert "enable_request_compression" not in config_text
+
+
+def test_sync_desktop_keeps_existing_catalog_when_load_exceeds_budget(monkeypatch, tmp_path):
+    settings = tmp_path / "models.json"
+    settings.write_text('{"models": []}')
+    codex_home = tmp_path / "codex-home"
+    desktop_catalog = codex_home / "custom_model_catalog.json"
+    runtime_dir = tmp_path / "runtime"
+    desktop_catalog.parent.mkdir(parents=True)
+    desktop_catalog.write_text('{"models": [{"slug": "codex-gpt-5-6-luna"}]}')
+
+    monkeypatch.setattr(cli, "RUNTIME_DIR", runtime_dir)
+    monkeypatch.setattr(cli, "CATALOG_PATH", runtime_dir / "custom_model_catalog.json")
+    monkeypatch.setattr(cli, "CONFIG_PATH", runtime_dir / "config.toml")
+    monkeypatch.setattr(cli, "CODEX_CONFIG_PATH", tmp_path / "config.toml")
+    monkeypatch.setattr(cli, "DESKTOP_CATALOG_PATH", desktop_catalog)
+    monkeypatch.setattr(cli, "CODEX_CONFIG_BACKUP_PATH", runtime_dir / "config.toml.before-codex-shim")
+    monkeypatch.setattr(cli, "SYNC_DESKTOP_BUDGET_S", 0.05)
+
+    def hang(_path):
+        import time
+
+        time.sleep(5)
+        raise AssertionError("load should have been abandoned")
+
+    monkeypatch.setattr(cli, "_load_models", hang)
+    assert cli.sync_desktop(settings, 8765) == 0
+    payload = json.loads(desktop_catalog.read_text())
+    assert payload["models"][0]["slug"] == "codex-gpt-5-6-luna"

@@ -250,6 +250,7 @@ def load_chatgpt_passthrough_catalog_models(
     cache_path: Path | None = None,
     *,
     catalog_path: Path | None = None,
+    skip_live: bool = False,
 ) -> list[dict[str, Any]]:
     """Build ChatGPT passthrough catalog entries.
 
@@ -262,7 +263,7 @@ def load_chatgpt_passthrough_catalog_models(
     """
     from .discover import fetch_chatgpt_codex_backend_models, persist_chatgpt_models_cache
 
-    backend_models = fetch_chatgpt_codex_backend_models()
+    backend_models = [] if skip_live else fetch_chatgpt_codex_backend_models()
     if backend_models:
         persist_chatgpt_models_cache(backend_models, cache_path)
         return _entries_from_upstream_models(backend_models)
@@ -297,8 +298,12 @@ def load_chatgpt_passthrough_catalog_models(
     ]
 
 
-def chatgpt_passthrough_slugs(cache_path: Path | None = None) -> set[str]:
-    return {str(model["slug"]) for model in load_chatgpt_passthrough_catalog_models(cache_path) if model.get("slug")}
+def chatgpt_passthrough_slugs(cache_path: Path | None = None, *, skip_live: bool = False) -> set[str]:
+    return {
+        str(model["slug"])
+        for model in load_chatgpt_passthrough_catalog_models(cache_path, skip_live=skip_live)
+        if model.get("slug")
+    }
 
 
 def chatgpt_passthrough_display_names(cache_path: Path | None = None) -> dict[str, str]:
@@ -406,6 +411,13 @@ class ModelSettings:
 
         settings_data = data if isinstance(data, dict) else None
         return discover_byok_models(explicit, settings_data=settings_data)
+
+    def load_explicit(self) -> list[ShimModel]:
+        """Configured models only — no provider discovery (safe for fast bind)."""
+        if not self.path.exists():
+            return []
+        data = json.loads(self.path.read_text())
+        return self._models_from_settings_data(data)
 
     def _models_from_settings_data(self, data: Any) -> list[ShimModel]:
         rows = _model_rows(data)

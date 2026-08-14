@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import json
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
 
+from codex_shim import chatgpt_conversation_cache as cache_mod
 from codex_shim.chatgpt_conversation_cache import (
     ChatgptConversationCache,
     max_cache_bytes,
@@ -25,7 +27,8 @@ def test_session_key_falls_back_to_thread_id():
     assert session_key_from_headers({"thread-id": "thread-2"}) == "thread-2"
 
 
-def test_session_key_unscoped_when_missing(capsys):
+def test_session_key_unscoped_when_missing(capsys, monkeypatch):
+    monkeypatch.setattr(cache_mod, "_unscoped_warned", False)
     assert session_key_from_headers({}) == "_unscoped"
     assert session_key_from_headers({}) == "_unscoped"
     captured = capsys.readouterr()
@@ -152,3 +155,99 @@ def test_global_size_eviction_removes_oldest_across_sessions(tmp_path: Path, mon
     assert total <= max_cache_bytes()
     assert cache.get("sess-a", "resp_a") is None
     assert cache.get("sess-c", "resp_c") is not None
+
+
+def test_concurrent_puts_over_size_limit_do_not_race(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("CODEX_SHIM_CHATGPT_CACHE_MAX_BYTES", "4000")
+    cache = ChatgptConversationCache(tmp_path)
+
+    def _write(index: int) -> None:
+        cache.put(
+            f"sess-{index % 8}",
+            f"resp_{index}",
+            [{"content": f"{index}-{'x' * 40}"}],
+            terminal=True,
+        )
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        list(pool.map(_write, range(80)))
+
+    remaining = list(tmp_path.rglob("*.json"))
+    total = sum(path.stat().st_size for path in remaining)
+    assert total <= max_cache_bytes()
+    cache.stats()
+
+
+def test_memory_lru_caps_resident_entries(tmp_path: Path):
+    cache = ChatgptConversationCache(tmp_path, max_memory_entries=2)
+    cache.put("sess", "resp_a", [{"n": 1}], terminal=True)
+    cache.put("sess", "resp_b", [{"n": 2}], terminal=True)
+    cache.get("sess", "resp_a")
+    cache.put("sess", "resp_c", [{"n": 3}], terminal=True)
+    assert cache.stats()["read_cache_entries"] == 2
+    assert cache.get("sess", "resp_b") == [{"n": 2}]
+    assert cache.get("sess", "resp_a") == [{"n": 1}]
+    assert cache.get("sess", "resp_c") == [{"n": 3}]
+
+
+def test_disk_lru_keeps_recently_read_entry(tmp_path: Path, monkeypatch):
+    cache = ChatgptConversationCache(tmp_path)
+    payload = [{"content": "x" * 80}]
+    cache.put("sess-a", "resp_a", payload, terminal=True)
+    size_a = (
+        tmp_path / sanitize_path_segment("sess-a") / sanitize_response_filename("resp_a")
+    ).stat().st_size
+    monkeypatch.setenv("CODEX_SHIM_CHATGPT_CACHE_MAX_BYTES", str(size_a * 2 + 32))
+    cache.put("sess-b", "resp_b", payload, terminal=True)
+    assert cache.get("sess-a", "resp_a") is not None
+    assert cache.get("sess-b", "resp_b") is not None
+    cache.get("sess-a", "resp_a")
+    cache.put("sess-c", "resp_c", payload, terminal=True)
+    remaining = list(tmp_path.rglob("*.json"))
+    total = sum(path.stat().st_size for path in remaining)
+    assert total <= max_cache_bytes()
+    assert cache.get("sess-a", "resp_a") is not None
+    assert cache.get("sess-b", "resp_b") is None
+    assert cache.get("sess-c", "resp_c") is not None
+
+
+def test_prune_until_keeps_recently_read_entry(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("CODEX_SHIM_CHATGPT_CACHE_MAX_BYTES", "10000")
+    cache = ChatgptConversationCache(tmp_path)
+    payload = [{"content": "x" * 80}]
+    cache.put("sess-a", "resp_a", payload, terminal=True)
+    cache.put("sess-b", "resp_b", payload, terminal=True)
+    cache.put("sess-c", "resp_c", payload, terminal=True)
+    cache.get("sess-c", "resp_c")
+    size_c = (
+        tmp_path / sanitize_path_segment("sess-c") / sanitize_response_filename("resp_c")
+    ).stat().st_size
+    after = cache.prune_until(size_c + 32)
+    assert after["total_bytes"] <= size_c + 32
+    assert cache.get("sess-c", "resp_c") is not None
+
+
+def test_repeated_puts_do_not_rescan_disk_tree(tmp_path: Path, monkeypatch):
+    cache = ChatgptConversationCache(tmp_path)
+    cache.put("sess", "resp_a", [{"n": 1}], terminal=True)
+    scans = {"n": 0}
+    original_iterdir = Path.iterdir
+
+    def counting_iterdir(self):
+        if self.resolve() == cache.root.resolve():
+            scans["n"] += 1
+        return original_iterdir(self)
+
+    monkeypatch.setattr(Path, "iterdir", counting_iterdir)
+    cache.put("sess", "resp_b", [{"n": 2}], terminal=True)
+    cache.put("sess", "resp_c", [{"n": 3}], terminal=True)
+    cache.stats()
+    assert scans["n"] == 0
+
+
+@pytest.mark.asyncio
+async def test_aput_round_trip_on_event_loop(tmp_path: Path):
+    cache = ChatgptConversationCache(tmp_path)
+    items = [{"type": "message", "role": "user", "content": "async"}]
+    await cache.aput("sess", "resp_1", items, terminal=True)
+    assert cache.get("sess", "resp_1") == items

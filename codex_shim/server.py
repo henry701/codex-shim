@@ -18,6 +18,8 @@ from urllib.parse import urljoin
 
 from aiohttp import ClientError, ClientSession, ClientTimeout, WSMsgType, web
 
+from .chatgpt_edge import post_chatgpt_with_retry
+
 from .compaction import (
     CompactionTriggerError,
     SHIM_COMPACTION_PREFIX,
@@ -152,10 +154,11 @@ from .upstream_io_trace import log_upstream_request, log_upstream_response, shim
 DEBUG_DIR = Path(__file__).resolve().parents[1] / ".codex-shim"
 CODEX_CONFIG_PATH = Path.home() / ".codex" / "config.toml"
 PICKER_TOKEN_HEADER = "X-Codex-Shim-Picker-Token"
+SSE_KEEPALIVE_INTERVAL = 15.0
 CHATGPT_ACCEPT_ENCODING = "zstd, gzip, deflate"
 # Align with opencode CLI discover cache: automatic in-process refresh is rare.
 _MODELS_CACHE_TTL_SEC = 3 * 60 * 60
-_STARTUP_REFRESH_TIMEOUT_SEC = 120.0
+_STARTUP_REFRESH_TIMEOUT_SEC = 8.0
 
 
 def _chatgpt_conversations_dir() -> Path:
@@ -263,23 +266,33 @@ class ShimServer:
         _log_compaction_upstream_trace(phase="pre-native-compact", url=url, forwarded=forwarded)
         log_upstream_request("chatgpt-compact", url, forwarded)
         async with ClientSession(timeout=self._compact_timeout) as session:
-            upstream = await session.post(url, json=forwarded, headers=headers)
+            posted = await post_chatgpt_with_retry(session, url, json=forwarded, headers=headers)
+            upstream = posted.response
             upstream_forward_headers = observe_upstream_response("chatgpt-compact-passthrough", upstream)
-            if upstream.status >= 400:
-                text = await upstream.text()
-                status = upstream.status
-                content_type = upstream.content_type or "text/plain"
-                code, message = parse_upstream_error(text, status)
-                print(f"[err] chatgpt-compact returned {status}: {message[:500]}", flush=True)
-                _log_compaction_upstream_trace(
-                    phase="native-compact-error",
-                    url=url,
-                    forwarded=forwarded,
-                    status=status,
-                    response_text=text,
-                )
-                log_upstream_response("chatgpt-compact", url, status, text, request_body=forwarded)
-                upstream.release()
+            if posted.status >= 400:
+                text = posted.error_text or ""
+                status = posted.status
+                content_type = posted.content_type or "text/plain"
+                if status == 404:
+                    print(
+                        "[chatgpt-compact] upstream missing (known): "
+                        "POST /codex/responses/compact 404; Desktop owns remote compact v2; "
+                        "shim will not synthesize compact",
+                        flush=True,
+                    )
+                else:
+                    _, message = parse_upstream_error(text, status)
+                    print(f"[err] chatgpt-compact returned {status}: {message[:500]}", flush=True)
+                    _log_compaction_upstream_trace(
+                        phase="native-compact-error",
+                        url=url,
+                        forwarded=forwarded,
+                        status=status,
+                        response_text=text,
+                    )
+                    log_upstream_response("chatgpt-compact", url, status, text, request_body=forwarded)
+                if upstream is not None:
+                    upstream.release()
                 return _upstream_text_response(
                     status,
                     text,
@@ -740,26 +753,25 @@ class ShimServer:
 
     async def _on_startup(self, _app: web.Application) -> None:
         try:
-            models = await asyncio.wait_for(
-                asyncio.to_thread(self.settings.load),
+            self._health_snapshot = await asyncio.wait_for(
+                asyncio.to_thread(self._startup_health_snapshot),
                 timeout=_STARTUP_REFRESH_TIMEOUT_SEC,
             )
-            self._models_cache = (time.monotonic(), models)
-            self._health_snapshot = self._compute_health_snapshot_from_models(models)
         except Exception:
-            try:
-                self._health_snapshot = await asyncio.wait_for(
-                    asyncio.to_thread(self._compute_health_snapshot),
-                    timeout=_STARTUP_REFRESH_TIMEOUT_SEC,
-                )
-            except Exception:
-                pass
+            self._health_snapshot = {
+                **self._health_snapshot,
+                "chatgpt_passthrough": chatgpt_passthrough_available(),
+                "cursor_passthrough": cursor_passthrough_available(),
+            }
+
+    def _startup_health_snapshot(self) -> dict[str, Any]:
+        return self._compute_health_snapshot_from_models(self.settings.load_explicit())
 
     def _compute_health_snapshot_from_models(self, models: list[ShimModel]) -> dict[str, Any]:
         usable = usable_byok_models(models)
         chatgpt_ok = chatgpt_passthrough_available()
         cursor_ok = cursor_passthrough_available()
-        passthrough_count = len(chatgpt_passthrough_slugs()) if chatgpt_ok else 0
+        passthrough_count = len(chatgpt_passthrough_slugs(skip_live=True)) if chatgpt_ok else 0
         if cursor_ok:
             passthrough_count += len(cursor_passthrough_display_names())
         config = self.settings.load_router()
@@ -1128,20 +1140,24 @@ class ShimServer:
             print(f"[ws-passthrough] upstream connect failed url={upstream_url} err={exc}", flush=True)
             return False
 
-        await passthrough.send_response_create(forwarded, upstream_url=upstream_url)
         client_ws = passthrough.client_ws
 
         async def write_event(event: dict[str, Any]) -> None:
             await _write_ws_json(client_ws, event)
 
-        await passthrough.relay_until_terminal(
-            source=source,
-            upstream_url=upstream_url,
-            model_override=target.response_model_override,
-            on_event=on_event,
-            rewrite_model=_rewrite_response_model,
-            write_event=write_event,
-        )
+        try:
+            await passthrough.send_response_create(forwarded, upstream_url=upstream_url)
+            await passthrough.relay_until_terminal(
+                source=source,
+                upstream_url=upstream_url,
+                model_override=target.response_model_override,
+                on_event=on_event,
+                rewrite_model=_rewrite_response_model,
+                write_event=write_event,
+            )
+        except WsPassthroughConnectError as exc:
+            print(f"[ws-passthrough] upstream relay failed url={upstream_url} err={exc}", flush=True)
+            return False
         if collector.response_id:
             items = self._build_turn_cache_items(request, raw_body, collector.output_items())
             if items:
@@ -1214,16 +1230,30 @@ class ShimServer:
                     return True
                 return not is_previous_response_id_upstream_event(event)
 
-            await passthrough.send_response_create(forwarded, upstream_url=upstream_url)
-            terminal = await passthrough.relay_until_terminal(
-                source=source,
-                upstream_url=upstream_url,
-                model_override=target.response_model_override,
-                on_event=on_event,
-                rewrite_model=_rewrite_response_model,
-                write_event=write_event,
-                forward_terminal=forward_terminal,
-            )
+            try:
+                await passthrough.send_response_create(forwarded, upstream_url=upstream_url)
+                terminal = await passthrough.relay_until_terminal(
+                    source=source,
+                    upstream_url=upstream_url,
+                    model_override=target.response_model_override,
+                    on_event=on_event,
+                    rewrite_model=_rewrite_response_model,
+                    write_event=write_event,
+                    forward_terminal=forward_terminal,
+                )
+            except WsPassthroughConnectError as exc:
+                print(
+                    f"[ws-passthrough] upstream relay failed; http-fallback url={upstream_url} err={exc}",
+                    flush=True,
+                )
+                await self._handle_chatgpt_response_create_websocket_http(
+                    request,
+                    passthrough.client_ws,
+                    payload,
+                    target,
+                    http_session=passthrough.client_session,
+                )
+                return True
             if (
                 terminal is not None
                 and is_previous_response_id_upstream_event(terminal)
@@ -1313,21 +1343,23 @@ class ShimServer:
         url = "https://chatgpt.com/backend-api/codex/responses"
         print(f"[ws-passthrough] http-fallback POST {url}", flush=True)
         log_upstream_request("chatgpt-passthrough-ws-http", url, forwarded)
-        upstream = await http_session.post(url, json=forwarded, headers=headers)
+        posted = await post_chatgpt_with_retry(http_session, url, json=forwarded, headers=headers)
+        upstream = posted.response
         upstream_forward_headers = observe_upstream_response("chatgpt-passthrough-ws", upstream)
-        if upstream.status >= 400:
-            text = await upstream.text()
-            code, message = parse_upstream_error(text, upstream.status)
+        if posted.status >= 400:
+            text = posted.error_text or ""
+            code, message = parse_upstream_error(text, posted.status)
             log_upstream_response(
                 "chatgpt-passthrough-ws-http",
                 url,
-                upstream.status,
+                posted.status,
                 text,
                 request_body=forwarded,
                 stream=True,
             )
-            upstream.release()
-            await _write_ws_error(ws, upstream.status, code, message)
+            if upstream is not None:
+                upstream.release()
+            await _write_ws_error(ws, posted.status, code, message)
             return
         collector = ChatgptPassthroughResponseCollector(forwarded)
 
@@ -2153,7 +2185,14 @@ class ShimServer:
     ) -> None:
         if not response_id or not items:
             return
-        self._chatgpt_conversation_cache.put(session_key, response_id, items, terminal=terminal)
+        try:
+            self._chatgpt_conversation_cache.put(session_key, response_id, items, terminal=terminal)
+        except Exception as exc:
+            print(
+                f"[chatgpt-cache] store failed session={session_key} "
+                f"response_id={response_id} terminal={terminal} err={exc}",
+                flush=True,
+            )
 
     async def _store_chatgpt_passthrough_conversation_async(
         self,
@@ -2165,16 +2204,19 @@ class ShimServer:
     ) -> None:
         if not response_id or not items:
             return
-        if terminal:
-            await asyncio.to_thread(
-                self._chatgpt_conversation_cache.put,
+        try:
+            self._chatgpt_conversation_cache.put(
                 session_key,
                 response_id,
                 items,
-                terminal=True,
+                terminal=terminal,
             )
-        else:
-            self._chatgpt_conversation_cache.put(session_key, response_id, items, terminal=False)
+        except Exception as exc:
+            print(
+                f"[chatgpt-cache] store failed session={session_key} "
+                f"response_id={response_id} terminal={terminal} err={exc}",
+                flush=True,
+            )
 
     def _store_responses_turn_conversation(
         self,
@@ -2261,13 +2303,15 @@ class ShimServer:
         url = "https://chatgpt.com/backend-api/codex/responses"
         log_upstream_request("chatgpt-passthrough", url, forwarded)
         async with ClientSession(timeout=self.timeout) as session:
-            upstream = await session.post(url, json=forwarded, headers=headers)
-            if upstream.status >= 400:
+            posted = await post_chatgpt_with_retry(session, url, json=forwarded, headers=headers)
+            upstream = posted.response
+            if posted.status >= 400:
                 upstream_forward_headers = observe_upstream_response("chatgpt-passthrough", upstream)
-                text = await upstream.text()
-                status = upstream.status
-                content_type = upstream.content_type or "text/plain"
-                upstream.release()
+                text = posted.error_text or ""
+                status = posted.status
+                content_type = posted.content_type or "text/plain"
+                if upstream is not None:
+                    upstream.release()
                 log_upstream_response(
                     "chatgpt-passthrough",
                     url,
@@ -2396,7 +2440,7 @@ class ShimServer:
             collector = ChatgptPassthroughResponseCollector(forwarded)
 
             try:
-                async for line in _sse_lines(upstream, request):
+                async for line in _iter_sse_lines_with_keepalive(upstream, request, response):
                     if line == "[DONE]":
                         await _safe_write(response, b"data: [DONE]\n\n")
                         break
@@ -4049,6 +4093,10 @@ def _finalize_chatgpt_compact_passthrough_body(body: dict[str, Any]) -> dict[str
 
 
 CHATGPT_LITE_REASONING_CONTEXT = "all_turns"
+CHATGPT_REASONING_EFFORT_ALIASES = {
+    "max": "xhigh",
+    "maximum": "xhigh",
+}
 
 
 def _apply_chatgpt_lite_constraints(body: dict[str, Any]) -> dict[str, Any]:
@@ -4056,14 +4104,18 @@ def _apply_chatgpt_lite_constraints(body: dict[str, Any]) -> dict[str, Any]:
 
     Lite ``/codex/responses`` requires ``reasoning.context=all_turns`` and an
     explicit ``parallel_tool_calls=false`` (omitting the field still 400s).
-    Keep effort/summary; force the Lite-required fields on every ChatGPT
-    passthrough turn, including forwarded remote-compact v2 requests.
+    Keep effort/summary; map aliases ChatGPT rejects (``max`` → ``xhigh``).
     """
     forwarded = dict(body)
     reasoning = forwarded.get("reasoning")
     if isinstance(reasoning, dict):
         updated = dict(reasoning)
         updated["context"] = CHATGPT_LITE_REASONING_CONTEXT
+        effort = updated.get("effort")
+        if isinstance(effort, str):
+            alias = CHATGPT_REASONING_EFFORT_ALIASES.get(effort.lower())
+            if alias:
+                updated["effort"] = alias
         forwarded["reasoning"] = updated
     else:
         forwarded["reasoning"] = {"context": CHATGPT_LITE_REASONING_CONTEXT}
@@ -6513,6 +6565,44 @@ async def _sse_lines(upstream, request: web.Request | None = None) -> Any:
     tail = buffer.decode("utf-8", errors="replace").strip()
     if tail.startswith("data:"):
         yield tail[5:].strip()
+
+
+async def _iter_sse_lines_with_keepalive(
+    upstream,
+    request: web.Request | None,
+    response: web.StreamResponse,
+    *,
+    interval: float | None = None,
+) -> Any:
+    """Yield SSE data lines and write ``: ping`` while the upstream is silent.
+
+    The upstream reader stays running across ping timeouts. ``asyncio.wait_for``
+    would cancel ``readany()`` and ``_sse_lines`` would close a live ChatGPT
+    stream.
+    """
+    timeout = SSE_KEEPALIVE_INTERVAL if interval is None else interval
+    agen = _sse_lines(upstream, request)
+    read_task = asyncio.create_task(anext(agen))
+    try:
+        while True:
+            done, _pending = await asyncio.wait({read_task}, timeout=timeout)
+            if not done:
+                await _safe_write(response, b": ping\n\n")
+                continue
+            try:
+                line = read_task.result()
+            except StopAsyncIteration:
+                break
+            yield line
+            read_task = asyncio.create_task(anext(agen))
+    finally:
+        if not read_task.done():
+            read_task.cancel()
+        try:
+            await read_task
+        except (asyncio.CancelledError, StopAsyncIteration):
+            pass
+        await agen.aclose()
 
 
 def _anthropic_stream_to_chat_chunk(event: dict[str, Any], model: str) -> dict[str, Any]:

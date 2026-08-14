@@ -9,6 +9,7 @@ def test_stop_escalates_to_sigkill_when_sigterm_times_out(monkeypatch, tmp_path)
     pid_path = tmp_path / "shim.pid"
     pid_path.write_text("4242")
     monkeypatch.setattr(cli, "PID_PATH", pid_path)
+    monkeypatch.setattr(cli, "_stop_systemd_unit_if_active", lambda: False)
 
     checks = {"count": 0}
 
@@ -46,6 +47,7 @@ def test_stop_returns_error_when_process_survives_sigkill(monkeypatch, tmp_path)
     pid_path = tmp_path / "shim.pid"
     pid_path.write_text("5150")
     monkeypatch.setattr(cli, "PID_PATH", pid_path)
+    monkeypatch.setattr(cli, "_stop_systemd_unit_if_active", lambda: False)
     monkeypatch.setattr(cli, "_pid_running", lambda pid: True)
     monkeypatch.setattr(cli, "_terminate_pid", lambda pid: None)
     monkeypatch.setattr(cli.os, "killpg", lambda pid, sig: None)
@@ -71,6 +73,7 @@ def test_stop_kills_orphan_listener_when_pid_file_is_stale(monkeypatch, tmp_path
     pid_path = tmp_path / "shim.pid"
     pid_path.write_text("9999")
     monkeypatch.setattr(cli, "PID_PATH", pid_path)
+    monkeypatch.setattr(cli, "_stop_systemd_unit_if_active", lambda: False)
     monkeypatch.setattr(cli, "_pid_running", lambda pid: False)
     monkeypatch.setattr(cli, "_health", lambda port: {"models": 3})
     monkeypatch.setattr(cli, "_listener_pid", lambda port: 4242)

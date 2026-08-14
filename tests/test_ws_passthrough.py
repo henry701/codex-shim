@@ -14,6 +14,8 @@ from codex_shim.header_passthrough import (
 from codex_shim.server import ChatgptPassthroughResponseCollector, _rewrite_response_model
 from codex_shim.ws_passthrough import (
     CHATGPT_WS_URL,
+    UPSTREAM_WS_HEARTBEAT,
+    WsPassthroughConnectError,
     WsPassthroughSession,
     responses_websocket_url,
     ws_passthrough_enabled,
@@ -190,3 +192,143 @@ def test_chatgpt_collector_keeps_output_item_done_when_completed_output_empty():
 
 def test_chatgpt_ws_url_constant():
     assert CHATGPT_WS_URL == "wss://chatgpt.com/backend-api/codex/responses"
+
+
+@pytest.mark.asyncio
+async def test_connect_upstream_passes_heartbeat():
+    client_ws = AsyncMock()
+    client_ws.closed = False
+    new_ws = AsyncMock()
+    new_ws.closed = False
+    new_ws.headers = {}
+    new_ws.exception = MagicMock(return_value=None)
+    client_session = AsyncMock()
+    client_session.ws_connect = AsyncMock(return_value=new_ws)
+    session = WsPassthroughSession(client_session=client_session, client_ws=client_ws)
+    url = "wss://example/v1/responses"
+    _, reused = await session.connect_upstream(url, {"Authorization": "Bearer x"})
+    assert reused is False
+    kwargs = client_session.ws_connect.call_args.kwargs
+    assert kwargs["heartbeat"] == UPSTREAM_WS_HEARTBEAT
+    assert kwargs["headers"] == {"Authorization": "Bearer x"}
+
+
+@pytest.mark.asyncio
+async def test_connect_upstream_does_not_reuse_ws_with_exception():
+    client_ws = AsyncMock()
+    client_ws.closed = False
+    dead_ws = AsyncMock()
+    dead_ws.closed = False
+    dead_ws.exception = MagicMock(return_value=ConnectionError("broken"))
+    new_ws = AsyncMock()
+    new_ws.closed = False
+    new_ws.headers = {}
+    new_ws.exception = MagicMock(return_value=None)
+    client_session = AsyncMock()
+    client_session.ws_connect = AsyncMock(return_value=new_ws)
+    session = WsPassthroughSession(client_session=client_session, client_ws=client_ws)
+    url = "wss://example/v1/responses"
+    session.upstream_by_url[url] = dead_ws
+    _, reused = await session.connect_upstream(url, {})
+    assert reused is False
+    client_session.ws_connect.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_send_response_create_failure_closes_lane():
+    client_ws = AsyncMock()
+    client_ws.closed = False
+    upstream_ws = AsyncMock()
+    upstream_ws.closed = False
+    upstream_ws.exception = MagicMock(return_value=None)
+    upstream_ws.send_str = AsyncMock(side_effect=ConnectionError("broken pipe"))
+    session = WsPassthroughSession(client_session=AsyncMock(), client_ws=client_ws)
+    url = "wss://example/v1/responses"
+    session.upstream_by_url[url] = upstream_ws
+    with pytest.raises(WsPassthroughConnectError):
+        await session.send_response_create({"model": "gpt-5.5"}, upstream_url=url)
+    assert url not in session.upstream_by_url
+    upstream_ws.close.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_relay_close_frame_drops_lane():
+    client_ws = AsyncMock()
+    client_ws.closed = False
+
+    class ClosingWs:
+        def __init__(self) -> None:
+            self.closed = False
+
+        def __aiter__(self):
+            return self._iter()
+
+        async def _iter(self):
+            msg = MagicMock()
+            msg.type = WSMsgType.CLOSE
+            yield msg
+
+        async def close(self):
+            self.closed = True
+
+    session = WsPassthroughSession(client_session=AsyncMock(), client_ws=client_ws)
+    url = "wss://example/v1/responses"
+    session.upstream_by_url[url] = ClosingWs()
+    terminal = await session.relay_until_terminal(source="test-ws", upstream_url=url)
+    assert terminal is None
+    assert url not in session.upstream_by_url
+
+
+@pytest.mark.asyncio
+async def test_relay_connection_reset_on_pong_closes_lane_and_raises():
+    client_ws = AsyncMock()
+    client_ws.closed = False
+
+    class ResettingWs:
+        def __init__(self) -> None:
+            self.closed = False
+            self.close = AsyncMock()
+
+        def __aiter__(self):
+            return self._iter()
+
+        async def _iter(self):
+            from aiohttp.client_exceptions import ClientConnectionResetError
+
+            raise ClientConnectionResetError("Cannot write to closing transport")
+            yield  # pragma: no cover
+
+    session = WsPassthroughSession(client_session=AsyncMock(), client_ws=client_ws)
+    url = "wss://example/v1/responses"
+    session.upstream_by_url[url] = ResettingWs()
+    with pytest.raises(WsPassthroughConnectError, match="closing transport"):
+        await session.relay_until_terminal(source="test-ws", upstream_url=url)
+    assert url not in session.upstream_by_url
+
+
+@pytest.mark.asyncio
+async def test_relay_error_frame_drops_lane():
+    client_ws = AsyncMock()
+    client_ws.closed = False
+
+    class ErrorWs:
+        def __init__(self) -> None:
+            self.closed = False
+
+        def __aiter__(self):
+            return self._iter()
+
+        async def _iter(self):
+            msg = MagicMock()
+            msg.type = WSMsgType.ERROR
+            yield msg
+
+        async def close(self):
+            self.closed = True
+
+    session = WsPassthroughSession(client_session=AsyncMock(), client_ws=client_ws)
+    url = "wss://example/v1/responses"
+    session.upstream_by_url[url] = ErrorWs()
+    terminal = await session.relay_until_terminal(source="test-ws", upstream_url=url)
+    assert terminal is None
+    assert url not in session.upstream_by_url

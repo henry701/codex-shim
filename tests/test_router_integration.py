@@ -29,10 +29,12 @@ def _reset_router_cache():
 
 @pytest.fixture(autouse=True)
 def auth_missing(monkeypatch, tmp_path):
-    """Keep ChatGPT passthrough out of discovery so model lists are deterministic."""
+    """Keep ChatGPT/Cursor passthrough out of discovery so model lists are deterministic."""
     missing = tmp_path / "missing-auth.json"
     monkeypatch.setattr("codex_shim.settings.DEFAULT_CODEX_AUTH", missing)
     monkeypatch.setattr("codex_shim.server.DEFAULT_CODEX_AUTH", missing)
+    monkeypatch.setattr("codex_shim.server.cursor_passthrough_available", lambda **_kwargs: False)
+    monkeypatch.setattr("codex_shim.cursor_passthrough.cursor_passthrough_available", lambda **_kwargs: False)
 
 
 # ---------------------------------------------------------------------------

@@ -4,7 +4,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PORT="${SMOKE_PORT:-8766}"
-MODEL="${SMOKE_MODEL:-codex-gpt-5-5}"
+MODEL="${SMOKE_MODEL:-codex-gpt-5-6-luna}"
 WORKDIR="${SMOKE_WORKDIR:-$ROOT}"
 PROMPT="${SMOKE_PROMPT:-Read the first 3 lines of README.md with a shell command (head -n 3 README.md), then answer in one short sentence what the project is.}"
 DEFAULT_SHIM_LOG="${HOME}/.codex-shim/shim.log"
@@ -29,6 +29,10 @@ trap cleanup EXIT
 STARTED_BY_SCRIPT=0
 if curl -sf "http://127.0.0.1:${PORT}/health" >/dev/null 2>&1; then
   if [[ "${SMOKE_RESTART:-0}" == "1" ]]; then
+    if [[ "${PORT}" == "8765" ]]; then
+      echo "Refusing SMOKE_RESTART=1 on port 8765 (production Desktop shim)."
+      exit 1
+    fi
     echo "Restarting shim on port ${PORT} with trace env (log: ${LOG})"
     codex-shim --port "${PORT}" restart >>"${LOG}" 2>&1 || true
     sleep 1
@@ -43,7 +47,9 @@ if curl -sf "http://127.0.0.1:${PORT}/health" >/dev/null 2>&1; then
 else
   echo "Starting shim on port ${PORT} (log: ${LOG})"
   : >"${LOG}"
-  codex-shim --port "${PORT}" run >>"${LOG}" 2>&1 &
+  # `serve` only: do not `run`/`sync-desktop` (mutates Desktop catalog) or `restart`
+  # (systemd restart is the production 8765 unit).
+  codex-shim --port "${PORT}" serve >>"${LOG}" 2>&1 &
   SHIM_PID=$!
   STARTED_BY_SCRIPT=1
   for _ in $(seq 1 30); do
