@@ -352,6 +352,9 @@ async def test_bridge_invoke_collector_appends_function_call():
     assert tool_items[0]["namespace"] == "goals"
     assert tool_items[0]["name"] == "update_goal"
     assert json.loads(tool_items[0]["arguments"]) == {"status": "complete", "goal_id": "g1"}
+    suffix = result["codex_call_id"].removeprefix("call_")
+    assert tool_items[0]["id"] == f"fc_{suffix}"
+    assert tool_items[0]["call_id"] == result["codex_call_id"]
 
 
 @pytest.mark.asyncio
@@ -396,6 +399,8 @@ async def test_bridge_emit_synthetic_function_call_streams_sse():
     assert len(added) == 1
     assert added[0]["item"]["namespace"] == "goals"
     assert added[0]["item"]["name"] == "update_goal"
+    assert added[0]["item"]["id"] == "fc_bridge_test_1"
+    assert added[0]["item"]["call_id"] == "call_bridge_test_1"
     assert any(event.get("type") == "response.function_call_arguments.done" for event in events)
 
 

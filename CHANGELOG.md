@@ -32,6 +32,13 @@ and this project does not yet follow semantic versioning (pre-1.0).
 
 ### Fixed
 
+- ChatGPT Lite rejects ``function_call.id`` values that start with ``call_``
+  (``invalid_id_prefix``, expected ``fc``). Cursor-bridge and BYOK translation
+  reused the Chat Completions call id for both fields. Item ``id`` is now
+  ``fc_<suffix>``; ``call_id`` stays ``call_<suffix>`` so tool outputs still
+  match. Passthrough sanitizes already-stored Desktop history the same way and
+  drops leaked ``call_``/``fc_`` ids from ``function_call_output``.
+
 - ChatGPT conversation cache is an LRU (RAM + disk) with an incremental size
   index: `get()` promotes entries, eviction no longer walks the tree on every
   write, and passthrough stores run on the event loop instead of
@@ -62,8 +69,10 @@ and this project does not yet follow semantic versioning (pre-1.0).
   snapshot without a live ChatGPT `/models` fetch (explicit settings models only,
   no provider discovery).
 
-- ChatGPT passthrough maps ``reasoning.effort=max`` to ``xhigh``. Codex CLI
-  defaults to ``max``; several ChatGPT Codex models 400 that value.
+- ChatGPT passthrough forwards ``reasoning.effort`` unchanged (including
+  ``max`` / ``ultra``). ChatGPT Codex accepts those values; clamping them to
+  ``xhigh`` was the public ``api.openai.com`` constraint applied on the wrong
+  host. Desktop/catalog own the effort string.
 
 - Doctor treats a systemd-managed listener as INFO when the pid file is unused,
   instead of warning “stale pid file; run stop”.

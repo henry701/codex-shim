@@ -183,28 +183,69 @@ def test_sanitize_chatgpt_passthrough_body_keeps_previous_response_id_by_default
     assert sanitized["metadata"]["previous_response_id"] == "metadata-value"
 
 
-def test_sanitize_chatgpt_passthrough_body_maps_max_effort_to_xhigh():
+def test_sanitize_chatgpt_passthrough_body_forwards_effort_verbatim():
     sanitized = _sanitize_chatgpt_passthrough_body(
         {
-            "model": "codex-gpt-5-5",
+            "model": "codex-gpt-5-6-luna",
             "input": [{"type": "message", "role": "user", "content": "hi"}],
             "reasoning": {"effort": "max", "summary": "auto"},
         }
     )
-    assert sanitized["reasoning"]["effort"] == "xhigh"
+    assert sanitized["reasoning"]["effort"] == "max"
     assert sanitized["reasoning"]["summary"] == "auto"
     assert sanitized["reasoning"]["context"] == "all_turns"
 
 
-def test_sanitize_chatgpt_passthrough_body_keeps_supported_effort():
+@pytest.mark.parametrize("effort", ["low", "medium", "high", "xhigh", "max", "ultra", "maximum"])
+def test_sanitize_chatgpt_passthrough_body_does_not_rewrite_effort(effort):
     sanitized = _sanitize_chatgpt_passthrough_body(
         {
-            "model": "codex-gpt-5-5",
+            "model": "codex-gpt-5-6-luna",
             "input": [{"type": "message", "role": "user", "content": "hi"}],
-            "reasoning": {"effort": "high"},
+            "reasoning": {"effort": effort},
         }
     )
-    assert sanitized["reasoning"]["effort"] == "high"
+    assert sanitized["reasoning"]["effort"] == effort
+
+
+def test_sanitize_chatgpt_passthrough_body_rewrites_function_call_id_prefix():
+    sanitized = _sanitize_chatgpt_passthrough_body(
+        {
+            "model": "codex-gpt-5-6-luna",
+            "input": [
+                {
+                    "type": "function_call",
+                    "id": "call_vSN3n7d4PoQtq7pr_1",
+                    "call_id": "call_vSN3n7d4PoQtq7pr_1",
+                    "name": "spawn_agent",
+                    "namespace": "multi_agent_v1",
+                    "arguments": '{"task":"review"}',
+                },
+                {
+                    "type": "function_call_output",
+                    "id": "call_vSN3n7d4PoQtq7pr_1",
+                    "call_id": "call_vSN3n7d4PoQtq7pr_1",
+                    "output": "ok",
+                },
+                {
+                    "type": "function_call",
+                    "id": "fc_already",
+                    "call_id": "call_already",
+                    "name": "lookup",
+                    "arguments": "{}",
+                },
+            ],
+        }
+    )
+    spawn = sanitized["input"][0]
+    assert spawn["id"] == "fc_vSN3n7d4PoQtq7pr_1"
+    assert spawn["call_id"] == "call_vSN3n7d4PoQtq7pr_1"
+    output = sanitized["input"][1]
+    assert "id" not in output
+    assert output["call_id"] == "call_vSN3n7d4PoQtq7pr_1"
+    already = sanitized["input"][2]
+    assert already["id"] == "fc_already"
+    assert already["call_id"] == "call_already"
 
 
 def test_sanitize_chatgpt_passthrough_body_can_strip_previous_response_id_for_legacy_expand():
@@ -494,6 +535,51 @@ async def test_chatgpt_passthrough_http_forwards_service_tier_and_output_caps(
     assert captured["body"]["max_output_tokens"] == 4096
     assert captured["body"]["max_tokens"] == 2048
     assert captured["body"]["store"] is False
+
+    await shim_client.close()
+
+
+async def test_chatgpt_passthrough_http_forwards_reasoning_effort_verbatim(
+    monkeypatch, tmp_path, auth_present
+):
+    captured = {}
+
+    class FakeUpstream:
+        status = 200
+        content_type = "application/json"
+        headers = {}
+
+        async def json(self, content_type=None):
+            return {"id": "resp_1", "model": "gpt-5.6-luna", "output": []}
+
+        def release(self):
+            pass
+
+    async def fake_post(self, url, json=None, headers=None):
+        captured["url"] = url
+        captured["body"] = json
+        return FakeUpstream()
+
+    monkeypatch.setattr("codex_shim.server.ClientSession.post", fake_post)
+    settings = tmp_path / "settings.json"
+    settings.write_text("{}")
+    shim_client = TestClient(TestServer(ShimServer(settings).app()))
+    await shim_client.start_server()
+
+    resp = await shim_client.post(
+        "/v1/responses",
+        json={
+            "model": "codex-gpt-5-6-luna",
+            "input": "hi",
+            "reasoning": {"effort": "max", "summary": "auto"},
+        },
+    )
+
+    assert resp.status == 200
+    assert captured["url"] == "https://chatgpt.com/backend-api/codex/responses"
+    assert captured["body"]["reasoning"]["effort"] == "max"
+    assert captured["body"]["reasoning"]["summary"] == "auto"
+    assert captured["body"]["reasoning"]["context"] == "all_turns"
 
     await shim_client.close()
 

@@ -19,6 +19,16 @@ def test_parse_mcp_tool_reference_accepts_dot_notation():
     )
 
 
+def test_responses_function_call_ids_splits_fc_item_from_call_id():
+    item_id, call_id = tool_translate.responses_function_call_ids(
+        "call_vSN3n7d4PoQtq7pr_1"
+    )
+    assert item_id == "fc_vSN3n7d4PoQtq7pr_1"
+    assert call_id == "call_vSN3n7d4PoQtq7pr_1"
+    assert tool_translate.responses_function_call_ids("fc_abc") == ("fc_abc", "call_abc")
+    assert tool_translate.responses_function_call_ids("tool-7") == ("fc_tool-7", "call_tool-7")
+
+
 def test_mcp_function_call_item_matches_passthrough_shape():
     item = tool_translate.mcp_function_call_item(
         "call_1",
@@ -28,7 +38,7 @@ def test_mcp_function_call_item_matches_passthrough_shape():
         "completed",
     )
     assert item == {
-        "id": "call_1",
+        "id": "fc_1",
         "type": "function_call",
         "status": "completed",
         "call_id": "call_1",

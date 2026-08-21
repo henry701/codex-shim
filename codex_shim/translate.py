@@ -8,7 +8,7 @@ from typing import Any
 from . import mcp_search
 from .compaction import decode_shim_compaction_summary
 from .responses_input_pipeline import UNKNOWN_FUNCTION_TOOL_NAME
-from .tool_translate import mcp_namespace
+from .tool_translate import mcp_namespace, responses_function_call_ids
 
 
 THINK_RE = re.compile(r"<think>.*?</think>", re.IGNORECASE | re.DOTALL)
@@ -86,8 +86,9 @@ def function_call_item_from_chat_tool(
         }
     if original_type.startswith("web_search"):
         return _web_search_call_item(call_id, fn.get("arguments", ""))
+    item_id, call_id = responses_function_call_ids(call_id)
     item: dict[str, Any] = {
-        "id": call_id,
+        "id": item_id,
         "type": "function_call",
         "status": "completed",
         "call_id": call_id,

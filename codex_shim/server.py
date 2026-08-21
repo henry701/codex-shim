@@ -4093,10 +4093,6 @@ def _finalize_chatgpt_compact_passthrough_body(body: dict[str, Any]) -> dict[str
 
 
 CHATGPT_LITE_REASONING_CONTEXT = "all_turns"
-CHATGPT_REASONING_EFFORT_ALIASES = {
-    "max": "xhigh",
-    "maximum": "xhigh",
-}
 
 
 def _apply_chatgpt_lite_constraints(body: dict[str, Any]) -> dict[str, Any]:
@@ -4104,18 +4100,13 @@ def _apply_chatgpt_lite_constraints(body: dict[str, Any]) -> dict[str, Any]:
 
     Lite ``/codex/responses`` requires ``reasoning.context=all_turns`` and an
     explicit ``parallel_tool_calls=false`` (omitting the field still 400s).
-    Keep effort/summary; map aliases ChatGPT rejects (``max`` → ``xhigh``).
+    Forward ``effort``/``summary`` unchanged; Desktop/catalog own those values.
     """
     forwarded = dict(body)
     reasoning = forwarded.get("reasoning")
     if isinstance(reasoning, dict):
         updated = dict(reasoning)
         updated["context"] = CHATGPT_LITE_REASONING_CONTEXT
-        effort = updated.get("effort")
-        if isinstance(effort, str):
-            alias = CHATGPT_REASONING_EFFORT_ALIASES.get(effort.lower())
-            if alias:
-                updated["effort"] = alias
         forwarded["reasoning"] = updated
     else:
         forwarded["reasoning"] = {"context": CHATGPT_LITE_REASONING_CONTEXT}
@@ -4150,6 +4141,10 @@ def _sanitize_chatgpt_passthrough_value(value: Any) -> Any:
             sanitized = _sanitize_chatgpt_passthrough_value(item)
             if sanitized is not _DROP_ITEM:
                 output[key] = sanitized
+        if output.get("type") == "function_call":
+            return tool_translate.apply_function_call_ids(output)
+        if output.get("type") == "function_call_output":
+            return tool_translate.strip_function_call_output_item_id(output)
         return output
     return value
 
@@ -4812,13 +4807,17 @@ class ResponsesStreamState:
         state = self.tool_calls.get(index)
         if state is None:
             call_id = call.get("id") or f"call_{index}"
+            output_type = _responses_output_type_for_tool(name, self.tool_types)
+            item_id, normalized_call_id = call_id, call_id
+            if output_type == "function_call":
+                item_id, normalized_call_id = tool_translate.responses_function_call_ids(call_id)
             if _should_defer_tool_name(name):
                 self.tool_calls[index] = {
-                    "id": call_id,
-                    "call_id": call_id,
+                    "id": item_id,
+                    "call_id": normalized_call_id,
                     "name": name,
                     "arguments": fn.get("arguments") or "",
-                    "output_type": _responses_output_type_for_tool(name, self.tool_types),
+                    "output_type": output_type,
                     "closed": False,
                     "emitted": False,
                 }
@@ -4828,7 +4827,7 @@ class ResponsesStreamState:
             state = await self._open_tool(
                 response,
                 key=index,
-                call_id=call_id,
+                call_id=normalized_call_id,
                 name=tool_name,
                 namespace=namespace,
             )
@@ -5019,9 +5018,10 @@ class ResponsesStreamState:
         state = self.mcp_tool_calls.get(index)
         if state is None:
             call_id = call.get("id") or f"call_{index}"
+            item_id, normalized_call_id = tool_translate.responses_function_call_ids(call_id)
             state = {
-                "id": call_id,
-                "call_id": call_id,
+                "id": item_id,
+                "call_id": normalized_call_id,
                 "name": name or fn.get("name") or "",
                 "arguments": "",
                 "closed": False,
@@ -5454,9 +5454,12 @@ class ResponsesStreamState:
         output_index = self.next_output_index
         self.next_output_index += 1
         output_type = _responses_output_type_for_tool(name, self.tool_types)
+        item_id, normalized_call_id = call_id, call_id
+        if output_type == "function_call":
+            item_id, normalized_call_id = tool_translate.responses_function_call_ids(call_id)
         state: dict[str, Any] = {
-            "id": call_id,
-            "call_id": call_id,
+            "id": item_id,
+            "call_id": normalized_call_id,
             "name": name,
             "namespace": namespace,
             "arguments": "",
@@ -6440,11 +6443,14 @@ def _log_chatgpt_passthrough_trace(
             trace_headers[key] = value
     input_items = forwarded.get("input")
     input_count = len(input_items) if isinstance(input_items, list) else 1 if input_items else 0
+    reasoning = forwarded.get("reasoning")
+    effort = reasoning.get("effort") if isinstance(reasoning, dict) else None
     print(
         "[chatgpt-trace] "
         f"phase={phase} "
         f"previous_response_id={forwarded.get('previous_response_id')!r} "
         f"input_items={input_count} "
+        f"reasoning_effort={effort!r} "
         f"client_headers={json.dumps(trace_headers, separators=(',', ':'))} "
         f"upstream_header_keys={sorted(upstream_headers)}",
         flush=True,

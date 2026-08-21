@@ -706,6 +706,8 @@ def test_function_call_round_trip_preserves_namespace_with_sanitized_names():
     )
     assert direct["namespace"] == "mcp__exa"
     assert direct["name"] == "web_search_exa"
+    assert direct["id"] == "fc_2"
+    assert direct["call_id"] == "call_2"
 
 
 def test_web_search_call_empty_results_emits_unavailable_tool_message():

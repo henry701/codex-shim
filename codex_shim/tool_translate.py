@@ -17,6 +17,52 @@ def mcp_namespace(server: str) -> str:
     return server if server.startswith("mcp__") else f"mcp__{server}"
 
 
+def responses_function_call_ids(raw_id: str | None) -> tuple[str, str]:
+    """ChatGPT Responses Lite requires ``function_call.id`` to start with ``fc``.
+
+    ``call_id`` stays on the Chat Completions ``call_`` prefix so Desktop can
+    pair ``function_call_output.call_id`` with the originating tool call.
+    """
+    token = str(raw_id or "").strip() or "0"
+    if token.startswith("call_"):
+        suffix = token[5:] or "0"
+    elif token.startswith("fc_"):
+        suffix = token[3:] or "0"
+        if suffix.startswith("call_"):
+            suffix = suffix[5:] or "0"
+    else:
+        suffix = token
+    return f"fc_{suffix}", f"call_{suffix}"
+
+
+def apply_function_call_ids(item: dict[str, Any]) -> dict[str, Any]:
+    if item.get("type") != "function_call":
+        return item
+    raw = item.get("call_id") or item.get("id")
+    item_id, call_id = responses_function_call_ids(None if raw is None else str(raw))
+    out = dict(item)
+    out["id"] = item_id
+    out["call_id"] = call_id
+    return out
+
+
+def strip_function_call_output_item_id(item: dict[str, Any]) -> dict[str, Any]:
+    """Drop leaked ``call_``/``fc_`` ids from ``function_call_output`` items.
+
+    Lite validates ``function_call.id`` as ``fc_*``. A copied ``call_*`` string
+    on the output item's ``id`` trips the same prefix check; ``call_id`` is the
+    correlator and must stay.
+    """
+    if item.get("type") != "function_call_output":
+        return item
+    oid = item.get("id")
+    if isinstance(oid, str) and (oid.startswith("call_") or oid.startswith("fc_")):
+        out = dict(item)
+        out.pop("id", None)
+        return out
+    return item
+
+
 def parse_tool_arguments(raw_args: Any) -> dict[str, Any]:
     if isinstance(raw_args, str):
         try:
@@ -36,11 +82,12 @@ def mcp_function_call_item(
     raw_arguments: str,
     status: str,
 ) -> dict[str, Any]:
+    item_id, call_id = responses_function_call_ids(item_id)
     return {
         "id": item_id,
         "type": "function_call",
         "status": status,
-        "call_id": item_id,
+        "call_id": call_id,
         "name": tool,
         "namespace": mcp_namespace(server),
         "arguments": raw_arguments,

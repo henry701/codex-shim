@@ -79,6 +79,7 @@ set +e
 codex exec \
   -m "${MODEL}" \
   -c "openai_base_url=\"http://127.0.0.1:${PORT}/v1\"" \
+  -c "model_reasoning_effort=\"${SMOKE_REASONING_EFFORT:-max}\"" \
   -C "${WORKDIR}" \
   -s danger-full-access \
   --dangerously-bypass-approvals-and-sandbox \
