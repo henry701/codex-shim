@@ -15,9 +15,19 @@ def _disable_model_discovery_by_default(monkeypatch, request):
     monkeypatch.setattr("codex_shim.discover.fetch_nvidia_integrate_model_ids", lambda: [])
     monkeypatch.setattr("codex_shim.discover.discover_opencode_cli_ids", lambda *_args, **_kwargs: [])
     monkeypatch.setattr("codex_shim.discover.fetch_local_openai_models", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr("codex_shim.discover.fetch_nous_portal_model_ids", lambda **_kwargs: [])
     monkeypatch.setattr("codex_shim.discover.discover_chatgpt_models_from_cursor", lambda: [])
     monkeypatch.setattr("codex_shim.discover.discover_chatgpt_model_ids_from_openai_api", lambda: [])
     monkeypatch.setattr("codex_shim.discover.fetch_chatgpt_codex_backend_models", lambda **_kwargs: [])
+
+
+@pytest.fixture(autouse=True)
+def _disable_nous_portal_by_default(monkeypatch, request):
+    if request.node.get_closest_marker("nous_portal"):
+        return
+    monkeypatch.setattr("codex_shim.discover.fetch_nous_portal_model_ids", lambda **_kwargs: [], raising=False)
+    monkeypatch.setattr("codex_shim.nous_auth.refresh_nous_oauth_on_startup", lambda **_kwargs: False, raising=False)
+    monkeypatch.setattr("codex_shim.nous_auth.refresh_nous_oauth", lambda **_kwargs: False, raising=False)
 
 
 @pytest.fixture(autouse=True)

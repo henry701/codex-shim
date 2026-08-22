@@ -847,6 +847,9 @@ def _bool_text(value: object) -> str:
 
 
 def sync_desktop(settings_path: Path, port: int, model_slug: str | None = None, *, install_config: bool = False) -> int:
+    from .nous_auth import refresh_nous_oauth_on_startup
+
+    refresh_nous_oauth_on_startup()
     try:
         models = _load_models_with_budget(settings_path, SYNC_DESKTOP_BUDGET_S)
     except TimeoutError:
@@ -883,6 +886,9 @@ def sync_desktop(settings_path: Path, port: int, model_slug: str | None = None, 
 
 
 def discover_models(settings_path: Path, *, refresh: bool = False) -> int:
+    from .nous_auth import refresh_nous_oauth_on_startup
+
+    refresh_nous_oauth_on_startup()
     expanded = Path(settings_path).expanduser()
     settings_data = _load_settings_data(expanded)
     try:
@@ -1054,8 +1060,10 @@ def list_models(settings_path: Path) -> int:
 
 
 def serve_foreground(settings_path: Path, port: int) -> int:
+    from .nous_auth import refresh_nous_oauth_on_startup
     from .server import main as server_main
 
+    refresh_nous_oauth_on_startup()
     server_main(
         [
             "--settings",

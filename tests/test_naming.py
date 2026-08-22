@@ -15,6 +15,9 @@ def test_display_name_from_slug_handles_versions_and_vendors():
         "OpenCode Zen — DeepSeek V4 Flash"
     )
     assert display_name_from_slug("cursor-composer-2-5") == "Composer 2.5"
+    assert display_name_from_slug("nous-stealth-ox-alpha", label_prefix="nous") == (
+        "Nous Portal — Stealth Ox Alpha"
+    )
 
 
 def test_catalog_display_name_normalizes_explicit_zen_free_models():

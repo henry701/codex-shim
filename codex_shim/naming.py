@@ -24,6 +24,7 @@ _TOKEN_OVERRIDES = {
     "haiku": "Haiku",
     "composer": "Composer",
     "nvidia": "NVIDIA",
+    "nous": "Nous",
     "openrouter": "OpenRouter",
     "opencode": "OpenCode",
     "zen": "Zen",
@@ -79,13 +80,14 @@ def _normalize_slug_body(body: str) -> str:
 
 _CATALOG_ROUTE_PREFIXES = ("cursor-", "codex-", "oc-free-")
 
-_ROUTE_SLUG_PREFIXES = ("oc-free", "zen", "or", "nvidia", "local", "ocgo", "cursor", "codex")
+_ROUTE_SLUG_PREFIXES = ("oc-free", "zen", "or", "nvidia", "nous", "local", "ocgo", "cursor", "codex")
 
 ROUTE_LABEL_PREFIXES = {
     "zen": "OpenCode Zen",
     "oc-free": "OpenCode Zen (free)",
     "or": "OpenRouter",
     "nvidia": "NVIDIA",
+    "nous": "Nous Portal",
     "local": "Local",
     "ocgo": "OpenCode Go",
 }

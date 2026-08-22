@@ -75,14 +75,14 @@ def function_call_item_from_chat_tool(
     raw_name = fn.get("name", "")
     call_id = call.get("id", "call_0")
     original_type = original_responses_tool_type(raw_name, tool_types)
-    if original_type == "apply_patch":
+    if original_type in {"apply_patch", "custom", "freeform"}:
         return {
             "id": call_id,
             "type": "custom_tool_call",
             "status": "completed",
             "call_id": call_id,
-            "name": "apply_patch",
-            "input": fn.get("arguments", ""),
+            "name": "apply_patch" if original_type == "apply_patch" else (raw_name or "apply_patch"),
+            "input": unwrap_custom_tool_input(fn.get("arguments", "")),
         }
     if original_type.startswith("web_search"):
         return _web_search_call_item(call_id, fn.get("arguments", ""))
@@ -132,15 +132,58 @@ def responses_tool_type_map(tools: Any) -> dict[str, str]:
     return mapped
 
 
+_CUSTOM_TOOL_INPUT_KEYS = ("input", "patch")
+
+
+def unwrap_custom_tool_input(raw: Any) -> str:
+    """Codex freeform tools expect the patch text, not a JSON envelope.
+
+    Chat-completions fallbacks advertise `{input}` / `{patch}` object schemas, so
+    models often emit `{"input": "*** Begin Patch\\n..."}` even when the tool
+    description says not to wrap. Codex then rejects `function_call` JSON as
+    `apply_patch invoked with incompatible payload`.
+    """
+    if isinstance(raw, dict):
+        parsed = raw
+        text = ""
+    elif isinstance(raw, str):
+        text = raw
+        stripped = text.strip()
+        if not stripped.startswith("{") and not stripped.startswith("["):
+            return text
+        try:
+            parsed = json.loads(stripped)
+        except json.JSONDecodeError:
+            return text
+    else:
+        return "" if raw is None else str(raw)
+    if not isinstance(parsed, dict):
+        return text if isinstance(raw, str) else json.dumps(parsed)
+    for key in _CUSTOM_TOOL_INPUT_KEYS:
+        value = parsed.get(key)
+        if isinstance(value, str) and value:
+            return value
+    if len(parsed) == 1:
+        only = next(iter(parsed.values()))
+        if isinstance(only, str) and only:
+            return only
+    return text if isinstance(raw, str) else json.dumps(parsed)
+
+
 def original_responses_tool_type(name: str, tool_types: dict[str, str] | None = None) -> str:
     clean = _sanitize_tool_name(str(name or ""))
+    mapped = ""
     if tool_types and clean in tool_types:
-        return str(tool_types[clean] or "").strip().lower()
-    if clean == "apply_patch":
+        mapped = str(tool_types[clean] or "").strip().lower()
+    if clean == "apply_patch" or mapped == "apply_patch":
         return "apply_patch"
+    if mapped in {"custom", "freeform"}:
+        return "custom"
+    if mapped.startswith("web_search") or clean in {"web_search", "web_search_preview"}:
+        return "web_search"
     if clean in {"web_search", "web_search_preview"}:
         return "web_search"
-    return ""
+    return mapped
 
 
 def _web_search_call_item(call_id: str, raw_arguments: Any, status: str = "completed") -> dict[str, Any]:

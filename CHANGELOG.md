@@ -9,6 +9,20 @@ and this project does not yet follow semantic versioning (pre-1.0).
 
 ### Added
 
+- `nous` / `nous-*` matches Hermes Agent Nous Portal: inference at
+  `https://inference-api.nousresearch.com/v1`, `NOUS_API_KEY` or the OAuth JWT
+  in `~/.hermes/auth.json`. `serve` / `sync-desktop` / `discover` force-refresh
+  the device-code grant on startup (same `/api/oauth/token` +
+  `x-nous-refresh-token` shape as Hermes CLI) and persist the rotated refresh
+  token immediately. Hermes Referer / X-Title as setdefaults. Catalog listing
+  is Portal `/v1/models` plus `stealth/ox-alpha`.
+
+- `zen_public` / `oc-free-*` now matches hermes-cli OpenCode Free: models.dev
+  listing, keyless `https://opencode.ai/zen/v1` chat (no `Authorization`; the
+  internal `public` sentinel is not sent), and Hermes `HTTP-Referer` / `X-Title`
+  as setdefaults. Desktop's User-Agent still wins. `big-pickle` may 429 under
+  that UA.
+
 - ChatGPT passthrough catalog prefers live
   `https://chatgpt.com/backend-api/codex/models?client_version=…` using the Codex
   OAuth token in `~/.codex/auth.json` (retries with exponential backoff via
@@ -31,6 +45,14 @@ and this project does not yet follow semantic versioning (pre-1.0).
   at ≥90% disk points at this command.
 
 ### Fixed
+
+- BYOK `apply_patch` is a Codex freeform custom tool. When the client advertises
+  it as `type: custom` or `type: function`, the shim previously echoed a
+  `function_call` with JSON `{"input": "..."}`. Codex then fatals with
+  `apply_patch invoked with incompatible payload`. Name `apply_patch` (and other
+  `custom`/`freeform` tools) now round-trip as `custom_tool_call`, JSON
+  `{input}`/`{patch}` envelopes are unwrapped, and stream events use
+  `custom_tool_call_input` instead of `function_call_arguments`.
 
 - ChatGPT Lite rejects ``function_call.id`` values that start with ``call_``
   (``invalid_id_prefix``, expected ``fc``). Cursor-bridge and BYOK translation
