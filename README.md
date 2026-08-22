@@ -142,7 +142,7 @@ persist the rotated refresh token immediately — those tokens are single-use.
 The shim updates `providers.nous` only and does not change Hermes
 `active_provider`.
 Hermes `HTTP-Referer` / `X-Title` are setdefaults; Desktop's User-Agent still
-wins. Listing uses Portal `/v1/models` and always includes `stealth/ox-alpha`.
+wins. Listing uses inference `/v1/models` and always includes `stealth/ox-alpha`.
 
 ---
 

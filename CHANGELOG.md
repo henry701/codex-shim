@@ -15,7 +15,7 @@ and this project does not yet follow semantic versioning (pre-1.0).
   the device-code grant on startup (same `/api/oauth/token` +
   `x-nous-refresh-token` shape as Hermes CLI) and persist the rotated refresh
   token immediately. Hermes Referer / X-Title as setdefaults. Catalog listing
-  is Portal `/v1/models` plus `stealth/ox-alpha`.
+  is inference `/v1/models` plus `stealth/ox-alpha`.
 
 - `zen_public` / `oc-free-*` now matches hermes-cli OpenCode Free: models.dev
   listing, keyless `https://opencode.ai/zen/v1` chat (no `Authorization`; the

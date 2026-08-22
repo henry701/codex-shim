@@ -485,14 +485,3 @@ def _atomic_write_json_pair(
                 except OSError:
                     pass
 
-
-def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
-    tmp = _stage_json(path, payload)
-    try:
-        _commit_staged(tmp, path)
-    finally:
-        if tmp.exists():
-            try:
-                tmp.unlink()
-            except OSError:
-                pass
