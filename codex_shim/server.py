@@ -4222,17 +4222,16 @@ def _tool_call_arguments_complete(tc: dict[str, Any], *, at_stream_end: bool = F
     args = tc.get("arguments") or ""
     if not isinstance(args, str) or not args.strip():
         return False
+    stripped = args.strip()
+    looks_json = stripped.startswith("{") or stripped.startswith("[")
+    if looks_json:
+        try:
+            json.loads(args)
+        except json.JSONDecodeError:
+            return False
+        return True
     if tc.get("output_type") == "custom_tool_call":
-        if at_stream_end:
-            return True
-        stripped = args.strip()
-        if stripped.startswith("{") or stripped.startswith("["):
-            try:
-                json.loads(args)
-            except json.JSONDecodeError:
-                return False
-            return True
-        return False
+        return at_stream_end
     try:
         json.loads(args)
     except json.JSONDecodeError:

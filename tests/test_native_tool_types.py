@@ -154,8 +154,41 @@ def test_unwrap_custom_tool_input_strips_json_envelope():
     assert unwrap_custom_tool_input(json.dumps({"input": raw})) == raw
     assert unwrap_custom_tool_input(json.dumps({"patch": raw})) == raw
     assert unwrap_custom_tool_input(raw) == raw
+    assert unwrap_custom_tool_input(json.dumps({"foo": "bar"})) == json.dumps({"foo": "bar"})
     assert original_responses_tool_type("apply_patch", {"apply_patch": "function"}) == "apply_patch"
     assert original_responses_tool_type("apply_patch", {"apply_patch": "custom"}) == "apply_patch"
+
+
+async def test_streaming_truncated_json_apply_patch_is_not_closed():
+    downstream = FakeResponse()
+    state = ResponsesStreamState("local", tool_types={"apply_patch": "function"})
+    envelope = json.dumps({"input": "*** Begin Patch\n*** Add File: snake.html\n+hi\n*** End Patch"})
+    truncated = envelope[:18]
+    await state.start(downstream)
+    await state.write_chat_delta(
+        downstream,
+        {
+            "choices": [
+                {
+                    "delta": {
+                        "tool_calls": [
+                            {
+                                "index": 0,
+                                "id": "call_patch",
+                                "function": {"name": "apply_patch", "arguments": truncated},
+                            }
+                        ]
+                    }
+                }
+            ]
+        },
+    )
+    await state.finish(downstream, upstream_saw_done=True)
+
+    events = _sse_events(b"".join(downstream.chunks))
+    assert not any(event.get("type") == "response.custom_tool_call_input.done" for event in events)
+    assert not any(event.get("type") == "response.completed" for event in events)
+    assert any(event.get("type") == "response.incomplete" for event in events)
 
 
 async def test_streaming_apply_patch_with_function_tool_type_emits_custom_tool_call():

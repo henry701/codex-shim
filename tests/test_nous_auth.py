@@ -6,6 +6,7 @@ from urllib.parse import parse_qs
 
 import pytest
 
+from codex_shim import nous_auth
 from codex_shim.discover import (
     NOUS_PORTAL_TEMPLATE,
     discover_byok_models,
@@ -21,7 +22,7 @@ from codex_shim.nous_auth import (
 from codex_shim.settings import byok_model_has_credentials
 
 
-pytestmark = [pytest.mark.enable_model_discovery, pytest.mark.nous_portal]
+pytestmark = [pytest.mark.nous_portal]
 
 
 def _write_auth(path: Path, *, access: str = "", agent: str = "", api_key: str = "") -> None:
@@ -111,7 +112,18 @@ def test_discover_nous_portal_ox_alpha_from_hermes_auth(tmp_path, monkeypatch):
         "codex_shim.discover.fetch_http_json",
         lambda *_args, **_kwargs: {"data": [{"id": "stealth/ox-alpha"}]},
     )
-    models = discover_byok_models([], settings_data={"discover": {"zen_public": False, "zen": False, "openrouter_free": False, "nvidia_integrate": False}})
+    models = discover_byok_models(
+        [],
+        settings_data={
+            "discover": {
+                "zen_public": False,
+                "zen": False,
+                "openrouter_free": False,
+                "nvidia_integrate": False,
+                "nous": True,
+            }
+        },
+    )
     route = next(model for model in models if model.model == "stealth/ox-alpha")
     assert route.slug == "nous-stealth-ox-alpha"
     assert route.base_url.rstrip("/") == "https://inference-api.nousresearch.com/v1"
@@ -199,7 +211,7 @@ def test_refresh_nous_oauth_skips_without_refresh_token(tmp_path, monkeypatch):
 
     (tmp_path / "auth.json").write_text(json.dumps({"providers": {"nous": {"access_token": "eyJ-only"}}}))
     monkeypatch.setattr("codex_shim.nous_auth.urlopen", boom)
-    assert refresh_nous_oauth(hermes_dir=tmp_path) is False
+    assert refresh_nous_oauth(hermes_dir=tmp_path) is True
     assert calls["n"] == 0
 
 
@@ -233,3 +245,175 @@ def test_refresh_nous_oauth_on_startup_is_once_per_process(tmp_path, monkeypatch
     assert calls["n"] == 1
     nous = json.loads((tmp_path / "auth.json").read_text())["providers"]["nous"]
     assert nous["refresh_token"] == "rt_1"
+
+
+def test_refresh_nous_oauth_does_not_steal_active_provider(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    (tmp_path / "auth.json").write_text(
+        json.dumps(
+            {
+                "active_provider": "openai",
+                "providers": {
+                    "openai": {"api_key": "sk-keep"},
+                    "nous": {
+                        "access_token": "eyJ-old",
+                        "refresh_token": "rt_must_not_be_used_as_bearer",
+                        "client_id": "hermes-cli",
+                    },
+                },
+            }
+        )
+    )
+
+    def fake_urlopen(request, timeout=None):
+        return _TokenResponse({"access_token": "eyJ-new", "refresh_token": "rt_new", "expires_in": 60})
+
+    monkeypatch.setattr("codex_shim.nous_auth.urlopen", fake_urlopen)
+    assert refresh_nous_oauth(hermes_dir=tmp_path) is True
+    store = json.loads((tmp_path / "auth.json").read_text())
+    assert store["active_provider"] == "openai"
+    assert store["providers"]["openai"] == {"api_key": "sk-keep"}
+    assert store["providers"]["nous"]["refresh_token"] == "rt_new"
+
+
+def test_refresh_nous_oauth_refuses_corrupt_auth_json(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    (tmp_path / "auth.json").write_text("{not-json")
+    shared = tmp_path / "shared" / "nous_auth.json"
+    shared.parent.mkdir(parents=True)
+    shared.write_text(json.dumps({"refresh_token": "rt_shared", "access_token": "eyJ-shared"}))
+    calls = {"n": 0}
+
+    def boom(*_args, **_kwargs):
+        calls["n"] += 1
+        raise AssertionError("must not consume refresh_token when auth.json is unreadable")
+
+    monkeypatch.setattr("codex_shim.nous_auth.urlopen", boom)
+    assert refresh_nous_oauth(hermes_dir=tmp_path) is False
+    assert calls["n"] == 0
+    assert (tmp_path / "auth.json").read_text() == "{not-json"
+
+
+def test_refresh_nous_oauth_on_startup_retries_after_http_error(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _write_auth(tmp_path / "auth.json", access="eyJ-old")
+    reset_nous_oauth_startup_state()
+    calls = {"n": 0}
+
+    def flaky_urlopen(request, timeout=None):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise OSError("portal down")
+        return _TokenResponse({"access_token": "eyJ-new", "refresh_token": "rt_new", "expires_in": 60})
+
+    monkeypatch.setattr("codex_shim.nous_auth.urlopen", flaky_urlopen)
+    assert refresh_nous_oauth_on_startup(hermes_dir=tmp_path) is False
+    assert refresh_nous_oauth_on_startup(hermes_dir=tmp_path) is True
+    assert calls["n"] == 2
+    nous = json.loads((tmp_path / "auth.json").read_text())["providers"]["nous"]
+    assert nous["refresh_token"] == "rt_new"
+
+
+def test_refresh_retries_persist_after_http_success(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _write_auth(tmp_path / "auth.json", access="eyJ-old")
+    calls = {"n": 0}
+    writes = {"n": 0}
+    real_write = nous_auth._atomic_write_json
+
+    def fake_urlopen(request, timeout=None):
+        calls["n"] += 1
+        return _TokenResponse({"access_token": "eyJ-new", "refresh_token": "rt_new", "expires_in": 60})
+
+    def flaky_write(path, payload):
+        writes["n"] += 1
+        if writes["n"] == 1:
+            raise OSError("ENOSPC")
+        return real_write(path, payload)
+
+    monkeypatch.setattr("codex_shim.nous_auth.urlopen", fake_urlopen)
+    monkeypatch.setattr("codex_shim.nous_auth._atomic_write_json", flaky_write)
+    assert refresh_nous_oauth(hermes_dir=tmp_path) is True
+    assert calls["n"] == 1
+    nous = json.loads((tmp_path / "auth.json").read_text())["providers"]["nous"]
+    assert nous["refresh_token"] == "rt_new"
+
+
+def test_refresh_does_not_reexchange_when_persist_still_pending(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _write_auth(tmp_path / "auth.json", access="eyJ-old")
+    reset_nous_oauth_startup_state()
+    calls = {"n": 0}
+    fail_writes = {"on": True}
+    real_write = nous_auth._atomic_write_json
+
+    def fake_urlopen(request, timeout=None):
+        calls["n"] += 1
+        return _TokenResponse({"access_token": "eyJ-new", "refresh_token": "rt_new", "expires_in": 60})
+
+    def maybe_write(path, payload):
+        if fail_writes["on"]:
+            raise OSError("ENOSPC")
+        return real_write(path, payload)
+
+    monkeypatch.setattr("codex_shim.nous_auth.urlopen", fake_urlopen)
+    monkeypatch.setattr("codex_shim.nous_auth._atomic_write_json", maybe_write)
+    assert refresh_nous_oauth(hermes_dir=tmp_path) is False
+    assert calls["n"] == 1
+    assert json.loads((tmp_path / "auth.json").read_text())["providers"]["nous"]["refresh_token"] == (
+        "rt_must_not_be_used_as_bearer"
+    )
+    fail_writes["on"] = False
+    assert refresh_nous_oauth(hermes_dir=tmp_path) is True
+    assert calls["n"] == 1
+    nous = json.loads((tmp_path / "auth.json").read_text())["providers"]["nous"]
+    assert nous["refresh_token"] == "rt_new"
+
+
+def test_refresh_persists_rotated_refresh_token_without_access_token(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _write_auth(tmp_path / "auth.json", access="eyJ-old")
+
+    def fake_urlopen(request, timeout=None):
+        return _TokenResponse({"access_token": "", "refresh_token": "rt_rotated"})
+
+    monkeypatch.setattr("codex_shim.nous_auth.urlopen", fake_urlopen)
+    assert refresh_nous_oauth(hermes_dir=tmp_path) is False
+    nous = json.loads((tmp_path / "auth.json").read_text())["providers"]["nous"]
+    assert nous["refresh_token"] == "rt_rotated"
+
+
+def test_resolve_and_refresh_honor_hermes_shared_auth_dir(tmp_path, monkeypatch):
+    monkeypatch.delenv("NOUS_API_KEY", raising=False)
+    home = tmp_path / "profile"
+    shared_dir = tmp_path / "elsewhere"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_SHARED_AUTH_DIR", str(shared_dir))
+    shared_dir.mkdir()
+    (shared_dir / "nous_auth.json").write_text(json.dumps({"access_token": "eyJ-shared-override"}))
+    assert resolve_nous_api_key() == "eyJ-shared-override"
+
+    _write_auth(home / "auth.json", access="eyJ-old")
+
+    def fake_urlopen(request, timeout=None):
+        return _TokenResponse({"access_token": "eyJ-new", "refresh_token": "rt_new", "expires_in": 60})
+
+    monkeypatch.setattr("codex_shim.nous_auth.urlopen", fake_urlopen)
+    assert refresh_nous_oauth(hermes_dir=home) is True
+    assert json.loads((shared_dir / "nous_auth.json").read_text())["refresh_token"] == "rt_new"
+    assert not (home / "shared" / "nous_auth.json").exists()
+
+
+def test_refresh_refuses_live_hermes_home_during_pytest(monkeypatch):
+    live = Path.home() / ".hermes"
+    monkeypatch.setenv("HERMES_HOME", str(live))
+    calls = {"n": 0}
+
+    def boom(*_args, **_kwargs):
+        calls["n"] += 1
+        raise AssertionError("must not refresh the live Hermes grant in pytest")
+
+    monkeypatch.setattr("codex_shim.nous_auth.urlopen", boom)
+    with pytest.raises(RuntimeError, match="live Hermes"):
+        refresh_nous_oauth(hermes_dir=live)
+    assert calls["n"] == 0

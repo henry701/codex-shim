@@ -163,10 +163,6 @@ def unwrap_custom_tool_input(raw: Any) -> str:
         value = parsed.get(key)
         if isinstance(value, str) and value:
             return value
-    if len(parsed) == 1:
-        only = next(iter(parsed.values()))
-        if isinstance(only, str) and only:
-            return only
     return text if isinstance(raw, str) else json.dumps(parsed)
 
 

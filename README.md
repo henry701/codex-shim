@@ -135,10 +135,12 @@ Paid `zen` is unchanged and still sends `OPENCODE_API_KEY`.
 `nous` (slug prefix `nous-`) is the Hermes Agent Nous Portal path:
 `https://inference-api.nousresearch.com/v1`. Auth is `NOUS_API_KEY` (static
 `sk-nous-…` key) or, if that env var is empty, the OAuth JWT in
-`~/.hermes/auth.json` / `~/.hermes/shared/nous_auth.json`. `serve`,
-`sync-desktop`, and `discover` force-refresh that OAuth grant on startup
+`~/.hermes/auth.json` or `HERMES_SHARED_AUTH_DIR` / `~/.hermes/shared/nous_auth.json`.
+`serve`, `sync-desktop`, and `discover` force-refresh that OAuth grant on startup
 (Hermes device-code `/api/oauth/token` with `x-nous-refresh-token`) and
 persist the rotated refresh token immediately — those tokens are single-use.
+The shim updates `providers.nous` only and does not change Hermes
+`active_provider`.
 Hermes `HTTP-Referer` / `X-Title` are setdefaults; Desktop's User-Agent still
 wins. Listing uses Portal `/v1/models` and always includes `stealth/ox-alpha`.
 
