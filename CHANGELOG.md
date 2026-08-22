@@ -57,7 +57,8 @@ and this project does not yet follow semantic versioning (pre-1.0).
   successful persist (or when there is no refresh token). HTTP failures
   retry on the next serve/sync/discover call. Corrupt `auth.json` is not
   rewritten. Hermes `active_provider` is left unchanged. The shared store
-  follows `HERMES_SHARED_AUTH_DIR` and is locked as `nous_auth.json.lock`.
+  follows `HERMES_SHARED_AUTH_DIR` and is locked as `nous_auth.lock` after
+  Hermes' `auth.lock`.
 
 - BYOK `apply_patch` is a Codex freeform custom tool. When the client advertises
   it as `type: custom` or `type: function`, the shim previously echoed a

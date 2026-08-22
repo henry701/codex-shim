@@ -4678,7 +4678,7 @@ class ResponsesStreamState:
             if mcp_search.parse_mcp_tool_reference(state.get("name") or ""):
                 continue
             if _tool_call_arguments_complete(state, at_stream_end=True):
-                await self._close_tool(response, state)
+                await self._close_tool(response, state, at_stream_end=True)
         for state in sorted(self.mcp_tool_calls.values(), key=lambda s: s["output_index"]):
             if not state.get("closed") and _tool_call_arguments_complete(state):
                 await self._close_mcp_tool(response, state)
@@ -5500,10 +5500,15 @@ class ResponsesStreamState:
         )
         return state
 
-    async def _close_tool(self, response: web.StreamResponse, state: dict[str, Any]) -> None:
+    async def _close_tool(
+        self,
+        response: web.StreamResponse,
+        state: dict[str, Any],
+        *,
+        at_stream_end: bool = False,
+    ) -> None:
         if state.get("closed"):
             return
-        at_stream_end = state.get("output_type") == "custom_tool_call"
         if not _tool_call_arguments_complete(state, at_stream_end=at_stream_end):
             return
         state["closed"] = True

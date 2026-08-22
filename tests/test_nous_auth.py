@@ -198,6 +198,10 @@ def test_refresh_nous_oauth_rotates_and_persists_tokens(tmp_path, monkeypatch):
     assert shared["access_token"] == "eyJ-new"
     assert shared["refresh_token"] == "rt_new"
     assert (tmp_path / "auth.json").stat().st_mode & 0o777 == 0o600
+    assert (tmp_path / "auth.lock").exists()
+    assert (tmp_path / "shared" / "nous_auth.lock").exists()
+    assert not (tmp_path / "auth.json.lock").exists()
+    assert not (tmp_path / "shared" / "nous_auth.json.lock").exists()
     assert resolve_nous_api_key() == "eyJ-new"
 
 
@@ -319,20 +323,20 @@ def test_refresh_retries_persist_after_http_success(tmp_path, monkeypatch):
     _write_auth(tmp_path / "auth.json", access="eyJ-old")
     calls = {"n": 0}
     writes = {"n": 0}
-    real_write = nous_auth._atomic_write_json
+    real_write = nous_auth._atomic_write_json_pair
 
     def fake_urlopen(request, timeout=None):
         calls["n"] += 1
         return _TokenResponse({"access_token": "eyJ-new", "refresh_token": "rt_new", "expires_in": 60})
 
-    def flaky_write(path, payload):
+    def flaky_write(auth_path, store, shared_path, shared):
         writes["n"] += 1
         if writes["n"] == 1:
             raise OSError("ENOSPC")
-        return real_write(path, payload)
+        return real_write(auth_path, store, shared_path, shared)
 
     monkeypatch.setattr("codex_shim.nous_auth.urlopen", fake_urlopen)
-    monkeypatch.setattr("codex_shim.nous_auth._atomic_write_json", flaky_write)
+    monkeypatch.setattr("codex_shim.nous_auth._atomic_write_json_pair", flaky_write)
     assert refresh_nous_oauth(hermes_dir=tmp_path) is True
     assert calls["n"] == 1
     nous = json.loads((tmp_path / "auth.json").read_text())["providers"]["nous"]
@@ -345,19 +349,19 @@ def test_refresh_does_not_reexchange_when_persist_still_pending(tmp_path, monkey
     reset_nous_oauth_startup_state()
     calls = {"n": 0}
     fail_writes = {"on": True}
-    real_write = nous_auth._atomic_write_json
+    real_write = nous_auth._atomic_write_json_pair
 
     def fake_urlopen(request, timeout=None):
         calls["n"] += 1
         return _TokenResponse({"access_token": "eyJ-new", "refresh_token": "rt_new", "expires_in": 60})
 
-    def maybe_write(path, payload):
+    def maybe_write(auth_path, store, shared_path, shared):
         if fail_writes["on"]:
             raise OSError("ENOSPC")
-        return real_write(path, payload)
+        return real_write(auth_path, store, shared_path, shared)
 
     monkeypatch.setattr("codex_shim.nous_auth.urlopen", fake_urlopen)
-    monkeypatch.setattr("codex_shim.nous_auth._atomic_write_json", maybe_write)
+    monkeypatch.setattr("codex_shim.nous_auth._atomic_write_json_pair", maybe_write)
     assert refresh_nous_oauth(hermes_dir=tmp_path) is False
     assert calls["n"] == 1
     assert json.loads((tmp_path / "auth.json").read_text())["providers"]["nous"]["refresh_token"] == (
@@ -417,3 +421,55 @@ def test_refresh_refuses_live_hermes_home_during_pytest(monkeypatch):
     with pytest.raises(RuntimeError, match="live Hermes"):
         refresh_nous_oauth(hermes_dir=live)
     assert calls["n"] == 0
+
+
+def test_refresh_retries_shared_commit_after_auth_json_lands(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _write_auth(tmp_path / "auth.json", access="eyJ-old")
+    calls = {"n": 0}
+    shared_fails = {"n": 0}
+    real_commit = nous_auth._commit_staged
+
+    def fake_urlopen(request, timeout=None):
+        calls["n"] += 1
+        return _TokenResponse({"access_token": "eyJ-new", "refresh_token": "rt_new", "expires_in": 60})
+
+    def flaky_commit(tmp, dest):
+        dest = Path(dest)
+        if dest.name == "nous_auth.json" and shared_fails["n"] == 0:
+            shared_fails["n"] += 1
+            raise OSError("ENOSPC")
+        return real_commit(tmp, dest)
+
+    monkeypatch.setattr("codex_shim.nous_auth.urlopen", fake_urlopen)
+    monkeypatch.setattr("codex_shim.nous_auth._commit_staged", flaky_commit)
+    assert refresh_nous_oauth(hermes_dir=tmp_path) is True
+    assert calls["n"] == 1
+    assert shared_fails["n"] == 1
+    assert json.loads((tmp_path / "auth.json").read_text())["providers"]["nous"]["refresh_token"] == "rt_new"
+    assert json.loads((tmp_path / "shared" / "nous_auth.json").read_text())["refresh_token"] == "rt_new"
+
+
+def test_resolve_uses_pending_access_token_when_persist_fails(tmp_path, monkeypatch):
+    monkeypatch.delenv("NOUS_API_KEY", raising=False)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _write_auth(tmp_path / "auth.json", access="eyJ-old")
+    fail_writes = {"on": True}
+    real_write = nous_auth._atomic_write_json_pair
+
+    def fake_urlopen(request, timeout=None):
+        return _TokenResponse({"access_token": "eyJ-new", "refresh_token": "rt_new", "expires_in": 60})
+
+    def maybe_write(auth_path, store, shared_path, shared):
+        if fail_writes["on"]:
+            raise OSError("ENOSPC")
+        return real_write(auth_path, store, shared_path, shared)
+
+    monkeypatch.setattr("codex_shim.nous_auth.urlopen", fake_urlopen)
+    monkeypatch.setattr("codex_shim.nous_auth._atomic_write_json_pair", maybe_write)
+    assert refresh_nous_oauth(hermes_dir=tmp_path) is False
+    assert json.loads((tmp_path / "auth.json").read_text())["providers"]["nous"]["access_token"] == "eyJ-old"
+    assert resolve_nous_api_key() == "eyJ-new"
+    fail_writes["on"] = False
+    assert resolve_nous_api_key() == "eyJ-new"
+    assert json.loads((tmp_path / "auth.json").read_text())["providers"]["nous"]["refresh_token"] == "rt_new"

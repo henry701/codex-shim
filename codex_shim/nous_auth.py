@@ -78,6 +78,13 @@ def resolve_nous_api_key(
     from_env = str(env.get("NOUS_API_KEY") or "").strip()
     if from_env:
         return from_env
+    if _pending_persist is not None:
+        _flush_pending_persist()
+    pending = _pending_persist
+    if pending is not None:
+        token = _token_from_mapping(pending.store) or _first_token(pending.shared)
+        if token:
+            return token
     home = hermes_dir if hermes_dir is not None else hermes_home(environ=env)
     for path in (home / "auth.json", shared_nous_auth_path(environ=env, hermes_dir=home)):
         token = _token_from_auth_file(path)
@@ -248,8 +255,7 @@ def _persist_rotated(
     last_exc: OSError | None = None
     for _attempt in range(_PERSIST_ATTEMPTS):
         try:
-            _atomic_write_json(auth_path, store)
-            _atomic_write_json(shared_path, shared)
+            _atomic_write_json_pair(auth_path, store, shared_path, shared)
             _pending_persist = None
             return True
         except OSError as exc:
@@ -423,23 +429,67 @@ def _exclusive_file_lock(lock_path: Path, timeout: float = AUTH_LOCK_TIMEOUT_SEC
 
 @contextmanager
 def _auth_locks(home: Path, shared_path: Path) -> Iterator[None]:
-    with _exclusive_file_lock(home / "auth.json.lock"):
+    with _exclusive_file_lock((home / "auth.json").with_suffix(".lock")):
         with _exclusive_file_lock(shared_path.with_suffix(".lock")):
             yield
 
 
-def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
+def _stage_json(path: Path, payload: dict[str, Any]) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(f"{path.name}.tmp.{os.getpid()}")
+    tmp = path.with_name(f"{path.name}.tmp.{os.getpid()}.{time.monotonic_ns()}")
     fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2)
+        handle.write("\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    return tmp
+
+
+def _commit_staged(tmp: Path, dest: Path) -> None:
+    os.replace(tmp, dest)
+    os.chmod(dest, 0o600)
+
+
+def _atomic_write_json_pair(
+    auth_path: Path,
+    store: dict[str, Any],
+    shared_path: Path,
+    shared: dict[str, Any],
+) -> None:
+    auth_tmp = _stage_json(auth_path, store)
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            json.dump(payload, handle, indent=2)
-            handle.write("\n")
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(tmp, path)
-        os.chmod(path, 0o600)
+        shared_tmp = _stage_json(shared_path, shared)
+    except Exception:
+        if auth_tmp.exists():
+            try:
+                auth_tmp.unlink()
+            except OSError:
+                pass
+        raise
+    try:
+        _commit_staged(auth_tmp, auth_path)
+        last_exc: OSError | None = None
+        for _attempt in range(_PERSIST_ATTEMPTS):
+            try:
+                _commit_staged(shared_tmp, shared_path)
+                return
+            except OSError as exc:
+                last_exc = exc
+        raise last_exc or OSError(f"failed to persist {shared_path}")
+    finally:
+        for tmp in (auth_tmp, shared_tmp):
+            if tmp.exists():
+                try:
+                    tmp.unlink()
+                except OSError:
+                    pass
+
+
+def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
+    tmp = _stage_json(path, payload)
+    try:
+        _commit_staged(tmp, path)
     finally:
         if tmp.exists():
             try:

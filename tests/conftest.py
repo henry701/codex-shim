@@ -7,6 +7,13 @@ import pytest
 def _isolate_hermes_auth_paths(monkeypatch, tmp_path_factory):
     # Refresh tokens are single-use. Tests must never read or rotate ~/.hermes.
     home = tmp_path_factory.mktemp("hermes-home")
+    for key in (
+        "HERMES_SHARED_AUTH_DIR",
+        "NOUS_API_KEY",
+        "HERMES_PORTAL_BASE_URL",
+        "NOUS_PORTAL_BASE_URL",
+    ):
+        monkeypatch.delenv(key, raising=False)
     monkeypatch.setenv("HERMES_HOME", str(home))
 
 
