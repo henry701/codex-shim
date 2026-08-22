@@ -6,6 +6,7 @@ import pytest
 
 from codex_shim.discover import (
     LocalModelRecord,
+    ZEN_PUBLIC_TEMPLATE,
     _catalog_slug_for_model,
     _parse_models_dev_opencode_free_ids,
     _parse_models_dev_opencode_paid_ids,
@@ -21,7 +22,7 @@ from codex_shim.discover import (
     merge_discovered_models,
     refresh_local_explicit_models,
 )
-from codex_shim.settings import ShimModel
+from codex_shim.settings import ShimModel, byok_model_has_credentials
 
 
 def _zen_template() -> ShimModel:
@@ -110,6 +111,30 @@ def test_discover_byok_models_adds_zen_public_models(monkeypatch):
     assert "oc-free-deepseek-v4-flash-free" in slugs
     assert "oc-free-minimax-m3-free" not in slugs
     assert "zen-kimi-k2-6" not in slugs
+
+
+def test_discovered_zen_public_is_keyless_with_hermes_attribution(monkeypatch):
+    monkeypatch.setattr(
+        "codex_shim.discover.fetch_models_dev_opencode_free_model_ids",
+        lambda: ["laguna-s-2.1-free"],
+    )
+    models = discover_byok_models([])
+    route = next(model for model in models if model.model == "laguna-s-2.1-free")
+    assert route.slug == "oc-free-laguna-s-2-1-free"
+    assert route.api_key == "public"
+    assert byok_model_has_credentials(route)
+    assert route.extra_headers["HTTP-Referer"] == "https://hermes-agent.nousresearch.com"
+    assert route.extra_headers["X-Title"] == "Hermes Agent"
+    assert "User-Agent" not in route.extra_headers
+    assert "Authorization" not in route.extra_headers
+
+
+def test_zen_public_template_has_hermes_attribution_without_user_agent():
+    assert ZEN_PUBLIC_TEMPLATE.api_key == "public"
+    assert ZEN_PUBLIC_TEMPLATE.extra_headers["HTTP-Referer"] == "https://hermes-agent.nousresearch.com"
+    assert ZEN_PUBLIC_TEMPLATE.extra_headers["X-Title"] == "Hermes Agent"
+    assert "User-Agent" not in ZEN_PUBLIC_TEMPLATE.extra_headers
+    assert "Authorization" not in ZEN_PUBLIC_TEMPLATE.extra_headers
 
 
 def test_parse_models_dev_opencode_paid_ids_skips_free_and_deprecated():

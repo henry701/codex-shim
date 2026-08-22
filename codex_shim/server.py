@@ -145,6 +145,7 @@ from .translate import (
     responses_tool_resolve_map,
     original_responses_tool_type,
     resolve_namespaced_tool_name,
+    unwrap_custom_tool_input,
     _chat_finish_to_anthropic_stop,
     _responses_usage_to_anthropic_usage,
 )
@@ -4214,15 +4215,23 @@ def _iter_reasoning_delta_chunks(text: str, chunk_size: int = _REASONING_DELTA_C
     return chunks
 
 
-def _tool_call_arguments_complete(tc: dict[str, Any]) -> bool:
+def _tool_call_arguments_complete(tc: dict[str, Any], *, at_stream_end: bool = False) -> bool:
     name = tc.get("name") or ""
     if not name:
         return False
     args = tc.get("arguments") or ""
     if not isinstance(args, str) or not args.strip():
         return False
-    if tc.get("output_type") == "custom_tool_call":
+    stripped = args.strip()
+    looks_json = stripped.startswith("{") or stripped.startswith("[")
+    if looks_json:
+        try:
+            json.loads(args)
+        except json.JSONDecodeError:
+            return False
         return True
+    if tc.get("output_type") == "custom_tool_call":
+        return at_stream_end
     try:
         json.loads(args)
     except json.JSONDecodeError:
@@ -4232,7 +4241,7 @@ def _tool_call_arguments_complete(tc: dict[str, Any]) -> bool:
 
 def _responses_output_type_for_tool(name: str, tool_types: dict[str, str] | None = None) -> str:
     original_type = original_responses_tool_type(name, tool_types)
-    if original_type == "apply_patch":
+    if original_type in {"apply_patch", "custom", "freeform"}:
         return "custom_tool_call"
     if original_type.startswith("web_search"):
         return "web_search_call"
@@ -4248,7 +4257,7 @@ def _stream_tool_added_item(state: dict[str, Any], status: str = "in_progress") 
             "status": status,
             "call_id": state["call_id"],
             "name": state["name"],
-            "input": "" if status == "in_progress" else state.get("arguments", ""),
+            "input": "" if status == "in_progress" else unwrap_custom_tool_input(state.get("arguments", "")),
         }
     if output_type == "web_search_call":
         return _web_search_stream_item(state, status)
@@ -4263,6 +4272,36 @@ def _stream_tool_added_item(state: dict[str, Any], status: str = "in_progress") 
     if state.get("namespace"):
         item["namespace"] = state["namespace"]
     return item
+
+
+def _tool_argument_delta_payload(state: dict[str, Any], delta: str) -> dict[str, Any] | None:
+    if not delta:
+        return None
+    output_type = state.get("output_type", "function_call")
+    if output_type == "custom_tool_call":
+        args = str(state.get("arguments") or "")
+        stripped = args.lstrip()
+        if stripped.startswith("{") or stripped.startswith("["):
+            return None
+        return {
+            "type": "response.custom_tool_call_input.delta",
+            "item_id": state["id"],
+            "output_index": state["output_index"],
+            "delta": delta,
+        }
+    if output_type == "web_search_call":
+        return {
+            "type": "response.function_call_arguments.delta",
+            "item_id": state["id"],
+            "output_index": state["output_index"],
+            "delta": delta,
+        }
+    return {
+        "type": "response.function_call_arguments.delta",
+        "item_id": state["id"],
+        "output_index": state["output_index"],
+        "delta": delta,
+    }
 
 
 def _web_search_stream_item(state: dict[str, Any], status: str) -> dict[str, Any]:
@@ -4638,8 +4677,8 @@ class ResponsesStreamState:
                 continue
             if mcp_search.parse_mcp_tool_reference(state.get("name") or ""):
                 continue
-            if _tool_call_arguments_complete(state):
-                await self._close_tool(response, state)
+            if _tool_call_arguments_complete(state, at_stream_end=True):
+                await self._close_tool(response, state, at_stream_end=True)
         for state in sorted(self.mcp_tool_calls.values(), key=lambda s: s["output_index"]):
             if not state.get("closed") and _tool_call_arguments_complete(state):
                 await self._close_mcp_tool(response, state)
@@ -4835,15 +4874,9 @@ class ResponsesStreamState:
             arg_delta = fn.get("arguments") or ""
             if arg_delta:
                 state["arguments"] = arg_delta
-                await _write_sse(
-                    response,
-                    {
-                        "type": "response.function_call_arguments.delta",
-                        "item_id": state["id"],
-                        "output_index": state["output_index"],
-                        "delta": arg_delta,
-                    },
-                )
+                payload = _tool_argument_delta_payload(state, arg_delta)
+                if payload is not None:
+                    await _write_sse(response, payload)
         else:
             if fn.get("name"):
                 state["name"] = name
@@ -4856,15 +4889,9 @@ class ResponsesStreamState:
                 if state is None or not state.get("emitted"):
                     return
             if arg_delta:
-                await _write_sse(
-                    response,
-                    {
-                        "type": "response.function_call_arguments.delta",
-                        "item_id": state["id"],
-                        "output_index": state["output_index"],
-                        "delta": arg_delta,
-                    },
-                )
+                payload = _tool_argument_delta_payload(state, arg_delta)
+                if payload is not None:
+                    await _write_sse(response, payload)
         state = self.tool_calls.get(index)
         if (
             state
@@ -5193,15 +5220,9 @@ class ResponsesStreamState:
                     arg_delta = delta.get("partial_json") or ""
                     if arg_delta:
                         state["arguments"] += arg_delta
-                        await _write_sse(
-                            response,
-                            {
-                                "type": "response.function_call_arguments.delta",
-                                "item_id": state["id"],
-                                "output_index": state["output_index"],
-                                "delta": arg_delta,
-                            },
-                        )
+                        payload = _tool_argument_delta_payload(state, arg_delta)
+                        if payload is not None:
+                            await _write_sse(response, payload)
             elif dtype == "thinking_delta":
                 state = self.reasoning_blocks.get(("anthropic_thinking", idx))
                 if state is None:
@@ -5479,11 +5500,30 @@ class ResponsesStreamState:
         )
         return state
 
-    async def _close_tool(self, response: web.StreamResponse, state: dict[str, Any]) -> None:
-        if state.get("closed") or not _tool_call_arguments_complete(state):
+    async def _close_tool(
+        self,
+        response: web.StreamResponse,
+        state: dict[str, Any],
+        *,
+        at_stream_end: bool = False,
+    ) -> None:
+        if state.get("closed"):
+            return
+        if not _tool_call_arguments_complete(state, at_stream_end=at_stream_end):
             return
         state["closed"] = True
-        if state.get("output_type", "function_call") == "function_call":
+        if state.get("output_type") == "custom_tool_call":
+            state["arguments"] = unwrap_custom_tool_input(state.get("arguments") or "")
+            await _write_sse(
+                response,
+                {
+                    "type": "response.custom_tool_call_input.done",
+                    "item_id": state["id"],
+                    "output_index": state["output_index"],
+                    "input": state["arguments"],
+                },
+            )
+        elif state.get("output_type", "function_call") == "function_call":
             await _write_sse(
                 response,
                 {
@@ -7126,6 +7166,9 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--port", type=int, default=DEFAULT_PORT)
     args = parser.parse_args(argv)
 
+    from .nous_auth import refresh_nous_oauth_on_startup
+
+    refresh_nous_oauth_on_startup()
     shim = ShimServer(args.settings, host=args.host)
     web.run_app(
         shim.app(),

@@ -76,7 +76,7 @@ def upstream_header_log_enabled() -> bool:
 def client_headers_for_upstream(
     request_headers: Mapping[str, str],
     *,
-    overrides: Mapping[str, str] | None = None,
+    overrides: Mapping[str, str | None] | None = None,
     setdefaults: Mapping[str, str] | None = None,
 ) -> dict[str, str]:
     """Copy client request headers, apply setdefaults for missing keys, then overrides."""
@@ -106,6 +106,9 @@ def client_headers_for_upstream(
     return merged
 
 
+KEYLESS_API_KEY = "public"
+
+
 def openai_upstream_headers(
     request_headers: Mapping[str, str],
     *,
@@ -113,9 +116,14 @@ def openai_upstream_headers(
     extra_headers: Mapping[str, str] | None = None,
     accept: str | None = None,
 ) -> dict[str, str]:
-    overrides: dict[str, str] = {"Content-Type": "application/json"}
-    if api_key:
-        overrides["Authorization"] = f"Bearer {api_key}"
+    overrides: dict[str, str | None] = {"Content-Type": "application/json"}
+    token = (api_key or "").strip()
+    if token == KEYLESS_API_KEY:
+        # Free Zen 401s unrecognized bearers, including "Bearer public".
+        # Pop Desktop's ChatGPT Authorization so it cannot leak upstream.
+        overrides["Authorization"] = None
+    elif token:
+        overrides["Authorization"] = f"Bearer {token}"
     if accept:
         overrides["Accept"] = accept
     setdefaults = dict(extra_headers or {})

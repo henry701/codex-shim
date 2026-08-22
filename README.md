@@ -34,8 +34,8 @@ multi-provider local catalog that stays in sync with Codex Desktop.
 
 | Area | What the fork adds |
 |---|---|
-| **Auto-discovery** | `codex-shim discover` lists models pulled from provider APIs/CLIs: OpenCode Zen (free + paid), OpenRouter `:free` models, NVIDIA Integrate, and local OpenAI-compatible endpoints. `discover --refresh` busts cached Cursor catalog metadata. |
-| **Provider-prefixed slugs** | Discovered routes get stable prefixes (`or-`, `zen-`, `nvidia-`, `oc-free-`, …) so hundreds of models stay identifiable in the picker and logs. |
+| **Auto-discovery** | `codex-shim discover` lists models pulled from provider APIs/CLIs: OpenCode Zen (keyless free via models.dev + paid), OpenRouter `:free` models, NVIDIA Integrate, Nous Portal (`stealth/ox-alpha` and `/v1/models`), and local OpenAI-compatible endpoints. `discover --refresh` busts cached Cursor catalog metadata. |
+| **Provider-prefixed slugs** | Discovered routes get stable prefixes (`or-`, `zen-`, `nvidia-`, `oc-free-`, `nous-`, …) so hundreds of models stay identifiable in the picker and logs. |
 | **`sync-desktop`** | Writes `~/.codex/custom_model_catalog.json` only. Does **not** change `~/.codex/config.toml` — use `codex-shim enable` (or `app`) to wire OpenAI-provider shim routing. |
 | **systemd user service** | `codex-shim install-service` installs a user unit with `ExecStartPre=sync-desktop` (45s discovery budget; keeps the existing catalog on timeout) and `ExecStart=serve`. `TimeoutStartSec=180`. `codex-shim restart` reloads and restarts the user unit when it is installed. CLI `run` still syncs then serves for interactive use. Config stays untouched until `enable`. Targets `graphical-session.target` and, when present, a local `network-ready-user.service` drop-in so model refresh waits for NM + DNS. Also installs an hourly user logrotate timer for `~/.codex-shim/shim.log` (30M, keep 10 compressed). |
 | **Namespace tools (dot notation)** | Responses `type: "namespace"` tools (including `multi_agent_v1` / multi-agent V2) expand to `namespace.tool` on BYOK chat/anthropic routes and round-trip back to `namespace` + `name` on responses and streams. MCP refs accept `mcp__srv__tool` and `mcp__srv.tool`. |
@@ -111,6 +111,7 @@ Provider discovery:
     "zen_public": true,
     "openrouter_free": true,
     "nvidia_integrate": true,
+    "nous": true,
     "local": true
   },
   "models": [ /* local or niche routes only; cloud catalogs are auto-discovered */ ]
@@ -118,6 +119,30 @@ Provider discovery:
 ```
 
 Set `"discover": false` to disable all auto-discovery, or toggle individual keys.
+
+`zen_public` (slug prefix `oc-free-`) is the hermes-cli OpenCode Free path:
+models from `https://models.dev/api.json` (provider `opencode`, `cost.input == 0`,
+not deprecated) and inference at `https://opencode.ai/zen/v1` with **no**
+`Authorization` header. Free Zen 401s unrecognized bearers, including
+`Bearer public`. The shim keeps `public` as an internal keyless sentinel so
+the route still counts as credentialed; it is never sent upstream, and Desktop's
+ChatGPT bearer is stripped so it cannot leak. Desktop's User-Agent is left
+as-is. Hermes `HTTP-Referer` / `X-Title` are set only when Desktop omitted them.
+`big-pickle` may 429 under a non-OpenCode-CLI User-Agent; that is expected.
+
+Paid `zen` is unchanged and still sends `OPENCODE_API_KEY`.
+
+`nous` (slug prefix `nous-`) is the Hermes Agent Nous Portal path:
+`https://inference-api.nousresearch.com/v1`. Auth is `NOUS_API_KEY` (static
+`sk-nous-…` key) or, if that env var is empty, the OAuth JWT in
+`~/.hermes/auth.json` or `HERMES_SHARED_AUTH_DIR` / `~/.hermes/shared/nous_auth.json`.
+`serve`, `sync-desktop`, and `discover` force-refresh that OAuth grant on startup
+(Hermes device-code `/api/oauth/token` with `x-nous-refresh-token`) and
+persist the rotated refresh token immediately — those tokens are single-use.
+The shim updates `providers.nous` only and does not change Hermes
+`active_provider`.
+Hermes `HTTP-Referer` / `X-Title` are setdefaults; Desktop's User-Agent still
+wins. Listing uses inference `/v1/models` and always includes `stealth/ox-alpha`.
 
 ---
 

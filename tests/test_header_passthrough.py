@@ -138,6 +138,44 @@ def test_openai_upstream_headers_preserves_client_accept_encoding():
     assert merged["Authorization"] == "Bearer sk-test"
 
 
+_HERMES_FREE_HEADERS = {
+    "HTTP-Referer": "https://hermes-agent.nousresearch.com",
+    "X-Title": "Hermes Agent",
+}
+
+
+def test_openai_upstream_headers_strips_authorization_for_public_sentinel():
+    merged = openai_upstream_headers(
+        {
+            "User-Agent": "ChatGPT/1.0",
+            "Authorization": "Bearer chatgpt-token",
+        },
+        api_key="public",
+        extra_headers=_HERMES_FREE_HEADERS,
+    )
+    assert not any(key.lower() == "authorization" for key in merged)
+    assert "Bearer public" not in merged.values()
+    assert "Bearer chatgpt-token" not in merged.values()
+    assert merged["User-Agent"] == "ChatGPT/1.0"
+    assert merged["HTTP-Referer"] == "https://hermes-agent.nousresearch.com"
+    assert merged["X-Title"] == "Hermes Agent"
+
+
+def test_openai_upstream_headers_public_keeps_desktop_referer():
+    merged = openai_upstream_headers(
+        {
+            "User-Agent": "ChatGPT/Desktop",
+            "HTTP-Referer": "https://chatgpt.com/",
+        },
+        api_key="public",
+        extra_headers=_HERMES_FREE_HEADERS,
+    )
+    assert not any(key.lower() == "authorization" for key in merged)
+    assert merged["User-Agent"] == "ChatGPT/Desktop"
+    assert merged["HTTP-Referer"] == "https://chatgpt.com/"
+    assert merged["X-Title"] == "Hermes Agent"
+
+
 def test_log_upstream_response_headers_includes_usage(monkeypatch, capsys):
     monkeypatch.setenv("CODEX_SHIM_UPSTREAM_HEADER_LOG", "1")
     log_upstream_response_headers(

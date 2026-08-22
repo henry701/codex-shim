@@ -44,5 +44,6 @@ testpaths = ["tests"]
 asyncio_mode = "auto"
 markers = [
   "enable_model_discovery: allow live provider discovery during tests",
+  "nous_portal: exercise Nous Portal credential resolution and discovery",
   "integration: live external tool tests (cursor-agent, tmux); skipped in CI by default",
 ]

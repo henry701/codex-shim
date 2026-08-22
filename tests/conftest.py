@@ -4,6 +4,32 @@ import pytest
 
 
 @pytest.fixture(autouse=True)
+def _isolate_hermes_auth_paths(monkeypatch, tmp_path_factory):
+    # Refresh tokens are single-use. Tests must never read or rotate ~/.hermes.
+    home = tmp_path_factory.mktemp("hermes-home")
+    for key in (
+        "HERMES_SHARED_AUTH_DIR",
+        "NOUS_API_KEY",
+        "HERMES_PORTAL_BASE_URL",
+        "NOUS_PORTAL_BASE_URL",
+    ):
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+
+
+@pytest.fixture(autouse=True)
+def _stub_nous_api_key_unless_portal(monkeypatch, request):
+    if request.node.get_closest_marker("nous_portal"):
+        return
+
+    def _empty(*, environ=None, hermes_dir=None):
+        return ""
+
+    monkeypatch.setattr("codex_shim.nous_auth.resolve_nous_api_key", _empty, raising=False)
+    monkeypatch.setattr("codex_shim.discover.resolve_nous_api_key", _empty, raising=False)
+
+
+@pytest.fixture(autouse=True)
 def _disable_model_discovery_by_default(monkeypatch, request):
     if "enable_model_discovery" in request.keywords:
         return
@@ -18,6 +44,24 @@ def _disable_model_discovery_by_default(monkeypatch, request):
     monkeypatch.setattr("codex_shim.discover.discover_chatgpt_models_from_cursor", lambda: [])
     monkeypatch.setattr("codex_shim.discover.discover_chatgpt_model_ids_from_openai_api", lambda: [])
     monkeypatch.setattr("codex_shim.discover.fetch_chatgpt_codex_backend_models", lambda **_kwargs: [])
+
+
+@pytest.fixture(autouse=True)
+def _disable_nous_portal_by_default(monkeypatch, request):
+    if request.node.get_closest_marker("nous_portal"):
+        return
+    monkeypatch.setattr("codex_shim.discover.fetch_nous_portal_model_ids", lambda **_kwargs: [], raising=False)
+    monkeypatch.setattr("codex_shim.nous_auth.refresh_nous_oauth_on_startup", lambda **_kwargs: False, raising=False)
+    monkeypatch.setattr("codex_shim.nous_auth.refresh_nous_oauth", lambda **_kwargs: False, raising=False)
+
+
+@pytest.fixture(autouse=True)
+def _reset_nous_oauth_startup_state():
+    from codex_shim.nous_auth import reset_nous_oauth_startup_state
+
+    reset_nous_oauth_startup_state()
+    yield
+    reset_nous_oauth_startup_state()
 
 
 @pytest.fixture(autouse=True)

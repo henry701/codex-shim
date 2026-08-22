@@ -17,12 +17,16 @@ from urllib.parse import urlencode, urlparse
 from urllib.request import Request, urlopen
 from pathlib import Path
 
+from .header_passthrough import KEYLESS_API_KEY
 from .naming import description_for_route, display_name_from_slug
+from .nous_auth import resolve_nous_api_key
 from .settings import ShimModel, slugify
 
 logger = logging.getLogger(__name__)
 
 ZEN_MODELS_URL = "https://opencode.ai/zen/v1/models"
+NOUS_INFERENCE_MODELS_URL = "https://inference-api.nousresearch.com/v1/models"
+NOUS_FALLBACK_MODEL_IDS = ("stealth/ox-alpha",)
 MODELS_DEV_API_URL = "https://models.dev/api.json"
 MODELS_DEV_OPENCODE_PROVIDER = "opencode"
 OPENAI_MODELS_URL = "https://api.openai.com/v1/models"
@@ -64,8 +68,11 @@ ZEN_PUBLIC_TEMPLATE = DiscoverTemplate(
     base_url="https://opencode.ai/zen/v1",
     provider="generic-chat-completion-api",
     slug_prefix="oc-free",
-    api_key="public",
-    extra_headers={},
+    api_key=KEYLESS_API_KEY,
+    extra_headers={
+        "HTTP-Referer": "https://hermes-agent.nousresearch.com",
+        "X-Title": "Hermes Agent",
+    },
     label_prefix="oc-free",
 )
 
@@ -106,14 +113,28 @@ NVIDIA_INTEGRATE_TEMPLATE = DiscoverTemplate(
     label_prefix="nvidia",
 )
 
+NOUS_PORTAL_TEMPLATE = DiscoverTemplate(
+    kind="nous",
+    base_url="https://inference-api.nousresearch.com/v1",
+    provider="generic-chat-completion-api",
+    slug_prefix="nous",
+    api_key="${NOUS_API_KEY}",
+    extra_headers={
+        "HTTP-Referer": "https://hermes-agent.nousresearch.com",
+        "X-Title": "Hermes Agent",
+    },
+    label_prefix="nous",
+)
+
 _BUILTIN_TEMPLATES: dict[str, DiscoverTemplate] = {
     "zen_public": ZEN_PUBLIC_TEMPLATE,
     "zen": ZEN_PAID_TEMPLATE,
     "openrouter_free": OPENROUTER_FREE_TEMPLATE,
     "nvidia_integrate": NVIDIA_INTEGRATE_TEMPLATE,
+    "nous": NOUS_PORTAL_TEMPLATE,
 }
 
-_BUILTIN_TEMPLATE_ORDER = ("zen", "zen_public", "openrouter_free", "nvidia_integrate")
+_BUILTIN_TEMPLATE_ORDER = ("zen", "zen_public", "openrouter_free", "nvidia_integrate", "nous")
 
 
 def discover_enabled(settings_data: dict[str, Any] | None, kind: str, *, has_template: bool) -> bool:
@@ -132,6 +153,7 @@ def discover_enabled(settings_data: dict[str, Any] | None, kind: str, *, has_tem
             "zen": ("zen", "zen_paid"),
             "openrouter_free": ("openrouter_free", "openrouter"),
             "nvidia_integrate": ("nvidia_integrate", "nvidia"),
+            "nous": ("nous", "nous_portal", "nousresearch"),
         }
         keys = aliases.get(kind, (kind,))
         value = next((discover.get(key) for key in keys if key in discover), None)
@@ -568,12 +590,44 @@ def _parse_openai_model_list(payload: Any) -> list[str]:
 def fetch_zen_model_ids(*, api_key: str = "") -> list[str]:
     headers: dict[str, str] = {}
     token = api_key.strip()
-    if token and token != "public":
+    if token and token != KEYLESS_API_KEY:
         headers["Authorization"] = f"Bearer {token}"
     try:
         return _parse_openai_model_list(fetch_http_json(ZEN_MODELS_URL, headers=headers or None))
     except (OSError, URLError, json.JSONDecodeError, ValueError):
         return discover_opencode_cli_ids("opencode")
+
+
+def fetch_nous_portal_model_ids(*, api_key: str = "") -> list[str]:
+    token = (api_key or "").strip() or resolve_nous_api_key()
+    if not token:
+        return []
+    ids: list[str] = []
+    try:
+        # Cloudflare 1010s Python-urllib's default UA; HermesAgent is the
+        # portal client identity. Inference still uses the Codex/Desktop UA.
+        ids = _parse_openai_model_list(
+            fetch_http_json(
+                NOUS_INFERENCE_MODELS_URL,
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "User-Agent": "HermesAgent/1.0",
+                    "HTTP-Referer": "https://hermes-agent.nousresearch.com",
+                    "X-Title": "Hermes Agent",
+                },
+            )
+        )
+    except (OSError, URLError, json.JSONDecodeError, ValueError, HTTPError):
+        ids = []
+    merged: list[str] = []
+    seen: set[str] = set()
+    for model_id in [*ids, *NOUS_FALLBACK_MODEL_IDS]:
+        clean = str(model_id or "").strip()
+        if not clean or clean in seen:
+            continue
+        seen.add(clean)
+        merged.append(clean)
+    return merged
 
 
 def _models_dev_model_status(row: dict[str, Any]) -> str:
@@ -661,7 +715,7 @@ def fetch_models_dev_opencode_paid_model_ids() -> list[str]:
 
 def fetch_zen_paid_model_ids(*, api_key: str = "") -> list[str]:
     token = api_key.strip()
-    if token and token != "public":
+    if token and token != KEYLESS_API_KEY:
         from_api = [
             model_id
             for model_id in fetch_zen_model_ids(api_key=token)
@@ -841,6 +895,10 @@ def _discover_rows_for_template(template: DiscoverTemplate) -> list[str]:
         return fetch_openrouter_free_model_ids()
     if template.kind in {"nvidia", "nvidia_integrate"}:
         return fetch_nvidia_integrate_model_ids()
+    if template.kind in {"nous", "nous_portal"}:
+        return fetch_nous_portal_model_ids(
+            api_key=_resolved_api_key(template.api_key) or resolve_nous_api_key()
+        )
     return []
 
 
@@ -888,7 +946,9 @@ def _catalog_slug_for_model(
 
 def _api_key_for_discovered_model(model_id: str, template: DiscoverTemplate) -> str:
     if template.kind == "zen_public" and is_zen_public_model(model_id):
-        return "public"
+        return KEYLESS_API_KEY
+    if template.kind in {"nous", "nous_portal"}:
+        return resolve_nous_api_key() or template.api_key
     return template.api_key
 
 
@@ -904,13 +964,14 @@ def _enrich_builtin_template(template: DiscoverTemplate, explicit_models: list[S
         "zen": "opencode.ai/zen",
         "openrouter_free": "openrouter.ai",
         "nvidia_integrate": "integrate.api.nvidia.com",
+        "nous": "inference-api.nousresearch.com",
     }.get(template.kind, "")
     if not needle:
         return template
     for model in explicit_models:
         if needle not in model.base_url.lower():
             continue
-        if template.kind == "zen" and _resolved_api_key(model.api_key) in {"", "public"}:
+        if template.kind == "zen" and _resolved_api_key(model.api_key) in {"", KEYLESS_API_KEY}:
             continue
         return DiscoverTemplate(
             kind=template.kind,
@@ -929,6 +990,8 @@ def _template_has_credentials(template: DiscoverTemplate) -> bool:
         return bool(_resolved_api_key(template.api_key))
     if template.kind in {"zen_public", "openrouter_free", "nvidia_integrate"}:
         return True
+    if template.kind in {"nous", "nous_portal"}:
+        return bool(_resolved_api_key(template.api_key) or resolve_nous_api_key())
     return bool(_resolved_api_key(template.api_key))
 
 
