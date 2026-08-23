@@ -44,7 +44,18 @@ and this project does not yet follow semantic versioning (pre-1.0).
   files down to a fraction of `CODEX_SHIM_CHATGPT_CACHE_MAX_BYTES`. Doctor WARN
   at ≥90% disk points at this command.
 
+- Shared `codex_shim/net/` transport layer: `StreamGuard` terminal events and
+  `[stream-end]` diagnostics, downstream SSE keepalives, aiohttp/urllib retry
+  with `CODEX_SHIM_RETRY_ATTEMPTS` / `CODEX_SHIM_RETRY_BACKOFF_BASE` /
+  `CODEX_SHIM_RETRY_BACKOFF_FACTOR`, and `CODEX_SHIM_SSE_KEEPALIVE_INTERVAL`.
+  ChatGPT, BYOK, Cursor, Anthropic, and WS paths share the layer; each still
+  owns its wire-format conversion. OAuth refresh stays one-shot.
+
 ### Fixed
+
+- ChatGPT live SSE, Cursor SSE, Anthropic raw SSE, and WS relays now emit a
+  terminal event when upstream closes without one (`response.incomplete` or
+  `message_stop`). WS CLOSE/ERROR frames no longer drop the lane in silence.
 
 - BYOK Responses streams always end with a terminal event. Previously an
   upstream that closed its SSE without `data: [DONE]` (Nous Portal, and any
@@ -58,7 +69,7 @@ and this project does not yet follow semantic versioning (pre-1.0).
 - BYOK OpenAI-chat and Anthropic Responses streams now send `: ping`
   keepalives while the upstream is silent, matching ChatGPT passthrough. Long
   silent generations (extended reasoning) no longer look like a dead
-  connection to Desktop.
+  connection to Desktop. Cursor SSE and other StreamGuard paths ping the same way.
 
 - Every BYOK chat stream logs a `[stream-end]` line with elapsed time,
   upstream event count, whether `[DONE]` arrived, longest upstream silence,

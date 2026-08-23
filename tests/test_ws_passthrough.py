@@ -93,6 +93,9 @@ class FakeUpstreamWs:
             msg.data = item
             yield msg
 
+    async def close(self):
+        self.closed = True
+
 
 @pytest.mark.asyncio
 async def test_relay_rewrites_model_in_events():
@@ -275,7 +278,36 @@ async def test_relay_close_frame_drops_lane():
     url = "wss://example/v1/responses"
     session.upstream_by_url[url] = ClosingWs()
     terminal = await session.relay_until_terminal(source="test-ws", upstream_url=url)
-    assert terminal is None
+    assert terminal is not None
+    assert terminal["type"] == "response.incomplete"
+    assert url not in session.upstream_by_url
+    sent = json.loads(client_ws.send_str.await_args.args[0])
+    assert sent["type"] == "response.incomplete"
+
+
+@pytest.mark.asyncio
+async def test_relay_text_without_terminal_synthesizes_incomplete():
+    client_ws = AsyncMock()
+    client_ws.closed = False
+    events = [
+        json.dumps({"type": "response.created", "response": {"id": "r1", "model": "gpt-5.5"}}),
+    ]
+    session = WsPassthroughSession(client_session=AsyncMock(), client_ws=client_ws)
+    url = "wss://example/v1/responses"
+    session.upstream_by_url[url] = FakeUpstreamWs(events)
+    sent: list[dict] = []
+
+    async def capture(event: dict) -> None:
+        sent.append(event)
+
+    terminal = await session.relay_until_terminal(
+        source="test-ws",
+        upstream_url=url,
+        write_event=capture,
+    )
+    assert terminal is not None
+    assert terminal["type"] == "response.incomplete"
+    assert [event["type"] for event in sent] == ["response.created", "response.incomplete"]
     assert url not in session.upstream_by_url
 
 
@@ -330,5 +362,8 @@ async def test_relay_error_frame_drops_lane():
     url = "wss://example/v1/responses"
     session.upstream_by_url[url] = ErrorWs()
     terminal = await session.relay_until_terminal(source="test-ws", upstream_url=url)
-    assert terminal is None
+    assert terminal is not None
+    assert terminal["type"] == "response.incomplete"
     assert url not in session.upstream_by_url
+    sent = json.loads(client_ws.send_str.await_args.args[0])
+    assert sent["type"] == "response.incomplete"

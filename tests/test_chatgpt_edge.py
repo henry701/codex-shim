@@ -105,7 +105,7 @@ async def test_post_retries_503_then_returns_200(monkeypatch):
     async def fake_sleep(seconds: float) -> None:
         sleeps.append(seconds)
 
-    monkeypatch.setattr("codex_shim.chatgpt_edge.asyncio.sleep", fake_sleep)
+    monkeypatch.setattr("codex_shim.net.retry.asyncio.sleep", fake_sleep)
     session = FakeSession(
         [
             FakeResponse(503, "envoy unavailable", "text/plain"),
@@ -132,7 +132,7 @@ async def test_post_exhausts_html_403_as_502_without_html_body(monkeypatch):
     async def fake_sleep(seconds: float) -> None:
         return None
 
-    monkeypatch.setattr("codex_shim.chatgpt_edge.asyncio.sleep", fake_sleep)
+    monkeypatch.setattr("codex_shim.net.retry.asyncio.sleep", fake_sleep)
     session = FakeSession(
         [
             FakeResponse(403, HTML_SITE_DOWN, "text/html"),
@@ -175,7 +175,7 @@ async def test_post_retries_connect_timeout_then_succeeds(monkeypatch):
     async def fake_sleep(seconds: float) -> None:
         sleeps.append(seconds)
 
-    monkeypatch.setattr("codex_shim.chatgpt_edge.asyncio.sleep", fake_sleep)
+    monkeypatch.setattr("codex_shim.net.retry.asyncio.sleep", fake_sleep)
     session = FakeSession(
         [
             ClientOSError(110, "Connection timed out"),
@@ -202,7 +202,7 @@ async def test_post_retries_econnreset_then_succeeds(monkeypatch):
     async def fake_sleep(seconds: float) -> None:
         sleeps.append(seconds)
 
-    monkeypatch.setattr("codex_shim.chatgpt_edge.asyncio.sleep", fake_sleep)
+    monkeypatch.setattr("codex_shim.net.retry.asyncio.sleep", fake_sleep)
     session = FakeSession(
         [
             ClientOSError(104, "Connection reset by peer"),

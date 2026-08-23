@@ -17,11 +17,12 @@ from .header_passthrough import (
     observe_upstream_response,
     upstream_headers_from_response,
 )
+from .net.emitters import WsRelayEmitter
 
 CHATGPT_WS_URL = "wss://chatgpt.com/backend-api/codex/responses"
 UPSTREAM_WS_HEARTBEAT = 30
 _VERSIONED_BASE_RE = re.compile(r"/v\d+$")
-_TERMINAL_EVENT_TYPES = frozenset({"response.completed", "response.failed", "error"})
+_TERMINAL_EVENT_TYPES = frozenset({"response.completed", "response.failed", "response.incomplete", "error"})
 
 
 def _upstream_lane_reusable(ws: Any) -> bool:
@@ -186,6 +187,8 @@ class WsPassthroughSession:
             else:
                 await self.client_ws.send_str(json.dumps(event, separators=(",", ":")))
 
+        emitter = WsRelayEmitter(_write_event, model=model_override or source)
+
         try:
             async for msg in upstream_ws:
                 if msg.type == WSMsgType.TEXT:
@@ -205,6 +208,7 @@ class WsPassthroughSession:
                         on_event(event)
                     if rewrite_model is not None and model_override:
                         rewrite_model(event, model_override)
+                    emitter.observe(event)
                     if event.get("type") == "response.completed":
                         response_obj = event.get("response")
                         usage = response_obj.get("usage") if isinstance(response_obj, dict) else None
@@ -232,6 +236,9 @@ class WsPassthroughSession:
             raise WsPassthroughConnectError(str(exc)) from exc
         if terminal_event is None:
             await self.close_upstream(upstream_url)
+            if not emitter.saw_terminal:
+                await emitter.complete()
+                terminal_event = emitter.last_emitted
         return terminal_event
 
     async def close_upstream(self, upstream_url: str | None = None) -> None:

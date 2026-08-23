@@ -743,6 +743,10 @@ Debug env knobs:
 | `CODEX_SHIM_UPSTREAM_HEADER_LOG=1` | Log upstream response headers + usage |
 | `CODEX_SHIM_PASSTHROUGH_TRACE=1` | Log forwarded client headers per ChatGPT request |
 | `CODEX_SHIM_STREAM_LOG=1` | Log SSE/WS event types |
+| `CODEX_SHIM_RETRY_ATTEMPTS` | HTTP transport retries for aiohttp POST and discovery GET (default: `3`). OAuth refresh stays 1 attempt — refresh tokens are single-use. |
+| `CODEX_SHIM_RETRY_BACKOFF_BASE` | Initial retry delay in seconds (default: `0.5`) |
+| `CODEX_SHIM_RETRY_BACKOFF_FACTOR` | Exponential backoff multiplier (default: `2`) |
+| `CODEX_SHIM_SSE_KEEPALIVE_INTERVAL` | Downstream SSE `: ping` interval in seconds while a stream is open (default: `15`) |
 | `CODEX_SHIM_WS_PASSTHROUGH=0` | Force legacy HTTP+SSE upstream for ChatGPT/BYOK WS routes (default: on) |
 | `CODEX_SHIM_CHATGPT_WS_FORCE_EXPAND=1` | Force cache expansion on ChatGPT Codex WS (default: native passthrough on reused upstream WS) |
 | `CODEX_SHIM_CHATGPT_CONVERSATIONS_DIR` | Root for persisted expansion cache (default: `~/.codex-shim/chatgpt-conversations`) |

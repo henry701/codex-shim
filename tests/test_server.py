@@ -1305,7 +1305,7 @@ async def test_chatgpt_passthrough_falls_back_to_byok_on_error(monkeypatch, tmp_
     async def fake_sleep(_seconds: float) -> None:
         return None
 
-    monkeypatch.setattr("codex_shim.chatgpt_edge.asyncio.sleep", fake_sleep)
+    monkeypatch.setattr("codex_shim.net.retry.asyncio.sleep", fake_sleep)
 
     class FailingChatGPTUpstream:
         status = 503
@@ -1385,7 +1385,7 @@ async def test_chatgpt_passthrough_retries_503_then_succeeds(monkeypatch, tmp_pa
     async def fake_sleep(_seconds: float) -> None:
         return None
 
-    monkeypatch.setattr("codex_shim.chatgpt_edge.asyncio.sleep", fake_sleep)
+    monkeypatch.setattr("codex_shim.net.retry.asyncio.sleep", fake_sleep)
 
     class OkUpstream:
         status = 200
@@ -1432,7 +1432,7 @@ async def test_chatgpt_passthrough_html_403_exhausted_returns_502(monkeypatch, t
     async def fake_sleep(_seconds: float) -> None:
         return None
 
-    monkeypatch.setattr("codex_shim.chatgpt_edge.asyncio.sleep", fake_sleep)
+    monkeypatch.setattr("codex_shim.net.retry.asyncio.sleep", fake_sleep)
 
     async def fake_post(self, url, json=None, headers=None):
         calls.append(str(url))
@@ -1881,7 +1881,7 @@ async def test_sse_lines_ignores_inbound_comment_lines():
 
 
 async def test_chatgpt_sse_keepalive_emits_ping_before_delayed_event(monkeypatch, tmp_path, auth_present):
-    monkeypatch.setattr(server_module, "SSE_KEEPALIVE_INTERVAL", 0.05)
+    monkeypatch.setattr("codex_shim.net.sse.SSE_KEEPALIVE_INTERVAL", 0.05)
 
     class DelayedContent(_FakeSseContent):
         def __init__(self, chunks: list[bytes], delay: float):
@@ -1947,10 +1947,66 @@ async def test_chatgpt_sse_keepalive_emits_ping_before_delayed_event(monkeypatch
         await shim_client.close()
 
 
+async def test_chatgpt_sse_synthesizes_incomplete_when_upstream_omits_terminal(
+    monkeypatch, tmp_path, auth_present
+):
+    class CutoffUpstream:
+        status = 200
+        content_type = "text/event-stream"
+        headers = {"Content-Type": "text/event-stream"}
+
+        def __init__(self):
+            self.content = _FakeSseContent(
+                [
+                    _sse_chunk(
+                        {
+                            "type": "response.created",
+                            "response": {
+                                "id": "resp_cut",
+                                "model": "gpt-5.5",
+                                "status": "in_progress",
+                                "output": [],
+                            },
+                        }
+                    )
+                ]
+            )
+
+        def close(self):
+            pass
+
+        def release(self):
+            pass
+
+    async def fake_post(self, url, json=None, headers=None):
+        return CutoffUpstream()
+
+    monkeypatch.setattr("codex_shim.server.ClientSession.post", fake_post)
+    settings = tmp_path / "settings.json"
+    settings.write_text("{}")
+    shim_client = TestClient(TestServer(ShimServer(settings).app()))
+    await shim_client.start_server()
+    try:
+        resp = await shim_client.post(
+            "/v1/responses",
+            json={"model": "codex-gpt-5-5", "input": "hi", "stream": True},
+        )
+        assert resp.status == 200
+        events = _sse_events((await resp.read()).decode())
+        assert [
+            event.get("type")
+            for event in events
+            if event.get("type")
+            in {"response.completed", "response.incomplete", "response.failed"}
+        ] == ["response.incomplete"]
+    finally:
+        await shim_client.close()
+
+
 async def test_chatgpt_sse_keepalive_disconnect_during_wait_closes_upstream(
     monkeypatch, tmp_path, auth_present
 ):
-    monkeypatch.setattr(server_module, "SSE_KEEPALIVE_INTERVAL", 0.05)
+    monkeypatch.setattr("codex_shim.net.sse.SSE_KEEPALIVE_INTERVAL", 0.05)
     hung_state = {"closed": False}
 
     class HungContent:
@@ -2095,7 +2151,7 @@ async def test_byok_stream_emits_incomplete_when_truncated_without_done(tmp_path
 
 async def test_byok_stream_pings_while_upstream_is_silent(monkeypatch, tmp_path):
     """Long silent generations must keep the downstream SSE warm."""
-    monkeypatch.setattr(server_module, "SSE_KEEPALIVE_INTERVAL", 0.05)
+    monkeypatch.setattr("codex_shim.net.sse.SSE_KEEPALIVE_INTERVAL", 0.05)
 
     async def chat(request):
         response = web.StreamResponse(headers={"Content-Type": "text/event-stream"})
@@ -3448,7 +3504,7 @@ async def test_chatgpt_legacy_compact_retries_503_then_returns_404_without_summa
     async def fake_sleep(_seconds: float) -> None:
         return None
 
-    monkeypatch.setattr("codex_shim.chatgpt_edge.asyncio.sleep", fake_sleep)
+    monkeypatch.setattr("codex_shim.net.retry.asyncio.sleep", fake_sleep)
 
     async def fake_post(self, url, json=None, headers=None):
         calls.append(str(url))

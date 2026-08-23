@@ -12,7 +12,9 @@ import time
 from typing import Any, Iterator, Mapping
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode, urlparse
-from urllib.request import Request, urlopen
+from urllib.request import urlopen
+
+from .net.retry import RetryPolicy, request_urllib
 
 logger = logging.getLogger(__name__)
 
@@ -354,19 +356,23 @@ def _exchange_refresh_token(
     timeout: float,
 ) -> dict[str, Any]:
     body = urlencode({"grant_type": "refresh_token", "client_id": client_id}).encode("utf-8")
-    request = Request(
+    result = request_urllib(
         f"{portal_base_url.rstrip('/')}/api/oauth/token",
-        data=body,
+        method="POST",
         headers={
             "Content-Type": "application/x-www-form-urlencoded",
             "Accept": "application/json",
             "User-Agent": "HermesAgent/1.0",
             "x-nous-refresh-token": refresh_token,
         },
-        method="POST",
+        data=body,
+        timeout=timeout,
+        policy=RetryPolicy(attempts=1, retry_json_decode=False),
+        urlopen_fn=urlopen,
+        sleep_fn=time.sleep,
+        label="nous-oauth-refresh",
     )
-    with urlopen(request, timeout=timeout) as response:
-        payload = json.loads(response.read().decode("utf-8"))
+    payload = json.loads(result.body.decode("utf-8"))
     if not isinstance(payload, dict):
         raise ValueError("Nous refresh response was not an object")
     return payload
