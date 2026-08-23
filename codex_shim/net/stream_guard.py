@@ -41,6 +41,7 @@ class StreamGuard:
         keepalive: bool = True,
         interval: float | None = None,
         finish_reason: Any | None = None,
+        upstream: Any | None = None,
     ):
         self.response = response
         self.emitter = emitter
@@ -48,8 +49,10 @@ class StreamGuard:
         self.keepalive = keepalive
         self.interval = interval
         self.finish_reason = finish_reason
+        self.upstream = upstream
         self.writer = DownstreamWriter(response) if response is not None else None
         self._pinger: DownstreamPinger | None = None
+        self._owner_task: asyncio.Task[Any] | None = None
         self.started_at = time.monotonic()
         self.last_event_at = self.started_at
         self.max_silence = 0.0
@@ -74,6 +77,10 @@ class StreamGuard:
     def abandon(self) -> None:
         """Skip terminal synthesis on exit so the caller can retry the upstream POST."""
         self.abandoned = True
+        self._deactivate()
+
+    def attach_upstream(self, upstream: Any) -> None:
+        self.upstream = upstream
 
     def mark_upstream_done(self) -> None:
         self.upstream_saw_done = True
@@ -89,8 +96,11 @@ class StreamGuard:
             return
         await write_bytes(self.response, data, content=content)
 
-    async def iter_sse(self, upstream: Any, request: Any | None = None) -> AsyncIterator[str]:
-        async for line in sse_lines(upstream, request):
+    async def iter_sse(self, upstream: Any | None = None, request: Any | None = None) -> AsyncIterator[str]:
+        src = self.upstream if upstream is None else upstream
+        if src is None:
+            return
+        async for line in sse_lines(src, request):
             self.note_upstream_event()
             yield line
 
@@ -114,19 +124,21 @@ class StreamGuard:
 
     async def __aenter__(self) -> StreamGuard:
         self._entered = True
+        self._owner_task = asyncio.current_task()
         self.started_at = time.monotonic()
         self.last_event_at = self.started_at
         if self.writer is not None:
             self.writer.activate()
             if self.keepalive:
-                self._pinger = DownstreamPinger(self.writer, self.interval)
+                self._pinger = DownstreamPinger(
+                    self.writer,
+                    self.interval,
+                    owner_task=self._owner_task,
+                )
                 self._pinger.start()
         return self
 
     async def __aexit__(self, exc_type, exc, tb) -> bool:
-        await self._stop_pinger()
-        if self.writer is not None:
-            self.max_silence = max(self.max_silence, time.monotonic() - self.last_event_at)
         swallowed = False
         try:
             if self.abandoned:
@@ -136,7 +148,6 @@ class StreamGuard:
                 swallowed = True
             elif exc_type is asyncio.CancelledError:
                 print(f"[cancel] client disconnected during {self.label}", flush=True)
-                swallowed = False
             elif exc_type is not None:
                 traceback.print_exc()
                 print(
@@ -151,41 +162,71 @@ class StreamGuard:
             print(f"[cancel] client disconnected during {self.label}", flush=True)
             swallowed = True
         except asyncio.CancelledError:
-            self._log_end()
-            self._deactivate()
+            print(f"[cancel] client disconnected during {self.label}", flush=True)
             raise
-        self._log_end()
-        if not self.abandoned:
-            await self._write_eof()
-        self._deactivate()
+        finally:
+            await self._stop_pinger()
+            if self.upstream is not None:
+                await close_upstream(self.upstream)
+                self.upstream = None
+            if self.writer is not None:
+                self.max_silence = max(self.max_silence, time.monotonic() - self.last_event_at)
+            try:
+                self._log_end()
+            except Exception:
+                pass
+            if not self.abandoned:
+                await self._write_eof()
+            self._deactivate()
         if exc_type is asyncio.CancelledError:
             return False
         return swallowed
 
     async def _complete_terminal(self) -> None:
-        if self.response is None or self.emitter.already_emitted:
-            if not self.terminal_event:
-                self.terminal_event = getattr(self.emitter, "terminal_event", None)
+        if self.response is None:
             return
-        self.terminal_event = await self.emitter.complete(
-            self.response,
-            upstream_saw_done=self.upstream_saw_done,
-        )
+        try:
+            self.terminal_event = await self.emitter.complete(
+                self.response,
+                upstream_saw_done=self.upstream_saw_done,
+            )
+        except ClientDisconnected:
+            raise
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            print(
+                f"[stream] {self.label} terminal complete failed: {type(exc).__name__}: {exc}",
+                flush=True,
+            )
 
     async def _fail_terminal(self, message: str, code: str) -> None:
-        if self.response is None or self.emitter.already_emitted:
+        if self.response is None:
             return
         try:
             self.terminal_event = await self.emitter.fail(self.response, message, code=code)
         except ClientDisconnected:
             raise
-        except Exception:
-            pass
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            print(
+                f"[stream] {self.label} terminal fail failed: {type(exc).__name__}: {exc}",
+                flush=True,
+            )
 
     async def _stop_pinger(self) -> None:
-        if self._pinger is not None:
-            await self._pinger.stop()
-            self._pinger = None
+        pinger = self._pinger
+        self._pinger = None
+        if pinger is None:
+            return
+        try:
+            await pinger.stop()
+        except Exception as exc:
+            print(
+                f"[stream] {self.label} pinger stop failed: {type(exc).__name__}: {exc}",
+                flush=True,
+            )
 
     def _deactivate(self) -> None:
         if self.writer is not None:

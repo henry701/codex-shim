@@ -12,6 +12,7 @@ from .errors import parse_upstream_error
 from .retry import (
     HttpPostResult,
     RetryPolicy,
+    parse_retry_after,
     request_urllib,
     retry_aiohttp_post,
     retry_policy_from_env,
@@ -43,6 +44,7 @@ __all__ = [
     "WsRelayEmitter",
     "close_upstream",
     "keepalive_interval",
+    "parse_retry_after",
     "parse_upstream_error",
     "request_disconnected",
     "request_urllib",

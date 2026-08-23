@@ -9,6 +9,16 @@ _RESPONSES_TERMINAL = frozenset({"response.completed", "response.failed", "respo
 _ANTHROPIC_TERMINAL = frozenset({"message_stop", "error"})
 
 
+def _synthetic_responses_object(last: dict[str, Any] | None, model: str, status: str) -> dict[str, Any]:
+    base = dict(last) if last else {}
+    base.setdefault("id", f"resp_shim_{int(time.time() * 1000)}")
+    base.setdefault("object", "response")
+    base.setdefault("model", model)
+    base.setdefault("output", [])
+    base["status"] = status
+    return base
+
+
 class ResponsesEmitter:
     def __init__(self, state: Any):
         self.state = state
@@ -122,17 +132,18 @@ class ChatgptRelayEmitter:
             f"[stream] {self.model} upstream ended without a terminal event; synthesizing {event_type}",
             flush=True,
         )
-        await write_sse(response, {"type": event_type, "response": self._synthetic_response("incomplete")})
+        await write_sse(response, {"type": event_type, "response": _synthetic_responses_object(self.last_response, self.model, "incomplete")})
         await self._write_done(response)
         self.already_emitted = True
         self.terminal_event = event_type
         return event_type
 
     async def fail(self, response: Any, message: str, *, code: str) -> str:
-        if self.already_emitted and self.saw_terminal:
+        if self.saw_terminal:
             await self._write_done(response)
+            self.already_emitted = True
             return self.terminal_event or "response.failed"
-        failed = self._synthetic_response("failed")
+        failed = _synthetic_responses_object(self.last_response, self.model, "failed")
         failed["error"] = {"code": code, "message": message}
         await write_sse(response, {"type": "error", "code": code, "message": message})
         await write_sse(response, {"type": "response.failed", "response": failed})
@@ -147,15 +158,6 @@ class ChatgptRelayEmitter:
             return
         await write_bytes(response, b"data: [DONE]\n\n")
         self._done_written = True
-
-    def _synthetic_response(self, status: str) -> dict[str, Any]:
-        base = dict(self.last_response) if self.last_response else {}
-        base.setdefault("id", f"resp_shim_{int(time.time() * 1000)}")
-        base.setdefault("object", "response")
-        base.setdefault("model", self.model)
-        base.setdefault("output", [])
-        base["status"] = status
-        return base
 
 
 class AnthropicRelayEmitter:
@@ -230,7 +232,7 @@ class WsRelayEmitter:
             return self.terminal_event or "response.completed"
         event = {
             "type": "response.incomplete",
-            "response": self._synthetic("incomplete"),
+            "response": _synthetic_responses_object(self.last_response, self.model, "incomplete"),
         }
         await self._write_event(event)
         self.last_emitted = event
@@ -243,19 +245,10 @@ class WsRelayEmitter:
         del response
         if self.already_emitted:
             return self.terminal_event or "error"
-        failed = self._synthetic("failed")
+        failed = _synthetic_responses_object(self.last_response, self.model, "failed")
         failed["error"] = {"code": code, "message": message}
         await self._write_event({"type": "error", "code": code, "message": message})
         await self._write_event({"type": "response.failed", "response": failed})
         self.already_emitted = True
         self.terminal_event = "response.failed"
         return "response.failed"
-
-    def _synthetic(self, status: str) -> dict[str, Any]:
-        base = dict(self.last_response) if self.last_response else {}
-        base.setdefault("id", f"resp_shim_{int(time.time() * 1000)}")
-        base.setdefault("object", "response")
-        base.setdefault("model", self.model)
-        base.setdefault("output", [])
-        base["status"] = status
-        return base

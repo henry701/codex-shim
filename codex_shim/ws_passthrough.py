@@ -180,6 +180,7 @@ class WsPassthroughSession:
             raise WsPassthroughConnectError("upstream websocket is not connected")
 
         terminal_event: dict[str, Any] | None = None
+        content_forwarded = False
 
         async def _write_event(event: dict[str, Any]) -> None:
             if write_event is not None:
@@ -221,8 +222,10 @@ class WsPassthroughSession:
                         terminal_event = event
                         if forward_terminal is None or forward_terminal(event):
                             await _write_event(event)
+                            content_forwarded = True
                         break
                     await _write_event(event)
+                    content_forwarded = True
                 elif msg.type in {WSMsgType.CLOSE, WSMsgType.CLOSED, WSMsgType.ERROR}:
                     break
         except Exception as exc:
@@ -233,6 +236,11 @@ class WsPassthroughSession:
             except Exception:
                 self.upstream_by_url.pop(upstream_url, None)
                 self.last_chained_response_id_by_url.pop(upstream_url, None)
+            if content_forwarded:
+                if not emitter.saw_terminal:
+                    await emitter.complete()
+                    terminal_event = emitter.last_emitted
+                return terminal_event
             raise WsPassthroughConnectError(str(exc)) from exc
         if terminal_event is None:
             await self.close_upstream(upstream_url)

@@ -47,7 +47,8 @@ and this project does not yet follow semantic versioning (pre-1.0).
 - Shared `codex_shim/net/` transport layer: `StreamGuard` terminal events and
   `[stream-end]` diagnostics, downstream SSE keepalives, aiohttp/urllib retry
   with `CODEX_SHIM_RETRY_ATTEMPTS` / `CODEX_SHIM_RETRY_BACKOFF_BASE` /
-  `CODEX_SHIM_RETRY_BACKOFF_FACTOR`, and `CODEX_SHIM_SSE_KEEPALIVE_INTERVAL`.
+  `CODEX_SHIM_RETRY_BACKOFF_FACTOR` / `CODEX_SHIM_RETRY_WAIT_BUDGET`, and
+  `CODEX_SHIM_SSE_KEEPALIVE_INTERVAL`.
   ChatGPT, BYOK, Cursor, Anthropic, and WS paths share the layer; each still
   owns its wire-format conversion. OAuth refresh stays one-shot.
 
@@ -56,6 +57,39 @@ and this project does not yet follow semantic versioning (pre-1.0).
 - ChatGPT live SSE, Cursor SSE, Anthropic raw SSE, and WS relays now emit a
   terminal event when upstream closes without one (`response.incomplete` or
   `message_stop`). WS CLOSE/ERROR frames no longer drop the lane in silence.
+
+- HTTP 429 retries honor `Retry-After` (numeric, HTTP-date, and OpenRouter
+  `error.metadata.retry_after_seconds`) capped at 60s per wait, plus a 30s extra
+  budget via `CODEX_SHIM_RETRY_WAIT_BUDGET`. Shared-pool free models that ask for
+  a 5s pause can recover instead of failing the stream on the third try. HTTP 429
+  without a hint now waits 5s as well (OpenCode `FreeUsageLimitError`).
+  Wait-budget extensions are also capped to eight extra attempts with a 250ms
+  floor so a millisecond-scale Retry-After cannot hot-loop.
+
+- BYOK OpenAI-chat streams prepare the downstream SSE and start keepalives
+  before the upstream POST, so 429 / disconnect retries stay on the same Codex
+  turn instead of going idle. Keepalives are `data: {"type":"ping"}` events
+  (not SSE comments or WebSocket protocol pings) because Codex's idle timer
+  waits on the next parsed event. WS relays forward those events. OpenRouter
+  `error.metadata.raw` is unwrapped when the outer message is the generic
+  "Provider returned error", so reconnects still see the rate-limit text.
+
+- StreamGuard always emits `[stream-end]`, writes EOF, deactivates the
+  ContextVar writer, and closes an attached upstream on every exit path,
+  including pinger failure and cancellation. `abandon()` drops the writer
+  immediately. A keepalive that sees a client disconnect cancels the owning
+  handler so an unbounded `sock_read` cannot hang. SSE streaming call sites
+  attach the upstream response to the guard instead of closing it in a
+  per-path `finally`.
+
+- Responses and Anthropic stream `fail()` set terminal flags only after the
+  terminal bytes are written. ChatGPT native relay does not emit a second
+  `response.failed` when upstream already sent one; it only appends `[DONE]`.
+  WebSocket relay synthesizes `response.incomplete` after a post-content
+  transport reset instead of raising a fallback signal.
+
+- Unterminated SSE lines are rejected after 1 MiB so a malformed upstream
+  cannot grow the line buffer without bound.
 
 - BYOK Responses streams always end with a terminal event. Previously an
   upstream that closed its SSE without `data: [DONE]` (Nous Portal, and any
@@ -66,7 +100,7 @@ and this project does not yet follow semantic versioning (pre-1.0).
   `response.incomplete` otherwise. An unexpected shim-side exception mid-stream
   emits `response.failed` instead of dropping the connection.
 
-- BYOK OpenAI-chat and Anthropic Responses streams now send `: ping`
+- BYOK OpenAI-chat and Anthropic Responses streams now send `{"type":"ping"}`
   keepalives while the upstream is silent, matching ChatGPT passthrough. Long
   silent generations (extended reasoning) no longer look like a dead
   connection to Desktop. Cursor SSE and other StreamGuard paths ping the same way.
@@ -118,7 +152,7 @@ and this project does not yet follow semantic versioning (pre-1.0).
   TCP connection. Exhausted HTML site-down becomes a short 502 instead of an
   HTML blob. JSON 403/401 are not retried. Compact 404 stays non-retryable.
 
-- HTTP SSE to Desktop writes `: ping` every 15s while ChatGPT is silent, so
+- HTTP SSE to Desktop writes `{"type":"ping"}` every 15s while ChatGPT is silent, so
   Luna think no longer trips Desktop’s idle request timeout.
 
 - Upstream ChatGPT/BYOK websockets enable aiohttp ping/pong (`heartbeat=30`).

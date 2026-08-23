@@ -9,7 +9,11 @@ from contextvars import ContextVar
 from typing import Any
 
 SSE_KEEPALIVE_INTERVAL = 15.0
-PING_BYTES = b": ping\n\n"
+# Codex idle-timeouts `stream.next()` / `ws_stream.next()`. SSE comments and
+# WebSocket protocol pings never complete those waits, so keepalives must be a
+# real ignored event. `content=False` so they do not block pre-content retry.
+PING_BYTES = b'data: {"type":"ping"}\n\n'
+MAX_UNTERMINATED_SSE_LINE = 1_048_576
 _DISCONNECT_NAMES = frozenset(
     {
         "ClientConnectionResetError",
@@ -126,6 +130,11 @@ async def sse_lines(upstream: Any, request: Any | None = None) -> AsyncIterator[
     try:
         async for chunk in iter_upstream_chunks(content, request):
             buffer += chunk
+            if len(buffer) > MAX_UNTERMINATED_SSE_LINE and b"\n" not in buffer:
+                await close_upstream(upstream)
+                raise ValueError(
+                    f"unterminated SSE line exceeds {MAX_UNTERMINATED_SSE_LINE} bytes"
+                )
             while b"\n" in buffer:
                 raw, buffer = buffer.split(b"\n", 1)
                 line = raw.decode("utf-8", errors="replace").strip()
@@ -191,9 +200,16 @@ class DownstreamWriter:
 class DownstreamPinger:
     """Ping the downstream SSE whenever it has been idle, independent of upstream."""
 
-    def __init__(self, writer: DownstreamWriter, interval: float | None = None):
+    def __init__(
+        self,
+        writer: DownstreamWriter,
+        interval: float | None = None,
+        *,
+        owner_task: asyncio.Task[Any] | None = None,
+    ):
         self.writer = writer
         self.interval = keepalive_interval(interval)
+        self.owner_task = owner_task
         self._task: asyncio.Task[None] | None = None
 
     def start(self) -> None:
@@ -210,6 +226,15 @@ class DownstreamPinger:
             await task
         except asyncio.CancelledError:
             pass
+        except Exception as exc:
+            print(f"[stream] keepalive task error: {type(exc).__name__}: {exc}", flush=True)
+
+    def _cancel_owner(self) -> None:
+        task = self.owner_task
+        current = asyncio.current_task()
+        if task is None or task is current or task.done():
+            return
+        task.cancel()
 
     async def _run(self) -> None:
         try:
@@ -220,6 +245,12 @@ class DownstreamPinger:
                     try:
                         await self.writer.ping()
                     except ClientDisconnected:
+                        self._cancel_owner()
                         return
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:
+                        self._cancel_owner()
+                        raise
         except asyncio.CancelledError:
             return

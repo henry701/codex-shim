@@ -49,6 +49,26 @@ def is_retryable_status(status: int | None) -> bool:
     return status in RETRYABLE_STATUS
 
 
+_GENERIC_ERROR_MESSAGES = frozenset({"provider returned error", "error"})
+
+
+def _nonempty_str(value: Any) -> str | None:
+    if isinstance(value, str):
+        stripped = value.strip()
+        if stripped:
+            return stripped
+    return None
+
+
+def _error_code_of(value: Any) -> str | None:
+    text = _nonempty_str(value)
+    if text is not None:
+        return text
+    if isinstance(value, int) and not isinstance(value, bool):
+        return str(value)
+    return None
+
+
 def parse_upstream_error(body: str, http_status: int) -> tuple[str, str]:
     text = (body or "").strip()
     code = f"upstream_http_{http_status}"
@@ -64,12 +84,24 @@ def parse_upstream_error(body: str, http_status: int) -> tuple[str, str]:
 
     err = payload.get("error")
     if isinstance(err, dict):
-        nested_message = err.get("message")
-        if isinstance(nested_message, str) and nested_message.strip():
-            message = nested_message.strip()
-        nested_code = err.get("type") or err.get("code")
-        if isinstance(nested_code, str) and nested_code.strip():
-            code = nested_code.strip()
+        nested_message = _nonempty_str(err.get("message"))
+        if nested_message is not None:
+            message = nested_message
+        nested_type = _nonempty_str(err.get("type"))
+        if nested_type is not None:
+            code = nested_type
+        else:
+            nested_code = _error_code_of(err.get("code"))
+            if nested_code is not None:
+                code = nested_code
+        meta = err.get("metadata")
+        if isinstance(meta, dict):
+            provider_code = _error_code_of(meta.get("provider_error_code"))
+            if provider_code is not None and nested_type is None:
+                code = provider_code
+            raw = _nonempty_str(meta.get("raw"))
+            if raw is not None and message.lower() in _GENERIC_ERROR_MESSAGES:
+                message = raw
     elif isinstance(err, str) and err.strip():
         message = err.strip()
 

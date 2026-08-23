@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import asyncio
 
+import pytest
+
 from codex_shim.net.sse import (
+    MAX_UNTERMINATED_SSE_LINE,
     DownstreamWriter,
     PING_BYTES,
     keepalive_interval,
@@ -33,6 +36,12 @@ class _RecordingResponse:
 
     async def write_eof(self):
         pass
+
+
+def test_ping_bytes_is_sse_data_event():
+    assert PING_BYTES.startswith(b"data:")
+    assert b'"type":"ping"' in PING_BYTES
+    assert not PING_BYTES.startswith(b":")
 
 
 def test_keepalive_interval_env_and_floor(monkeypatch):
@@ -82,3 +91,55 @@ async def test_ping_does_not_count_as_content():
     await writer.ping()
     assert writer.content_written is False
     assert writer.ping_count == 1
+
+
+async def test_sse_lines_rejects_oversized_unterminated_line():
+    class Upstream:
+        content = _FakeContent([b"x" * (MAX_UNTERMINATED_SSE_LINE + 1)])
+        closed = False
+
+        def close(self):
+            self.closed = True
+
+        def release(self):
+            pass
+
+    upstream = Upstream()
+    with pytest.raises(ValueError, match="unterminated SSE line"):
+        [line async for line in sse_lines(upstream)]
+    assert upstream.closed is True
+
+
+async def test_sse_lines_preserves_done_marker_at_eof_without_newline():
+    class Upstream:
+        content = _FakeContent([b"data: [DONE]"])
+
+        def close(self):
+            pass
+
+        def release(self):
+            pass
+
+    lines = [line async for line in sse_lines(Upstream())]
+    assert lines == ["[DONE]"]
+
+
+async def test_ping_and_event_writes_are_serialized():
+    response = _RecordingResponse()
+    original_write = response.write
+
+    async def slow_write(data: bytes):
+        await asyncio.sleep(0.04)
+        await original_write(data)
+
+    response.write = slow_write
+    writer = DownstreamWriter(response)
+    writer.activate()
+    try:
+        event_task = asyncio.create_task(writer.write(b"EVENT"))
+        await asyncio.sleep(0.01)
+        ping_task = asyncio.create_task(writer.ping())
+        await asyncio.gather(event_task, ping_task)
+    finally:
+        writer.deactivate()
+    assert response.chunks == [b"EVENT", PING_BYTES]

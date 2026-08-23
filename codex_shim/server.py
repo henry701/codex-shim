@@ -2463,9 +2463,10 @@ class ShimServer:
                 response,
                 emitter,
                 label="chatgpt-passthrough",
+                upstream=upstream,
             ) as guard:
                 try:
-                    async for line in guard.iter_sse(upstream, request):
+                    async for line in guard.iter_sse(request=request):
                         if line == "[DONE]":
                             guard.mark_upstream_done()
                             break
@@ -2500,7 +2501,6 @@ class ShimServer:
                                 cache_items,
                                 terminal=True,
                             )
-                    await _close_upstream(upstream)
             return response
 
     async def _chatgpt_compact_passthrough(
@@ -3512,9 +3512,10 @@ class ShimServer:
                 response,
                 emitter,
                 label=f"byok-openai-responses:{route.slug}",
+                upstream=upstream,
             ) as guard:
                 try:
-                    async for line in guard.iter_sse(upstream, request):
+                    async for line in guard.iter_sse(request=request):
                         if line == "[DONE]":
                             guard.mark_upstream_done()
                             break
@@ -3530,8 +3531,6 @@ class ShimServer:
                             await _safe_write(response, f"data: {line}\n\n".encode())
                 except ClientError as exc:
                     await guard.note_upstream_disconnect(exc)
-                finally:
-                    await _close_upstream(upstream)
             return response
 
     async def _post_openai_chat_completions(
@@ -3687,31 +3686,29 @@ class ShimServer:
             else RawChatEmitter()
         )
         policy = retry_policy_from_env()
-        response: web.StreamResponse | None = None
         messages = list(body.get("messages", []))
         chat_body = {k: v for k, v in body.items() if k != "stream"}
         chat_body["stream"] = True
+        response = _sse_response()
+        await response.prepare(request)
         async with ClientSession(timeout=self.timeout) as session:
-            for attempt in range(policy.attempts):
-                turn_body = {**chat_body, "messages": messages}
-                upstream, err = await self._post_openai_chat_completions(
-                    session, route, turn_body, request.headers
-                )
-                if err is not None:
-                    status, _text, code, message = err
-                    print(
-                        f"[stream] model={route.slug} upstream HTTP {status}: {message[:500]}",
-                        flush=True,
+            async with StreamGuard(
+                response,
+                emitter,
+                label=label,
+                finish_reason=(lambda: state.upstream_finish_reason if state is not None else None),
+            ) as guard:
+                for attempt in range(policy.attempts):
+                    turn_body = {**chat_body, "messages": messages}
+                    upstream, err = await self._post_openai_chat_completions(
+                        session, route, turn_body, request.headers
                     )
-                    if response is None:
-                        response = _sse_response()
-                        await response.prepare(request)
-                    async with StreamGuard(
-                        response,
-                        emitter,
-                        label=label,
-                        finish_reason=(state.upstream_finish_reason if state is not None else None),
-                    ):
+                    if err is not None:
+                        status, _text, code, message = err
+                        print(
+                            f"[stream] model={route.slug} upstream HTTP {status}: {message[:500]}",
+                            flush=True,
+                        )
                         if state is not None:
                             await state.start(response)
                             await state.fail(response, message, code=code)
@@ -3721,20 +3718,12 @@ class ShimServer:
                                 f"upstream {status}: {message[:200]}",
                                 code=code,
                             )
-                    return response
-                observe_upstream_response(f"byok-openai-chat-stream:{route.slug}", upstream)
-                if response is None:
-                    response = prepare_downstream_sse_response(upstream)
-                    await response.prepare(request)
-                state_started = False
-                async with StreamGuard(
-                    response,
-                    emitter,
-                    label=label,
-                    finish_reason=(lambda: state.upstream_finish_reason if state is not None else None),
-                ) as guard:
+                        return response
+                    observe_upstream_response(f"byok-openai-chat-stream:{route.slug}", upstream)
+                    guard.attach_upstream(upstream)
+                    state_started = False
                     try:
-                        async for line in guard.iter_sse(upstream, request):
+                        async for line in guard.iter_sse(request=request):
                             if state is not None and not state_started:
                                 await state.start(response)
                                 state_started = True
@@ -3744,6 +3733,8 @@ class ShimServer:
                             try:
                                 event = json.loads(line)
                             except json.JSONDecodeError:
+                                continue
+                            if isinstance(event, dict) and event.get("type") == "ping":
                                 continue
                             if isinstance(event, dict) and event.get("error"):
                                 code, message = parse_upstream_error(json.dumps(event), 502)
@@ -3758,32 +3749,26 @@ class ShimServer:
                                 await _write_sse(response, event)
                     except ClientError as exc:
                         if guard.can_retry and attempt + 1 < policy.attempts:
-                            guard.abandon()
-                        else:
-                            await guard.note_upstream_disconnect(exc)
-                    finally:
-                        await _close_upstream(upstream)
-                if guard.abandoned:
-                    await policy.sleep(attempt)
-                    continue
-                if (
-                    as_responses
-                    and state is not None
-                    and responses_body is not None
-                    and not state.failed
-                    and not state._has_open_incomplete_items()
-                ):
-                    self._store_responses_turn_conversation(
-                        request,
-                        responses_body,
-                        state.response_id,
-                        state.output_items(),
-                    )
-                return response
-        if response is None:
-            response = _sse_response()
-            await response.prepare(request)
-            async with StreamGuard(response, emitter, label=label):
+                            await _close_upstream(upstream)
+                            guard.attach_upstream(None)
+                            await policy.sleep(attempt)
+                            continue
+                        await guard.note_upstream_disconnect(exc)
+                        return response
+                    if (
+                        as_responses
+                        and state is not None
+                        and responses_body is not None
+                        and not state.failed
+                        and not state._has_open_incomplete_items()
+                    ):
+                        self._store_responses_turn_conversation(
+                            request,
+                            responses_body,
+                            state.response_id,
+                            state.output_items(),
+                        )
+                    return response
                 await emitter.fail(response, "upstream unavailable", code="upstream_error")
         return response
 
@@ -3970,10 +3955,15 @@ class ShimServer:
         await response.prepare(request)
         state = AnthropicMessagesStreamState(route.slug)
         emitter = AnthropicMessagesEmitter(state)
-        async with StreamGuard(response, emitter, label=f"byok-openai-chat-anthropic:{route.slug}") as guard:
+        async with StreamGuard(
+            response,
+            emitter,
+            label=f"byok-openai-chat-anthropic:{route.slug}",
+            upstream=upstream,
+        ) as guard:
             try:
                 await state.start(response)
-                async for line in guard.iter_sse(upstream, request):
+                async for line in guard.iter_sse(request=request):
                     if line == "[DONE]":
                         guard.mark_upstream_done()
                         break
@@ -3984,8 +3974,6 @@ class ShimServer:
                     await state.write_chat_delta(response, event)
             except ClientError as exc:
                 await guard.note_upstream_disconnect(exc)
-            finally:
-                await _close_upstream(upstream)
         return response
 
     async def _stream_anthropic(
@@ -4014,10 +4002,11 @@ class ShimServer:
             emitter,
             label=f"byok-anthropic:{route.slug}",
             finish_reason=(lambda: state.upstream_finish_reason if state is not None else None),
+            upstream=upstream,
         ) as guard:
             state_started = False
             try:
-                async for line in guard.iter_sse(upstream, request):
+                async for line in guard.iter_sse(request=request):
                     if state is not None and not state_started:
                         await state.start(response)
                         state_started = True
@@ -4041,8 +4030,6 @@ class ShimServer:
                         await _write_sse(response, _anthropic_stream_to_chat_chunk(event, client_slug))
             except ClientError as exc:
                 await guard.note_upstream_disconnect(exc)
-            finally:
-                await _close_upstream(upstream)
         if (
             as_responses
             and state is not None
@@ -4066,9 +4053,10 @@ class ShimServer:
             response,
             emitter,
             label=f"byok-anthropic-messages:{model_slug or 'anthropic'}",
+            upstream=upstream,
         ) as guard:
             try:
-                async for line in guard.iter_sse(upstream, request):
+                async for line in guard.iter_sse(request=request):
                     if line == "[DONE]":
                         guard.mark_upstream_done()
                         break
@@ -4088,8 +4076,6 @@ class ShimServer:
                     await _safe_write(response, f"data: {line}\n\n".encode())
             except ClientError as exc:
                 await guard.note_upstream_disconnect(exc)
-            finally:
-                await _close_upstream(upstream)
         return response
 
 
@@ -4482,8 +4468,6 @@ class AnthropicMessagesStreamState:
     async def fail(self, response: web.StreamResponse, message: str, *, code: str = "upstream_error") -> None:
         if self.failed or self.terminal_emitted:
             return
-        self.failed = True
-        self.terminal_emitted = True
         if self.reasoning_open:
             await self._close_reasoning(response)
         if self.text_open:
@@ -4497,6 +4481,8 @@ class AnthropicMessagesStreamState:
             "error",
             {"type": "error", "error": {"type": code, "message": message}},
         )
+        self.failed = True
+        self.terminal_emitted = True
 
     async def _text_delta(self, response: web.StreamResponse, text: str) -> None:
         if self.text_index is None:
@@ -4696,11 +4682,8 @@ class ResponsesStreamState:
         *,
         code: str = "upstream_error",
     ) -> None:
-        if self.failed:
+        if self.failed or self.terminal_emitted:
             return
-        self.failed = True
-        self.terminal_emitted = True
-        self.terminal_event = "response.failed"
         await self.close_turn_items(response)
         await _write_sse(
             response,
@@ -4717,6 +4700,9 @@ class ResponsesStreamState:
             {"type": "response.failed", "response": failed_response},
         )
         await _safe_write(response, b"data: [DONE]\n\n")
+        self.failed = True
+        self.terminal_emitted = True
+        self.terminal_event = "response.failed"
 
     async def finish(self, response: web.StreamResponse, *, upstream_saw_done: bool) -> None:
         """Terminate the turn, always emitting a terminal event.

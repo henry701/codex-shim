@@ -1792,6 +1792,8 @@ async def test_byok_stream_stores_conversation_cache_for_delta_expansion(tmp_pat
         headers=headers,
     )
     assert second.status == 200
+    second_events = _sse_events(await second.text())
+    assert any(event.get("type") == "response.completed" for event in second_events)
     assert len(captured_requests) == 2
     second_messages = captured_requests[1].get("messages") or []
     roles = [msg.get("role") for msg in second_messages]
@@ -1940,7 +1942,7 @@ async def test_chatgpt_sse_keepalive_emits_ping_before_delayed_event(monkeypatch
         )
         assert resp.status == 200
         body = await resp.read()
-        assert b": ping" in body
+        assert b'"type":"ping"' in body
         events = _sse_events(body.decode())
         assert any(event.get("type") == "response.completed" for event in events)
     finally:
@@ -2176,9 +2178,124 @@ async def test_byok_stream_pings_while_upstream_is_silent(monkeypatch, tmp_path)
         )
         assert resp.status == 200
         body = await resp.read()
-        assert b": ping" in body
+        assert b'"type":"ping"' in body
         events = _sse_events(body.decode())
         assert any(event.get("type") == "response.completed" for event in events)
+    finally:
+        await shim_client.close()
+        await upstream_client.close()
+
+
+async def test_byok_stream_pings_during_upstream_429_retry(monkeypatch, tmp_path):
+    """Codex idle-timeouts the stream if 429 retries happen before any SSE bytes."""
+    monkeypatch.setattr("codex_shim.net.sse.SSE_KEEPALIVE_INTERVAL", 0.05)
+    hits = {"n": 0}
+
+    async def chat(request):
+        hits["n"] += 1
+        if hits["n"] == 1:
+            return web.json_response(
+                {
+                    "error": {
+                        "message": "Provider returned error",
+                        "code": 429,
+                        "metadata": {
+                            "raw": "google/gemma-4-26b-a4b-it:free is temporarily rate-limited upstream.",
+                            "provider_error_code": "upstream_429",
+                            "retry_after_seconds": 0.2,
+                        },
+                    }
+                },
+                status=429,
+            )
+        response = web.StreamResponse(headers={"Content-Type": "text/event-stream"})
+        await response.prepare(request)
+        await response.write(b'data: {"choices":[{"delta":{"content":"ok"}}]}\n\n')
+        await response.write(b'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n')
+        await response.write(b"data: [DONE]\n\n")
+        await response.write_eof()
+        return response
+
+    upstream = web.Application()
+    upstream.router.add_post("/v1/chat/completions", chat)
+    upstream_client = TestClient(TestServer(upstream))
+    await upstream_client.start_server()
+
+    shim_client = TestClient(TestServer(ShimServer(_byok_settings(upstream_client, tmp_path)).app()))
+    await shim_client.start_server()
+    try:
+        resp = await shim_client.post(
+            "/v1/responses",
+            json={"model": "real-openai", "input": "hi", "stream": True},
+        )
+        assert resp.status == 200
+        body = await resp.read()
+        assert b'"type":"ping"' in body
+        events = _sse_events(body.decode())
+        assert any(event.get("type") == "response.completed" for event in events)
+        assert hits["n"] == 2
+    finally:
+        await shim_client.close()
+        await upstream_client.close()
+
+
+async def test_byok_websocket_pings_during_upstream_429_retry(monkeypatch, tmp_path):
+    monkeypatch.setattr("codex_shim.net.sse.SSE_KEEPALIVE_INTERVAL", 0.05)
+    hits = {"n": 0}
+
+    async def chat(request):
+        hits["n"] += 1
+        if hits["n"] == 1:
+            return web.json_response(
+                {
+                    "error": {
+                        "message": "Provider returned error",
+                        "code": 429,
+                        "metadata": {
+                            "raw": "temporarily rate-limited upstream",
+                            "provider_error_code": "upstream_429",
+                            "retry_after_seconds": 0.2,
+                        },
+                    }
+                },
+                status=429,
+            )
+        response = web.StreamResponse(headers={"Content-Type": "text/event-stream"})
+        await response.prepare(request)
+        await response.write(b'data: {"choices":[{"delta":{"content":"ok"}}]}\n\n')
+        await response.write(b'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n')
+        await response.write(b"data: [DONE]\n\n")
+        await response.write_eof()
+        return response
+
+    upstream = web.Application()
+    upstream.router.add_post("/v1/chat/completions", chat)
+    upstream_client = TestClient(TestServer(upstream))
+    await upstream_client.start_server()
+
+    shim_client = TestClient(TestServer(ShimServer(_byok_settings(upstream_client, tmp_path)).app()))
+    await shim_client.start_server()
+    try:
+        ws = await shim_client.ws_connect("/v1/responses")
+        await ws.send_json(
+            {
+                "type": "response.create",
+                "model": "real-openai",
+                "input": [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]}],
+                "stream": True,
+            }
+        )
+        types: list[str] = []
+        while True:
+            msg = await ws.receive(timeout=5)
+            assert msg.type == WSMsgType.TEXT
+            payload = json.loads(msg.data)
+            types.append(str(payload.get("type") or ""))
+            if payload.get("type") in {"response.completed", "response.failed", "error"}:
+                break
+        assert "ping" in types
+        assert "response.completed" in types
+        await ws.close()
     finally:
         await shim_client.close()
         await upstream_client.close()
