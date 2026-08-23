@@ -27,7 +27,7 @@ from .net.emitters import (
     ResponsesEmitter,
     WsRelayEmitter,
 )
-from .net.errors import parse_upstream_error
+from .net.errors import chat_chunk_upstream_error, parse_upstream_error
 from .net.retry import retry_aiohttp_post, retry_policy_from_env
 from .net.sse import (
     ClientDisconnected,
@@ -3721,8 +3721,33 @@ class ShimServer:
         chat_body = {k: v for k, v in body.items() if k != "stream"}
         chat_body["stream"] = True
         response = _sse_response()
-        await response.prepare(request)
+        prepared = False
+
+        async def ensure_prepared() -> None:
+            nonlocal prepared
+            if not prepared:
+                await response.prepare(request)
+                prepared = True
+
+        if as_responses:
+            await ensure_prepared()
         async with ClientSession(timeout=self.timeout) as session:
+            pending_upstream = None
+            if not as_responses:
+                pending_upstream, err = await self._post_openai_chat_completions(
+                    session, route, {**chat_body, "messages": messages}, request.headers
+                )
+                if err is not None:
+                    status, _text, code, message = err
+                    print(
+                        f"[stream] model={route.slug} upstream HTTP {status}: {message[:500]}",
+                        flush=True,
+                    )
+                    return web.json_response(
+                        {"error": {"message": message, "type": code, "code": code}},
+                        status=status,
+                    )
+                await ensure_prepared()
             async with StreamGuard(
                 response,
                 emitter,
@@ -3742,10 +3767,14 @@ class ShimServer:
                         await _close_upstream(src)
 
                 while True:
-                    turn_body = {**chat_body, "messages": messages}
-                    upstream, err = await self._post_openai_chat_completions(
-                        session, route, turn_body, request.headers
-                    )
+                    if pending_upstream is not None:
+                        upstream, err = pending_upstream, None
+                        pending_upstream = None
+                    else:
+                        turn_body = {**chat_body, "messages": messages}
+                        upstream, err = await self._post_openai_chat_completions(
+                            session, route, turn_body, request.headers
+                        )
                     if err is not None:
                         status, _text, code, message = err
                         print(
@@ -3759,6 +3788,7 @@ class ShimServer:
                                 flush=True,
                             )
                             break
+                        await ensure_prepared()
                         if state is not None:
                             if not state_started:
                                 await state.start(response)
@@ -3791,13 +3821,15 @@ class ShimServer:
                                 continue
                             if isinstance(event, dict) and event.get("type") == "ping":
                                 continue
-                            if isinstance(event, dict) and event.get("error"):
-                                code, message = parse_upstream_error(json.dumps(event), 502)
-                                if state is not None:
-                                    await state.fail(response, message, code=code)
-                                else:
-                                    await emitter.fail(response, message, code=code)
-                                break
+                            if isinstance(event, dict):
+                                chunk_error = chat_chunk_upstream_error(event)
+                                if chunk_error is not None:
+                                    code, message = chunk_error
+                                    if state is not None:
+                                        await state.fail(response, message, code=code)
+                                    else:
+                                        await emitter.fail(response, message, code=code)
+                                    break
                             if state is not None:
                                 filtered = (
                                     skipper.filter_chunk(event)
@@ -4756,6 +4788,7 @@ class ResponsesStreamState:
         self.next_output_index = 0
         self.completed_turns: list[dict[str, Any]] = []
         self.upstream_finish_reason: str | None = None
+        self.upstream_native_finish_reason: str | None = None
         self.tool_types = tool_types or {}
         self.tool_resolve = tool_resolve or {}
 
@@ -4813,6 +4846,20 @@ class ResponsesStreamState:
                 "synthesizing terminal event",
                 flush=True,
             )
+        error_reason = self._upstream_error_finish_reason()
+        if error_reason or (
+            not self._has_visible_output()
+            and not upstream_saw_done
+            and not self._has_open_incomplete_items()
+        ):
+            code = error_reason or "upstream_empty_stream"
+            message = (
+                f"Upstream finished with {error_reason}"
+                if error_reason
+                else "Upstream stream ended without content"
+            )
+            await self.fail(response, message, code=code)
+            return
         conclusive = is_conclusive_finish(
             self.upstream_finish_reason, saw_done=upstream_saw_done
         )
@@ -4838,6 +4885,27 @@ class ResponsesStreamState:
             self.terminal_event = "response.incomplete"
         await _safe_write(response, b"data: [DONE]\n\n")
         self.terminal_emitted = True
+
+    def _upstream_error_finish_reason(self) -> str | None:
+        native = str(self.upstream_native_finish_reason or "").strip().lower()
+        finish = str(self.upstream_finish_reason or "").strip().lower()
+        if native in {"error", "network_error", "provider_error", "internal_error", "unknown_error"}:
+            return native
+        if finish in {"error", "network_error", "provider_error", "internal_error", "unknown_error"}:
+            return finish
+        return None
+
+    def _has_visible_output(self) -> bool:
+        if str(self.message_text or "").strip():
+            return True
+        for tc in (
+            *self.tool_calls.values(),
+            *self.mcp_tool_calls.values(),
+            *self.tool_search_calls.values(),
+        ):
+            if str(tc.get("name") or "").strip() or str(tc.get("arguments") or "").strip():
+                return True
+        return False
 
     def _has_open_incomplete_items(self) -> bool:
         if self.message_opened and not self.message_closed:
@@ -4913,6 +4981,8 @@ class ResponsesStreamState:
         self.tool_search_calls = {}
         self.reasoning_blocks = {}
         self.finished_messages = []
+        self.upstream_finish_reason = None
+        self.upstream_native_finish_reason = None
 
     def _current_turn_dict(self) -> dict[str, Any]:
         return {
@@ -4942,6 +5012,9 @@ class ResponsesStreamState:
         finish_reason = choice.get("finish_reason")
         if finish_reason is not None:
             self.upstream_finish_reason = str(finish_reason)
+        native_finish = choice.get("native_finish_reason")
+        if native_finish is not None:
+            self.upstream_native_finish_reason = str(native_finish)
         delta = choice.get("delta") or {}
         reasoning = delta.get("reasoning_content") or delta.get("reasoning")
         if reasoning:

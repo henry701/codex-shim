@@ -2602,6 +2602,198 @@ async def test_byok_stream_fails_terminally_on_internal_error(monkeypatch, tmp_p
         await upstream_client.close()
 
 
+def _fast_upstream_retries(monkeypatch):
+    monkeypatch.setenv("CODEX_SHIM_RETRY_ATTEMPTS", "1")
+    monkeypatch.setenv("CODEX_SHIM_RETRY_WAIT_BUDGET", "0")
+    monkeypatch.setattr("codex_shim.net.retry.DEFAULT_429_RETRY_AFTER", 0.0)
+
+
+async def test_byok_responses_stream_exhausted_429_emits_response_failed(monkeypatch, tmp_path):
+    _fast_upstream_retries(monkeypatch)
+
+    async def chat(request):
+        return web.json_response(
+            {
+                "error": {
+                    "message": "The requested model is temporarily at capacity upstream.",
+                    "code": 429,
+                }
+            },
+            status=429,
+        )
+
+    upstream = web.Application()
+    upstream.router.add_post("/v1/chat/completions", chat)
+    upstream_client = TestClient(TestServer(upstream))
+    await upstream_client.start_server()
+    shim_client = TestClient(TestServer(ShimServer(_byok_settings(upstream_client, tmp_path)).app()))
+    await shim_client.start_server()
+    try:
+        resp = await shim_client.post(
+            "/v1/responses",
+            json={"model": "real-openai", "input": "hi", "stream": True},
+        )
+        events = _sse_events((await resp.read()).decode())
+        terminals = [
+            event.get("type")
+            for event in events
+            if event.get("type") in {"response.completed", "response.incomplete", "response.failed"}
+        ]
+        assert terminals == ["response.failed"]
+        failed = next(event for event in events if event.get("type") == "response.failed")
+        assert "capacity" in (failed.get("response") or {}).get("error", {}).get("message", "")
+        assert not any(event.get("type") == "response.completed" for event in events)
+    finally:
+        await shim_client.close()
+        await upstream_client.close()
+
+
+async def test_byok_chat_stream_exhausted_429_returns_http_error(monkeypatch, tmp_path):
+    _fast_upstream_retries(monkeypatch)
+
+    async def chat(request):
+        return web.json_response(
+            {
+                "error": {
+                    "message": "The requested model is temporarily at capacity upstream.",
+                    "code": 429,
+                }
+            },
+            status=429,
+        )
+
+    upstream = web.Application()
+    upstream.router.add_post("/v1/chat/completions", chat)
+    upstream_client = TestClient(TestServer(upstream))
+    await upstream_client.start_server()
+    shim_client = TestClient(TestServer(ShimServer(_byok_settings(upstream_client, tmp_path)).app()))
+    await shim_client.start_server()
+    try:
+        resp = await shim_client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "real-openai",
+                "messages": [{"role": "user", "content": "hi"}],
+                "stream": True,
+            },
+        )
+        body = await resp.read()
+        assert resp.status == 429
+        payload = json.loads(body)
+        message = str(payload.get("error") or payload)
+        assert "capacity" in message.lower() or "429" in message
+        assert b"response.completed" not in body
+        assert b'"content":' not in body or b'"content": null' in body or b'"content":null' in body
+    finally:
+        await shim_client.close()
+        await upstream_client.close()
+
+
+async def test_byok_responses_stream_network_error_finish_is_failed_not_empty_completed(
+    tmp_path,
+):
+    async def chat(request):
+        response = web.StreamResponse(headers={"Content-Type": "text/event-stream"})
+        await response.prepare(request)
+        await response.write(
+            b'data: {"choices":[{"delta":{"content":"","role":"assistant"},'
+            b'"finish_reason":"stop","native_finish_reason":"network_error"}]}\n\n'
+        )
+        await response.write_eof()
+        return response
+
+    upstream = web.Application()
+    upstream.router.add_post("/v1/chat/completions", chat)
+    upstream_client = TestClient(TestServer(upstream))
+    await upstream_client.start_server()
+    shim_client = TestClient(TestServer(ShimServer(_byok_settings(upstream_client, tmp_path)).app()))
+    await shim_client.start_server()
+    try:
+        resp = await shim_client.post(
+            "/v1/responses",
+            json={"model": "real-openai", "input": "hi", "stream": True},
+        )
+        events = _sse_events((await resp.read()).decode())
+        terminals = [
+            event.get("type")
+            for event in events
+            if event.get("type") in {"response.completed", "response.incomplete", "response.failed"}
+        ]
+        assert terminals == ["response.failed"]
+        assert not any(event.get("type") == "response.output_text.delta" for event in events)
+    finally:
+        await shim_client.close()
+        await upstream_client.close()
+
+
+async def test_byok_chat_stream_network_error_finish_emits_error_not_empty_assistant(tmp_path):
+    async def chat(request):
+        response = web.StreamResponse(headers={"Content-Type": "text/event-stream"})
+        await response.prepare(request)
+        await response.write(
+            b'data: {"choices":[{"delta":{"content":"","role":"assistant"},'
+            b'"finish_reason":"stop","native_finish_reason":"network_error"}]}\n\n'
+        )
+        await response.write_eof()
+        return response
+
+    upstream = web.Application()
+    upstream.router.add_post("/v1/chat/completions", chat)
+    upstream_client = TestClient(TestServer(upstream))
+    await upstream_client.start_server()
+    shim_client = TestClient(TestServer(ShimServer(_byok_settings(upstream_client, tmp_path)).app()))
+    await shim_client.start_server()
+    try:
+        resp = await shim_client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "real-openai",
+                "messages": [{"role": "user", "content": "hi"}],
+                "stream": True,
+            },
+        )
+        body = (await resp.read()).decode()
+        events = _sse_events(body)
+        assert any(event.get("error") for event in events), body
+        assert not any(
+            ((event.get("choices") or [{}])[0].get("delta") or {}).get("content")
+            for event in events
+        )
+    finally:
+        await shim_client.close()
+        await upstream_client.close()
+
+
+async def test_responses_stream_state_empty_network_error_finish_fails():
+    class FakeResponse:
+        def __init__(self):
+            self.chunks: list[bytes] = []
+
+        async def write(self, data: bytes):
+            self.chunks.append(data)
+
+    downstream = FakeResponse()
+    state = ResponsesStreamState("stealth-ox")
+    await state.start(downstream)
+    await state.write_chat_delta(
+        downstream,
+        {
+            "choices": [
+                {
+                    "delta": {"content": "", "role": "assistant"},
+                    "finish_reason": "stop",
+                    "native_finish_reason": "network_error",
+                }
+            ]
+        },
+    )
+    await state.finish(downstream, upstream_saw_done=False)
+    events = _sse_events(b"".join(downstream.chunks).decode())
+    assert [event.get("type") for event in events if event.get("type") in {"response.completed", "response.failed"}] == [
+        "response.failed"
+    ]
+
+
 async def test_request_disconnected_reflects_closing_transport():
     class FakeTransport:
         def __init__(self, closing: bool):

@@ -6,7 +6,11 @@ from urllib.error import HTTPError, URLError
 
 import pytest
 
-from codex_shim.net.errors import is_retryable_exception, parse_upstream_error
+from codex_shim.net.errors import (
+    chat_chunk_upstream_error,
+    is_retryable_exception,
+    parse_upstream_error,
+)
 from codex_shim.net.retry import RetryPolicy, request_urllib, retry_aiohttp_post, retry_policy_from_env
 
 
@@ -213,6 +217,34 @@ def test_parse_upstream_error_and_retryable_exception():
     assert message == "nope"
     assert is_retryable_exception(TimeoutError("late")) is True
     assert is_retryable_exception(ValueError("nope")) is False
+
+
+def test_chat_chunk_upstream_error_detects_native_network_error():
+    chunk = {
+        "choices": [
+            {
+                "delta": {"content": "", "role": "assistant"},
+                "finish_reason": "stop",
+                "native_finish_reason": "network_error",
+                "message": {"role": "assistant", "content": None},
+            }
+        ]
+    }
+    code, message = chat_chunk_upstream_error(chunk)
+    assert code == "network_error"
+    assert "network_error" in message
+
+
+def test_chat_chunk_upstream_error_detects_embedded_error_object():
+    chunk = {"error": {"message": "The requested model is temporarily at capacity upstream.", "code": 429}}
+    code, message = chat_chunk_upstream_error(chunk)
+    assert "429" in code or code == "upstream_http_502"
+    assert "capacity" in message
+
+
+def test_chat_chunk_upstream_error_ignores_normal_stop():
+    chunk = {"choices": [{"delta": {"content": "hi"}, "finish_reason": "stop"}]}
+    assert chat_chunk_upstream_error(chunk) is None
 
 
 def test_parse_upstream_error_unwraps_openrouter_metadata_raw():

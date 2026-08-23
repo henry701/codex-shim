@@ -69,6 +69,38 @@ def _error_code_of(value: Any) -> str | None:
     return None
 
 
+UPSTREAM_FAILURE_FINISH_REASONS = frozenset(
+    {
+        "error",
+        "network_error",
+        "provider_error",
+        "internal_error",
+        "unknown_error",
+    }
+)
+
+
+def chat_chunk_upstream_error(chunk: Any) -> tuple[str, str] | None:
+    """Return (code, message) when a chat.completion chunk is an upstream failure."""
+    if not isinstance(chunk, dict):
+        return None
+    if chunk.get("error") is not None:
+        return parse_upstream_error(json.dumps(chunk), 502)
+    choice = (chunk.get("choices") or [None])[0]
+    if not isinstance(choice, dict):
+        return None
+    native = str(choice.get("native_finish_reason") or "").strip().lower()
+    finish = str(choice.get("finish_reason") or "").strip().lower()
+    reason = ""
+    if native in UPSTREAM_FAILURE_FINISH_REASONS:
+        reason = native
+    elif finish in UPSTREAM_FAILURE_FINISH_REASONS:
+        reason = finish
+    if not reason:
+        return None
+    return reason, f"Upstream finished with {reason}"
+
+
 def parse_upstream_error(body: str, http_status: int) -> tuple[str, str]:
     text = (body or "").strip()
     code = f"upstream_http_{http_status}"
