@@ -9,6 +9,7 @@ import re
 import secrets
 import sys
 import time
+import traceback
 import uuid
 from collections.abc import AsyncIterator
 from pathlib import Path
@@ -3632,6 +3633,13 @@ class ShimServer:
         chat_body = {k: v for k, v in body.items() if k != "stream"}
         chat_body["stream"] = True
         upstream_saw_done = False
+        # Per-turn stream diagnostics: a turn that dies without a terminal event
+        # is invisible in the request log, so every turn reports how it ended.
+        stream_started_at = time.monotonic()
+        keepalive_stats: dict[str, Any] = {"pings": 0}
+        upstream_events = 0
+        last_event_at = stream_started_at
+        max_silence = 0.0
         try:
             async with ClientSession(timeout=self.timeout) as session:
                 for _ in range(max_turns):
@@ -3668,7 +3676,13 @@ class ShimServer:
                         await state.start(response)
                         state_started = True
                     try:
-                        async for line in _sse_lines(upstream, request):
+                        async for line in _iter_sse_lines_with_keepalive(
+                            upstream, request, response, stats=keepalive_stats
+                        ):
+                            now = time.monotonic()
+                            max_silence = max(max_silence, now - last_event_at)
+                            last_event_at = now
+                            upstream_events += 1
                             if line == "[DONE]":
                                 upstream_saw_done = True
                                 break
@@ -3702,29 +3716,40 @@ class ShimServer:
                     finally:
                         await _close_upstream(upstream)
                     break
-            if as_responses and state is not None and not state.failed:
+            if as_responses and state is not None and response is not None and not state.failed:
                 await state.finish(response, upstream_saw_done=upstream_saw_done)
-                if (
-                    upstream_saw_done
-                    and responses_body is not None
-                    and not state._has_open_incomplete_items()
-                ):
+                if responses_body is not None and not state._has_open_incomplete_items():
                     self._store_responses_turn_conversation(
                         request,
                         responses_body,
                         state.response_id,
                         state.output_items(),
                     )
-            elif upstream_saw_done:
+            elif response is not None and not as_responses:
                 await _safe_write(response, b"data: [DONE]\n\n")
         except asyncio.CancelledError:
             print("[cancel] client disconnected during BYOK stream", flush=True)
             raise
         except ClientDisconnected:
             print("[cancel] client disconnected during BYOK stream", flush=True)
+        except Exception as exc:
+            # Letting this escape drops the SSE with no terminal event, and Desktop
+            # kills the turn with "stream closed before response.completed".
+            traceback.print_exc()
+            await _fail_stream_terminally(response, state, exc, route.slug)
         if response is None:
             response = _sse_response()
             await response.prepare(request)
+        max_silence = max(max_silence, time.monotonic() - last_event_at)
+        print(
+            f"[stream-end] byok-openai-chat:{route.slug} "
+            f"elapsed={time.monotonic() - stream_started_at:.1f}s "
+            f"upstream_events={upstream_events} saw_done={upstream_saw_done} "
+            f"max_silence={max_silence:.1f}s pings={keepalive_stats['pings']} "
+            f"terminal={(state.terminal_event if state is not None else 'n/a') or 'NONE'} "
+            f"finish_reason={state.upstream_finish_reason if state is not None else 'n/a'}",
+            flush=True,
+        )
         try:
             await response.write_eof()
         except Exception:
@@ -3936,7 +3961,7 @@ class ShimServer:
             if as_responses:
                 await state.start(response)
             try:
-                async for line in _sse_lines(upstream, request):
+                async for line in _iter_sse_lines_with_keepalive(upstream, request, response):
                     if line == "[DONE]":
                         upstream_saw_done = True
                         break
@@ -3969,24 +3994,24 @@ class ShimServer:
                     )
             if as_responses and not state.failed:
                 await state.finish(response, upstream_saw_done=upstream_saw_done)
-                if (
-                    upstream_saw_done
-                    and responses_body is not None
-                    and not state._has_open_incomplete_items()
-                ):
+                if responses_body is not None and not state._has_open_incomplete_items():
                     self._store_responses_turn_conversation(
                         request,
                         responses_body,
                         state.response_id,
                         state.output_items(),
                     )
-            elif upstream_saw_done:
+            elif not as_responses:
                 await _safe_write(response, b"data: [DONE]\n\n")
         except asyncio.CancelledError:
             print("[cancel] client disconnected during Anthropic stream", flush=True)
             raise
         except ClientDisconnected:
             print("[cancel] client disconnected during Anthropic stream", flush=True)
+        except Exception as exc:
+            # See _stream_chat_loop: a bare drop makes Desktop discard the turn.
+            traceback.print_exc()
+            await _fail_stream_terminally(response, state, exc, route.slug)
         finally:
             await _close_upstream(upstream)
         try:
@@ -4553,8 +4578,8 @@ class ResponsesStreamState:
     each tool call as separate output items with stable indices, and emits
     proper .added / .delta / .done / .completed events plus a final
     proper .added / .delta / .done / .completed events. Emits ``response.completed``
-    and client ``[DONE]`` only when upstream sent ``[DONE]`` and every open item
-    was fully received."""
+    only when every open item was fully received, and ``response.incomplete``
+    otherwise; either way the turn always ends with a terminal event."""
 
     def __init__(
         self,
@@ -4567,6 +4592,7 @@ class ResponsesStreamState:
         self.model = model
         self.failed = False
         self.terminal_emitted = False
+        self.terminal_event: str | None = None
         self.message_index: int | None = None  # output_index for the assistant message
         self.message_text = ""
         self.message_opened = False
@@ -4605,6 +4631,7 @@ class ResponsesStreamState:
             return
         self.failed = True
         self.terminal_emitted = True
+        self.terminal_event = "response.failed"
         await self.close_turn_items(response)
         await _write_sse(
             response,
@@ -4623,17 +4650,31 @@ class ResponsesStreamState:
         await response.write(b"data: [DONE]\n\n")
 
     async def finish(self, response: web.StreamResponse, *, upstream_saw_done: bool) -> None:
+        """Terminate the turn, always emitting a terminal event.
+
+        Plenty of OpenAI-compatible upstreams (and any proxy that cuts a long
+        stream) end the SSE with a bare EOF instead of ``data: [DONE]``. Closing
+        our own stream without a terminal event makes Codex Desktop abort the
+        turn with "stream closed before response.completed" and lose the whole
+        turn, so a missing sentinel is downgraded to ``response.incomplete``
+        rather than silence.
+        """
         if self.failed or self.terminal_emitted:
             return
         await self.close_turn_items(response)
-        if upstream_saw_done and not self._has_open_incomplete_items():
+        if not upstream_saw_done:
+            print(
+                f"[stream] model={self.model} upstream ended without [DONE]; "
+                "synthesizing terminal event",
+                flush=True,
+            )
+        if not self._has_open_incomplete_items():
             await _write_sse(
                 response,
                 {"type": "response.completed", "response": self._response("completed", final=True)},
             )
-            await response.write(b"data: [DONE]\n\n")
-            self.terminal_emitted = True
-        elif upstream_saw_done:
+            self.terminal_event = "response.completed"
+        else:
             self._log_incomplete_tool_calls()
             incomplete_response = self._response("incomplete", final=True)
             if self.upstream_finish_reason == "length":
@@ -4642,10 +4683,9 @@ class ResponsesStreamState:
                 response,
                 {"type": "response.incomplete", "response": incomplete_response},
             )
-            await response.write(b"data: [DONE]\n\n")
-            self.terminal_emitted = True
-        elif self._has_open_incomplete_items():
-            self._log_incomplete_tool_calls()
+            self.terminal_event = "response.incomplete"
+        await response.write(b"data: [DONE]\n\n")
+        self.terminal_emitted = True
 
     def _has_open_incomplete_items(self) -> bool:
         if self.message_opened and not self.message_closed:
@@ -6594,6 +6634,33 @@ async def _iter_upstream_chunks(content, request: web.Request | None = None):
         raise
 
 
+async def _fail_stream_terminally(
+    response: web.StreamResponse | None,
+    state: Any,
+    exc: BaseException,
+    model_slug: str,
+) -> None:
+    """Turn an unexpected shim-side stream error into ``response.failed``.
+
+    Desktop treats a closed SSE without a terminal event as a lost turn, so a
+    crash mid-stream must still be reported in-band.
+    """
+    print(
+        f"[stream] model={model_slug} internal stream error: {type(exc).__name__}: {exc}",
+        flush=True,
+    )
+    if response is None or state is None or state.failed or state.terminal_emitted:
+        return
+    try:
+        await state.fail(
+            response,
+            f"Shim stream error: {type(exc).__name__}: {exc}",
+            code="shim_stream_error",
+        )
+    except Exception:
+        pass
+
+
 async def _sse_lines(upstream, request: web.Request | None = None) -> Any:
     buffer = b""
     content = upstream.content
@@ -6619,6 +6686,7 @@ async def _iter_sse_lines_with_keepalive(
     response: web.StreamResponse,
     *,
     interval: float | None = None,
+    stats: dict[str, Any] | None = None,
 ) -> Any:
     """Yield SSE data lines and write ``: ping`` while the upstream is silent.
 
@@ -6634,6 +6702,8 @@ async def _iter_sse_lines_with_keepalive(
             done, _pending = await asyncio.wait({read_task}, timeout=timeout)
             if not done:
                 await _safe_write(response, b": ping\n\n")
+                if stats is not None:
+                    stats["pings"] = stats.get("pings", 0) + 1
                 continue
             try:
                 line = read_task.result()

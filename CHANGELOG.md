@@ -46,6 +46,25 @@ and this project does not yet follow semantic versioning (pre-1.0).
 
 ### Fixed
 
+- BYOK Responses streams always end with a terminal event. Previously an
+  upstream that closed its SSE without `data: [DONE]` (Nous Portal, and any
+  proxy that cuts a long stream) made the shim close its own stream silently,
+  and Codex Desktop killed the turn with "stream disconnected before
+  completion: stream closed before response.completed". A missing sentinel now
+  emits `response.completed` when every item was fully received and
+  `response.incomplete` otherwise. An unexpected shim-side exception mid-stream
+  emits `response.failed` instead of dropping the connection.
+
+- BYOK OpenAI-chat and Anthropic Responses streams now send `: ping`
+  keepalives while the upstream is silent, matching ChatGPT passthrough. Long
+  silent generations (extended reasoning) no longer look like a dead
+  connection to Desktop.
+
+- Every BYOK chat stream logs a `[stream-end]` line with elapsed time,
+  upstream event count, whether `[DONE]` arrived, longest upstream silence,
+  keepalive pings, the terminal event emitted, and the upstream finish reason.
+  `terminal=NONE` in that line means a turn ended without a terminal event.
+
 - Truncated JSON `apply_patch` envelopes at stream end are no longer emitted
   as complete `custom_tool_call` input. JSON-looking custom-tool arguments
   must parse; leftover non-JSON patch text is still accepted at stream end.

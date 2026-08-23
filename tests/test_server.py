@@ -1992,6 +1992,183 @@ async def test_chatgpt_sse_keepalive_disconnect_during_wait_closes_upstream(
         await shim_client.close()
 
 
+def _byok_settings(upstream_client, tmp_path):
+    settings = tmp_path / "settings.json"
+    settings.write_text(
+        json.dumps(
+            {
+                "models": [
+                    {
+                        "model": "real-openai",
+                        "display_name": "Real OpenAI",
+                        "provider": "openai",
+                        "base_url": str(upstream_client.make_url("/v1")),
+                        "api_key": "secret",
+                    }
+                ]
+            }
+        )
+    )
+    return settings
+
+
+async def test_byok_stream_emits_completed_when_upstream_omits_done(tmp_path):
+    """Upstream EOF without ``data: [DONE]`` must still terminate the turn.
+
+    Desktop aborts with "stream closed before response.completed" when the SSE
+    ends with no terminal event.
+    """
+
+    async def chat(request):
+        response = web.StreamResponse(headers={"Content-Type": "text/event-stream"})
+        await response.prepare(request)
+        await response.write(b'data: {"choices":[{"delta":{"content":"hello"}}]}\n\n')
+        await response.write(b'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n')
+        await response.write_eof()
+        return response
+
+    upstream = web.Application()
+    upstream.router.add_post("/v1/chat/completions", chat)
+    upstream_client = TestClient(TestServer(upstream))
+    await upstream_client.start_server()
+
+    shim_client = TestClient(TestServer(ShimServer(_byok_settings(upstream_client, tmp_path)).app()))
+    await shim_client.start_server()
+    try:
+        resp = await shim_client.post(
+            "/v1/responses",
+            json={"model": "real-openai", "input": "hi", "stream": True},
+        )
+        assert resp.status == 200
+        events = _sse_events((await resp.read()).decode())
+        terminal = [
+            event.get("type")
+            for event in events
+            if event.get("type")
+            in {"response.completed", "response.incomplete", "response.failed"}
+        ]
+        assert terminal == ["response.completed"]
+        assert any(event.get("delta") == "hello" for event in events)
+    finally:
+        await shim_client.close()
+        await upstream_client.close()
+
+
+async def test_byok_stream_emits_incomplete_when_truncated_without_done(tmp_path):
+    """Upstream dying mid tool-call must emit a terminal event, not close silently."""
+
+    async def chat(request):
+        response = web.StreamResponse(headers={"Content-Type": "text/event-stream"})
+        await response.prepare(request)
+        await response.write(
+            b'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1",'
+            b'"function":{"name":"exec_command","arguments":"{\\"cmd\\": \\"ls"}}]}}]}\n\n'
+        )
+        await response.write_eof()
+        return response
+
+    upstream = web.Application()
+    upstream.router.add_post("/v1/chat/completions", chat)
+    upstream_client = TestClient(TestServer(upstream))
+    await upstream_client.start_server()
+
+    shim_client = TestClient(TestServer(ShimServer(_byok_settings(upstream_client, tmp_path)).app()))
+    await shim_client.start_server()
+    try:
+        resp = await shim_client.post(
+            "/v1/responses",
+            json={"model": "real-openai", "input": "hi", "stream": True},
+        )
+        assert resp.status == 200
+        events = _sse_events((await resp.read()).decode())
+        terminal = [
+            event.get("type")
+            for event in events
+            if event.get("type")
+            in {"response.completed", "response.incomplete", "response.failed"}
+        ]
+        assert terminal == ["response.incomplete"]
+    finally:
+        await shim_client.close()
+        await upstream_client.close()
+
+
+async def test_byok_stream_pings_while_upstream_is_silent(monkeypatch, tmp_path):
+    """Long silent generations must keep the downstream SSE warm."""
+    monkeypatch.setattr(server_module, "SSE_KEEPALIVE_INTERVAL", 0.05)
+
+    async def chat(request):
+        response = web.StreamResponse(headers={"Content-Type": "text/event-stream"})
+        await response.prepare(request)
+        await asyncio.sleep(0.3)
+        await response.write(b'data: {"choices":[{"delta":{"content":"slow"}}]}\n\n')
+        await response.write(b"data: [DONE]\n\n")
+        await response.write_eof()
+        return response
+
+    upstream = web.Application()
+    upstream.router.add_post("/v1/chat/completions", chat)
+    upstream_client = TestClient(TestServer(upstream))
+    await upstream_client.start_server()
+
+    shim_client = TestClient(TestServer(ShimServer(_byok_settings(upstream_client, tmp_path)).app()))
+    await shim_client.start_server()
+    try:
+        resp = await shim_client.post(
+            "/v1/responses",
+            json={"model": "real-openai", "input": "hi", "stream": True},
+        )
+        assert resp.status == 200
+        body = await resp.read()
+        assert b": ping" in body
+        events = _sse_events(body.decode())
+        assert any(event.get("type") == "response.completed" for event in events)
+    finally:
+        await shim_client.close()
+        await upstream_client.close()
+
+
+async def test_byok_stream_fails_terminally_on_internal_error(monkeypatch, tmp_path):
+    """An unexpected shim-side error must surface as response.failed, not a dropped SSE."""
+
+    async def chat(request):
+        response = web.StreamResponse(headers={"Content-Type": "text/event-stream"})
+        await response.prepare(request)
+        await response.write(b'data: {"choices":[{"delta":{"content":"hello"}}]}\n\n')
+        await response.write(b"data: [DONE]\n\n")
+        await response.write_eof()
+        return response
+
+    async def boom(self, response, event):
+        raise RuntimeError("malformed upstream event")
+
+    monkeypatch.setattr(ResponsesStreamState, "write_chat_delta", boom)
+
+    upstream = web.Application()
+    upstream.router.add_post("/v1/chat/completions", chat)
+    upstream_client = TestClient(TestServer(upstream))
+    await upstream_client.start_server()
+
+    shim_client = TestClient(TestServer(ShimServer(_byok_settings(upstream_client, tmp_path)).app()))
+    await shim_client.start_server()
+    try:
+        resp = await shim_client.post(
+            "/v1/responses",
+            json={"model": "real-openai", "input": "hi", "stream": True},
+        )
+        assert resp.status == 200
+        events = _sse_events((await resp.read()).decode())
+        assert [
+            event.get("type")
+            for event in events
+            if event.get("type")
+            in {"response.completed", "response.incomplete", "response.failed"}
+        ] == ["response.failed"]
+    finally:
+        await shim_client.close()
+        await upstream_client.close()
+
+
 async def test_request_disconnected_reflects_closing_transport():
     class FakeTransport:
         def __init__(self, closing: bool):
@@ -2680,7 +2857,7 @@ async def test_finish_emits_response_incomplete_with_length_reason_when_upstream
     assert terminal["response"]["incomplete_details"] == {"reason": "max_output_tokens"}
 
 
-async def test_finish_emits_response_completed_only_when_upstream_done_and_items_complete():
+async def test_finish_emits_response_completed_when_items_complete():
     class FakeResponse:
         def __init__(self):
             self.chunks: list[bytes] = []
@@ -2700,6 +2877,9 @@ async def test_finish_emits_response_completed_only_when_upstream_done_and_items
     assert events[-1]["type"] == "response.completed"
     assert b"data: [DONE]" in b"".join(downstream.chunks)
 
+    # A missing upstream [DONE] sentinel still terminates the turn: closing the
+    # SSE silently makes Desktop abort with "stream closed before
+    # response.completed" and throw away the whole turn.
     downstream2 = FakeResponse()
     state2 = ResponsesStreamState("local-llama")
     await state2.start(downstream2)
@@ -2709,8 +2889,46 @@ async def test_finish_emits_response_completed_only_when_upstream_done_and_items
     )
     await state2.finish(downstream2, upstream_saw_done=False)
     events2 = _sse_events(b"".join(downstream2.chunks).decode())
-    assert not [e for e in events2 if e.get("type") == "response.completed"]
-    assert b"data: [DONE]" not in b"".join(downstream2.chunks)
+    assert events2[-1]["type"] == "response.completed"
+    assert b"data: [DONE]" in b"".join(downstream2.chunks)
+
+
+async def test_finish_emits_response_incomplete_when_tool_call_args_truncated():
+    class FakeResponse:
+        def __init__(self):
+            self.chunks: list[bytes] = []
+
+        async def write(self, data: bytes):
+            self.chunks.append(data)
+
+    downstream = FakeResponse()
+    state = ResponsesStreamState("local-llama")
+    await state.start(downstream)
+    await state.write_chat_delta(
+        downstream,
+        {
+            "choices": [
+                {
+                    "delta": {
+                        "tool_calls": [
+                            {
+                                "index": 0,
+                                "id": "call_trunc",
+                                "function": {
+                                    "name": "exec_command",
+                                    "arguments": '{"cmd": "ls',
+                                },
+                            }
+                        ]
+                    }
+                }
+            ]
+        },
+    )
+    await state.finish(downstream, upstream_saw_done=False)
+    events = _sse_events(b"".join(downstream.chunks).decode())
+    assert events[-1]["type"] == "response.incomplete"
+    assert b"data: [DONE]" in b"".join(downstream.chunks)
 
 
 async def test_mcp_tool_call_emits_namespaced_function_call():
