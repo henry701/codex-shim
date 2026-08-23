@@ -27,6 +27,7 @@ class CompactionSettings:
     tertiary_fallback_slug: str | None = None
     compaction_output_token_reserve: int | None = None
     use_client_instructions_for_native: bool = True
+    max_recent_user_prompts: int = 50
 
 
 def effective_compaction_output_token_reserve(settings: CompactionSettings) -> int:
@@ -105,6 +106,7 @@ def load_compaction_settings(path: Path | None = None) -> CompactionSettings:
         ),
         compaction_output_token_reserve=_load_output_token_reserve(raw),
         use_client_instructions_for_native=_coerce_bool(raw.get("use_client_instructions_for_native"), True),
+        max_recent_user_prompts=max(0, _coerce_int(raw.get("max_recent_user_prompts"), 50)),
     )
 
 

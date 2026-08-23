@@ -44,7 +44,7 @@ def test_compaction_budget_slug_keeps_thread_model_when_not_overridden():
     assert compaction_budget_slug(settings, "oc-free-big-pickle") == "oc-free-big-pickle"
 
 
-def test_context_window_tokens_for_slug_reads_byok_model():
+def test_context_window_tokens_for_slug_reads_byok_model(tmp_path):
     models = [
         ShimModel(
             slug="oc-free-big-pickle",
@@ -55,7 +55,14 @@ def test_context_window_tokens_for_slug_reads_byok_model():
             max_context_limit=128_000,
         )
     ]
-    assert context_window_tokens_for_slug("oc-free-big-pickle", byok_models=models) == 128_000
+    assert (
+        context_window_tokens_for_slug(
+            "oc-free-big-pickle",
+            byok_models=models,
+            catalog_path=tmp_path / "missing-custom_model_catalog.json",
+        )
+        == 128_000
+    )
 
 
 def test_context_window_tokens_for_slug_reads_catalog_entry(tmp_path):
@@ -108,3 +115,30 @@ def test_load_compaction_settings_accepts_output_reserve_and_legacy_alias(tmp_pa
     )
     legacy = load_compaction_settings(settings_path)
     assert legacy.compaction_output_token_reserve == 24000
+
+
+def test_load_compaction_settings_accepts_max_recent_user_prompts(tmp_path):
+    settings_path = tmp_path / "models.json"
+    settings_path.write_text(
+        """
+        {
+          "compaction": {
+            "max_recent_user_prompts": 50
+          }
+        }
+        """
+    )
+    loaded = load_compaction_settings(settings_path)
+    assert loaded.max_recent_user_prompts == 50
+
+    settings_path.write_text(
+        """
+        {
+          "compaction": {
+            "max_recent_user_prompts": 12
+          }
+        }
+        """
+    )
+    loaded = load_compaction_settings(settings_path)
+    assert loaded.max_recent_user_prompts == 12

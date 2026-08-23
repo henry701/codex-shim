@@ -155,6 +155,15 @@ def test_unwrap_custom_tool_input_strips_json_envelope():
     assert unwrap_custom_tool_input(json.dumps({"patch": raw})) == raw
     assert unwrap_custom_tool_input(raw) == raw
     assert unwrap_custom_tool_input(json.dumps({"foo": "bar"})) == json.dumps({"foo": "bar"})
+
+
+def test_wrap_custom_tool_input_adds_json_envelope():
+    from codex_shim.translate import wrap_custom_tool_input
+
+    raw = "*** Begin Patch\n*** End Patch"
+    assert json.loads(wrap_custom_tool_input(raw)) == {"input": raw}
+    already = json.dumps({"input": raw})
+    assert wrap_custom_tool_input(already) == already
     assert original_responses_tool_type("apply_patch", {"apply_patch": "function"}) == "apply_patch"
     assert original_responses_tool_type("apply_patch", {"apply_patch": "custom"}) == "apply_patch"
 

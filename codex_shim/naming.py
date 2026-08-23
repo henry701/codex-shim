@@ -115,6 +115,10 @@ def format_cursor_display_name(name: str) -> str:
 
 def catalog_display_name(model) -> str:
     """Normalize picker labels for routed shim models."""
+    raw = getattr(model, "raw", None)
+    upstream_name = ""
+    if isinstance(raw, dict):
+        upstream_name = str(raw.get("upstream_name") or "").strip()
     base_url = str(getattr(model, "base_url", "") or "").rstrip("/")
     if base_url.endswith("opencode.ai/zen/v1"):
         from .discover import is_zen_public_model
@@ -126,7 +130,12 @@ def catalog_display_name(model) -> str:
             if slug.startswith("oc-free-") or slug.endswith("-free") or is_zen_public_model(model_id)
             else "zen"
         )
+        if upstream_name:
+            prefix_display = ROUTE_LABEL_PREFIXES.get(label_prefix, label_prefix)
+            return f"{prefix_display} — {upstream_name}"
         return display_name_from_slug(slug, label_prefix=label_prefix)
+    if upstream_name:
+        return str(getattr(model, "display_name", "") or upstream_name)
     return str(getattr(model, "display_name", "") or getattr(model, "slug", "") or "Model")
 
 

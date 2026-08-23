@@ -7,7 +7,34 @@ and this project does not yet follow semantic versioning (pre-1.0).
 
 ## Unreleased
 
+### Fixed
+
+- Nous `stealth/ox-alpha` and OpenCode Zen `x-preview-f-free` now advertise the
+  published 1,048,576-token window. Discovery was dropping context and falling
+  through to the 128k catalog default, so Desktop auto-compacted at ~102k and
+  the picker showed ~122k remaining.
+
+- Local compaction no longer treats Codex `developer` preamble as user turns.
+  That bug excluded the real task and tool trace from summarization (typical
+  Nous/Ox native-compact 502 fallback), replacing hours of work with a
+  400-character stub. Span selection now matches OpenCode/Pi/Hermes: real user
+  turns only, recency-capped verbatim user quotes (default last 50 prompts),
+  token-budgeted tail, and a deterministic structured fallback when LLM
+  summaries are empty or unusable. The first user message is no longer immortal.
+
 ### Added
+
+- Catalog discovery now maps useful models.dev metadata for OpenCode Zen,
+  OpenRouter `:free`, NVIDIA Integrate, and Nous (`stealth/ox-alpha` via the
+  OpenRouter row): context/output limits, reasoning effort variants, input
+  modalities, and upstream name/description. ChatGPT passthrough already
+  forwards the Codex backend `/models` row; the hardcoded fallback now includes
+  `max`/`ultra`. Cursor stays CLI-driven.
+
+- `compaction.max_recent_user_prompts` (default 50) caps which user prompts stay
+  in the summarization head, verbatim quote block, usability snippet, and local
+  fallback Goal. Older prompts remain only via prior compaction summaries.
+
 
 - `nous` / `nous-*` matches Hermes Agent Nous Portal: inference at
   `https://inference-api.nousresearch.com/v1`, `NOUS_API_KEY` or the OAuth JWT
@@ -54,6 +81,32 @@ and this project does not yet follow semantic versioning (pre-1.0).
 
 ### Fixed
 
+- BYOK chat translation no longer drops `custom_tool_call` / `custom_tool_call_output`
+  history (apply_patch rounds) or plaintext compaction summaries. Native
+  ChatGPT-encrypted compaction blobs that this fork cannot decode now become an
+  explicit “do not restart” notice instead of vanishing. Orphan tool outputs
+  reuse an advertised tool name (`exec_command` when present) so Nous/Ox is not
+  handed a synthetic `unknown_tool` that 400s.
+
+- OpenCode Zen Console GLM/Z.AI `[1210]` / `[1214]` ("Invalid API parameter"
+  / "messages parameter is illegal") no longer fail the Codex turn on the
+  first 400. Chat-completions bodies for `zen` / `zen_public` / `oc-free-*`
+  drop `reasoning_content`, `reasoning_effort`, `parallel_tool_calls`,
+  tool_call `index`, null assistant content, and image parts; empty or
+  missing user turns get a `Continue.` placeholder. Other providers learn
+  the same sanitizer from a 1210/1214 and retry once, then retry once more
+  for flaky Console 400s.
+
+- BYOK OpenAI-chat streams that die without a conclusive `finish_reason`
+  (`stop` / `tool_calls` / `[DONE]`) now reconnect on the same Codex turn
+  with assistant prefill: the request's messages plus the truncated
+  assistant text/reasoning/tool_calls, and no user nudge. New tokens are
+  spliced onto the open Responses items (replayed prefixes are skipped).
+  Cap is three continues; a 400/422 on the trailing assistant ends
+  `response.incomplete` instead of faking `completed`. `stop` and complete
+  `tool_calls` still terminate immediately, even when upstream omits
+  `[DONE]`.
+
 - ChatGPT live SSE, Cursor SSE, Anthropic raw SSE, and WS relays now emit a
   terminal event when upstream closes without one (`response.incomplete` or
   `message_stop`). WS CLOSE/ERROR frames no longer drop the lane in silence.
@@ -73,6 +126,10 @@ and this project does not yet follow semantic versioning (pre-1.0).
   waits on the next parsed event. WS relays forward those events. OpenRouter
   `error.metadata.raw` is unwrapped when the outer message is the generic
   "Provider returned error", so reconnects still see the rate-limit text.
+  After the first content byte, a silent upstream EOF without `stop` /
+  `tool_calls` / `[DONE]` reconnects with assistant prefill on the same
+  turn (truncated assistant, no user nudge) instead of synthesizing
+  `response.completed`.
 
 - StreamGuard always emits `[stream-end]`, writes EOF, deactivates the
   ContextVar writer, and closes an attached upstream on every exit path,
@@ -350,6 +407,7 @@ and this project does not yet follow semantic versioning (pre-1.0).
   `~/.codex-shim/upstream-compat.json`. Models that reject `parallel_tool_calls`
   (e.g. OpenCode Zen North Mini Code) trigger one transparent retry with the
   field stripped; later requests and catalog metadata omit it proactively.
+  Zen Console `[1210]` / `[1214]` learn `console_chat_compat` the same way.
 - Namespace tools forwarded to strict OpenAI-compatible upstreams use
   underscore-separated chat tool ids (e.g. `codex_app_load_workspace_dependencies`
   instead of `codex_app.load_workspace_dependencies`). A per-request resolve map

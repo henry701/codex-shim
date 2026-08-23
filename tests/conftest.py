@@ -39,6 +39,7 @@ def _disable_model_discovery_by_default(monkeypatch, request):
     monkeypatch.setattr("codex_shim.discover.fetch_zen_public_model_ids", lambda: [])
     monkeypatch.setattr("codex_shim.discover.fetch_openrouter_free_model_ids", lambda: [])
     monkeypatch.setattr("codex_shim.discover.fetch_nvidia_integrate_model_ids", lambda: [])
+    monkeypatch.setattr("codex_shim.discover.fetch_models_dev_catalog", lambda: {}, raising=False)
     monkeypatch.setattr("codex_shim.discover.discover_opencode_cli_ids", lambda *_args, **_kwargs: [])
     monkeypatch.setattr("codex_shim.discover.fetch_local_openai_models", lambda *_args, **_kwargs: [])
     monkeypatch.setattr("codex_shim.discover.discover_chatgpt_models_from_cursor", lambda: [])
@@ -66,11 +67,13 @@ def _reset_nous_oauth_startup_state():
 
 @pytest.fixture(autouse=True)
 def _clear_opencode_cli_models_cache():
-    from codex_shim.discover import clear_opencode_cli_models_cache
+    from codex_shim.discover import clear_models_dev_catalog_cache, clear_opencode_cli_models_cache
 
     clear_opencode_cli_models_cache()
+    clear_models_dev_catalog_cache()
     yield
     clear_opencode_cli_models_cache()
+    clear_models_dev_catalog_cache()
 
 
 @pytest.fixture(autouse=True)

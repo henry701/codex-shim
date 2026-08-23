@@ -166,6 +166,22 @@ def unwrap_custom_tool_input(raw: Any) -> str:
     return text if isinstance(raw, str) else json.dumps(parsed)
 
 
+def wrap_custom_tool_input(raw: Any) -> str:
+    """Inverse of unwrap: chat-completions history needs a JSON `{input}` envelope."""
+    if isinstance(raw, dict):
+        return json.dumps(raw, ensure_ascii=False)
+    text = "" if raw is None else str(raw)
+    stripped = text.strip()
+    if stripped.startswith("{") or stripped.startswith("["):
+        try:
+            parsed = json.loads(stripped)
+        except json.JSONDecodeError:
+            parsed = None
+        if isinstance(parsed, dict):
+            return text
+    return json.dumps({"input": text}, ensure_ascii=False)
+
+
 def original_responses_tool_type(name: str, tool_types: dict[str, str] | None = None) -> str:
     clean = _sanitize_tool_name(str(name or ""))
     mapped = ""
@@ -215,15 +231,77 @@ def _is_hosted_web_search_name(name: str) -> bool:
     return clean in {"web_search", "web_search_preview"}
 
 
+_TOOL_CALL_HISTORY_TYPES = frozenset({"function_call", "custom_tool_call"})
+_TOOL_OUTPUT_HISTORY_TYPES = frozenset({"function_call_output", "custom_tool_call_output"})
+_ORPHAN_TOOL_NAME_PREFERENCE = ("exec_command", "shell", "bash", "apply_patch")
+NATIVE_COMPACTION_UNAVAILABLE_NOTICE = (
+    "Compacted conversation state is present but encrypted for another provider. "
+    "Continue the user's existing task from remaining messages and the workspace; "
+    "do not restart from scratch or invent a new goal."
+)
+
+
 def _function_call_name_map(input_items: list[Any]) -> dict[str, str]:
     names: dict[str, str] = {}
     for item in input_items:
-        if not isinstance(item, dict) or item.get("type") != "function_call":
+        if not isinstance(item, dict) or item.get("type") not in _TOOL_CALL_HISTORY_TYPES:
             continue
         call_id = str(item.get("call_id") or item.get("id") or "")
         if call_id:
             names[call_id] = str(item.get("name") or "")
     return names
+
+
+def _advertised_chat_tool_names(tools: Any) -> list[str]:
+    names: list[str] = []
+    seen: set[str] = set()
+    if not isinstance(tools, list):
+        return names
+    for tool in tools:
+        if not isinstance(tool, dict):
+            continue
+        name = str(tool.get("name") or "")
+        function = tool.get("function")
+        if not name and isinstance(function, dict):
+            name = str(function.get("name") or "")
+        if name and name not in seen:
+            seen.add(name)
+            names.append(name)
+    return names
+
+
+def _orphan_tool_name(advertised: list[str] | None) -> str:
+    advertised = advertised or []
+    advertised_set = set(advertised)
+    for candidate in _ORPHAN_TOOL_NAME_PREFERENCE:
+        if candidate in advertised_set:
+            return candidate
+    if advertised:
+        return advertised[0]
+    return UNKNOWN_FUNCTION_TOOL_NAME
+
+
+def _compaction_summary_text(item: dict[str, Any]) -> str | None:
+    decoded = decode_shim_compaction_summary(item.get("encrypted_content"))
+    if decoded:
+        return decoded
+    summary = item.get("summary")
+    if isinstance(summary, str) and summary.strip():
+        return summary.strip()
+    if isinstance(summary, list):
+        parts: list[str] = []
+        for entry in summary:
+            if isinstance(entry, str) and entry.strip():
+                parts.append(entry.strip())
+                continue
+            if not isinstance(entry, dict):
+                continue
+            text = entry.get("text") or entry.get("summary")
+            if isinstance(text, str) and text.strip():
+                parts.append(text.strip())
+        if parts:
+            return "\n".join(parts)
+    return None
 
 
 def _format_web_search_result_entries(entries: Any) -> list[str]:
@@ -407,17 +485,26 @@ def responses_to_chat(
     if instructions_text:
         messages.append({"role": "system", "content": instructions_text})
     pending_reasoning: str | None = None
-    for m in _responses_input_to_messages(body.get("input")):
+    advertised_tool_names = _advertised_chat_tool_names(body.get("tools"))
+    for m in _responses_input_to_messages(
+        body.get("input"),
+        advertised_tool_names=advertised_tool_names,
+    ):
         if m.get("_reasoning_only"):
             summary = m.get("summary") or []
             text = " ".join(item.get("text", "") for item in summary if isinstance(item, dict))
             if text:
                 pending_reasoning = text
             continue
-        if pending_reasoning and m.get("role") == "assistant":
-            m["reasoning_content"] = pending_reasoning
+        if pending_reasoning:
+            if m.get("role") == "assistant":
+                m["reasoning_content"] = pending_reasoning
+            else:
+                messages.append({"role": "assistant", "content": pending_reasoning})
             pending_reasoning = None
         messages.append(m)
+    if pending_reasoning:
+        messages.append({"role": "assistant", "content": pending_reasoning})
     messages = _sanitize_chat_messages(_merge_consecutive_messages(_normalize_chat_roles(messages)))
 
     chat: dict[str, Any] = {
@@ -456,7 +543,10 @@ def responses_to_anthropic(body: dict[str, Any], upstream_model: str, max_tokens
             messages.append({"role": role, "content": content})
 
     pending_thinking: list[dict[str, Any]] = []
-    for chat_msg in _responses_input_to_messages(body.get("input")):
+    for chat_msg in _responses_input_to_messages(
+        body.get("input"),
+        advertised_tool_names=_advertised_chat_tool_names(body.get("tools")),
+    ):
         role = chat_msg.get("role", "user")
         if chat_msg.get("_reasoning_only"):
             decoded = _decode_thinking_blob(chat_msg.get("encrypted_content"))
@@ -820,7 +910,11 @@ def strip_think(text: str) -> str:
     return THINK_RE.sub("", text or "")
 
 
-def _responses_input_to_messages(value: Any) -> list[dict[str, Any]]:
+def _responses_input_to_messages(
+    value: Any,
+    *,
+    advertised_tool_names: list[str] | None = None,
+) -> list[dict[str, Any]]:
     if value is None:
         return []
     if isinstance(value, str):
@@ -832,6 +926,7 @@ def _responses_input_to_messages(value: Any) -> list[dict[str, Any]]:
     deferred_tool_outputs: dict[str, list[dict[str, Any]]] = {}
     emitted_tool_call_ids: set[str] = set()
     function_call_names = _function_call_name_map(value) if isinstance(value, list) else {}
+    orphan_name = _orphan_tool_name(advertised_tool_names)
 
     def flush_pending_assistant_tool_calls():
         if pending_tool_calls:
@@ -864,26 +959,34 @@ def _responses_input_to_messages(value: Any) -> list[dict[str, Any]]:
         elif item_type == "computer_call_output":
             flush_pending_assistant_tool_calls()
             messages.append({"role": "user", "content": _computer_output_to_chat_content(item)})
-        elif item_type == "function_call":
-            # Coalesce consecutive function_call items into a single assistant
-            # message with multiple tool_calls so chat-completions upstreams
-            # accept the subsequent tool messages.
+        elif item_type in _TOOL_CALL_HISTORY_TYPES:
+            # Coalesce consecutive function_call / custom_tool_call items into a
+            # single assistant message with multiple tool_calls so chat-completions
+            # upstreams accept the subsequent tool messages.
             call_id = item.get("call_id") or item.get("id") or "call_0"
             fn_name = item.get("name") or ""
+            if item_type == "custom_tool_call" and not fn_name:
+                fn_name = "apply_patch"
             namespace = item.get("namespace") or ""
             if namespace and fn_name:
                 fn_name = upstream_chat_tool_name(namespace, fn_name)
+            if item_type == "custom_tool_call" or (
+                item.get("input") is not None and not item.get("arguments")
+            ):
+                arguments = wrap_custom_tool_input(item.get("input"))
+            else:
+                arguments = item.get("arguments") or ""
             pending_tool_calls.append(
                 {
                     "id": call_id,
                     "type": "function",
                     "function": {
                         "name": fn_name,
-                        "arguments": item.get("arguments") or "",
+                        "arguments": arguments,
                     },
                 }
             )
-        elif item_type == "function_call_output":
+        elif item_type in _TOOL_OUTPUT_HISTORY_TYPES:
             output = item.get("output", "")
             call_id = str(item.get("call_id") or "")
             tool_name = function_call_names.get(call_id, "")
@@ -979,12 +1082,19 @@ def _responses_input_to_messages(value: Any) -> list[dict[str, Any]]:
             )
         elif item_type == "compaction":
             flush_pending_assistant_tool_calls()
-            summary = decode_shim_compaction_summary(item.get("encrypted_content"))
+            summary = _compaction_summary_text(item)
             if summary:
                 messages.append(
                     {
                         "role": "user",
                         "content": f"Compacted conversation state:\n{summary}",
+                    }
+                )
+            else:
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": NATIVE_COMPACTION_UNAVAILABLE_NOTICE,
                     }
                 )
         elif item_type == "agent_message":
@@ -1021,7 +1131,7 @@ def _responses_input_to_messages(value: Any) -> list[dict[str, Any]]:
                         "id": call_id,
                         "type": "function",
                         "function": {
-                            "name": UNKNOWN_FUNCTION_TOOL_NAME,
+                            "name": orphan_name,
                             "arguments": "{}",
                         },
                     }

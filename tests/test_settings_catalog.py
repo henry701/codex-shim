@@ -389,6 +389,32 @@ def test_catalog_preserves_context_and_visibility():
     assert not entry.get("use_responses_lite")
 
 
+def test_catalog_ox_alpha_uses_1m_context_and_does_not_auto_compact_at_128k():
+    from dataclasses import replace
+
+    base = ModelSettingsFixture.one()
+    nous = replace(
+        base,
+        slug="nous-stealth-ox-alpha",
+        model="stealth/ox-alpha",
+        display_name="Nous Portal — Stealth Ox Alpha",
+        max_context_limit=None,
+    )
+    zen = replace(
+        base,
+        slug="oc-free-x-preview-f-free",
+        model="x-preview-f-free",
+        display_name="OpenCode Zen (free) — X Preview F (free)",
+        max_context_limit=None,
+    )
+    for model in (nous, zen):
+        entry = catalog_entry(model)
+        assert entry["context_window"] == 1_048_576
+        assert entry["max_context_window"] == 1_048_576
+        assert entry["auto_compact_token_limit"] == 838_860
+        assert entry["auto_compact_token_limit"] > 200_000
+
+
 def test_catalog_enables_reasoning_summaries_when_requested():
     model = ModelSettingsFixture.one()
     model = replace(model, supports_reasoning_summaries=True)
@@ -1030,3 +1056,59 @@ class ModelSettingsFixture:
             )
         )
         return ModelSettings(path).load()[0]
+
+
+def test_catalog_entry_uses_discovered_reasoning_efforts_and_modalities():
+    from codex_shim.settings import ShimModel
+
+    model = ShimModel(
+        slug="nous-stealth-ox-alpha",
+        model="stealth/ox-alpha",
+        display_name="Nous Portal — Ox Alpha",
+        provider="generic-chat-completion-api",
+        base_url="https://inference-api.nousresearch.com/v1",
+        api_key="k",
+        max_context_limit=1_048_576,
+        max_output_tokens=131_072,
+        supports_reasoning_summaries=True,
+        raw={
+            "discovered": True,
+            "discover_kind": "nous",
+            "upstream_name": "Ox Alpha",
+            "upstream_description": "Multimodal reasoning model for visual analysis, planning, and tool use",
+            "reasoning_efforts": ["low", "high", "max"],
+            "input_modalities": ["text", "image", "video"],
+        },
+    )
+    entry = catalog_entry(model)
+    assert [level["effort"] for level in entry["supported_reasoning_levels"]] == [
+        "low",
+        "high",
+        "max",
+    ]
+    assert entry["default_reasoning_level"] == "high"
+    assert entry["input_modalities"] == ["text", "image", "video"]
+    assert "visual analysis" in entry["description"]
+    assert entry["supports_reasoning_summaries"] is True
+
+
+def test_catalog_entry_without_upstream_metadata_keeps_default_reasoning_levels():
+    from codex_shim.settings import ShimModel
+
+    model = ShimModel(
+        slug="or-openrouter-free",
+        model="openrouter/free",
+        display_name="OpenRouter — Free",
+        provider="generic-chat-completion-api",
+        base_url="https://openrouter.ai/api/v1",
+        api_key="k",
+    )
+    entry = catalog_entry(model)
+    assert [level["effort"] for level in entry["supported_reasoning_levels"]] == [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+    ]
+    assert entry["default_reasoning_level"] == "medium"
+    assert entry["input_modalities"] == ["text", "image"]

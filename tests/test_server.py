@@ -2070,6 +2070,80 @@ def _byok_settings(upstream_client, tmp_path):
     return settings
 
 
+async def test_byok_stream_retries_console_1210_after_sanitizer(monkeypatch, tmp_path):
+    captured: list[dict] = []
+    compat_path = tmp_path / "upstream-compat.json"
+    monkeypatch.setattr("codex_shim.upstream_compat.DEFAULT_UPSTREAM_COMPAT_PATH", compat_path)
+
+    async def chat(request):
+        body = await request.json()
+        captured.append(body)
+        dumped = json.dumps(body)
+        if (
+            "reasoning_content" in dumped
+            or "reasoning_effort" in body
+            or "parallel_tool_calls" in body
+        ):
+            return web.Response(
+                status=400,
+                content_type="application/json",
+                text=(
+                    '{"error":{"type":"server_error","message":'
+                    '"Error from provider (Console): Upstream request failed: '
+                    '[1210] Invalid API parameter, please check the documentation."}}'
+                ),
+            )
+        response = web.StreamResponse(headers={"Content-Type": "text/event-stream"})
+        await response.prepare(request)
+        await response.write(b'data: {"choices":[{"delta":{"content":"ok"}}]}\n\n')
+        await response.write(b'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n')
+        await response.write(b"data: [DONE]\n\n")
+        await response.write_eof()
+        return response
+
+    upstream = web.Application()
+    upstream.router.add_post("/v1/chat/completions", chat)
+    upstream_client = TestClient(TestServer(upstream))
+    await upstream_client.start_server()
+    shim_client = TestClient(TestServer(ShimServer(_byok_settings(upstream_client, tmp_path)).app()))
+    await shim_client.start_server()
+    try:
+        resp = await shim_client.post(
+            "/v1/responses",
+            json={
+                "model": "real-openai",
+                "stream": True,
+                "parallel_tool_calls": True,
+                "reasoning_effort": "high",
+                "input": [
+                    {"type": "reasoning", "summary": [{"type": "summary_text", "text": "think"}]},
+                    {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": "prior"}],
+                    },
+                    {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "next"}],
+                    },
+                ],
+            },
+        )
+        assert resp.status == 200
+        events = _sse_events((await resp.read()).decode())
+        assert any(event.get("delta") == "ok" for event in events)
+        assert any(event.get("type") == "response.completed" for event in events)
+        assert len(captured) >= 2
+        assert "reasoning_content" in json.dumps(captured[0])
+        assert "reasoning_content" not in json.dumps(captured[-1])
+        assert "parallel_tool_calls" not in captured[-1]
+        assert "reasoning_effort" not in captured[-1]
+    finally:
+        await shim_client.close()
+        await upstream_client.close()
+
+
 async def test_byok_stream_emits_completed_when_upstream_omits_done(tmp_path):
     """Upstream EOF without ``data: [DONE]`` must still terminate the turn.
 
@@ -2112,8 +2186,194 @@ async def test_byok_stream_emits_completed_when_upstream_omits_done(tmp_path):
         await upstream_client.close()
 
 
+async def test_byok_stream_prefills_truncated_assistant_and_continues_same_turn(tmp_path):
+    captured: list[dict] = []
+
+    async def chat(request):
+        body = await request.json()
+        captured.append(body)
+        response = web.StreamResponse(headers={"Content-Type": "text/event-stream"})
+        await response.prepare(request)
+        if len(captured) == 1:
+            await response.write(b'data: {"choices":[{"delta":{"content":"The plan is"}}]}\n\n')
+            await response.write_eof()
+            return response
+        await response.write(b'data: {"choices":[{"delta":{"content":" to ship it"}}]}\n\n')
+        await response.write(b'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n')
+        await response.write(b"data: [DONE]\n\n")
+        await response.write_eof()
+        return response
+
+    upstream = web.Application()
+    upstream.router.add_post("/v1/chat/completions", chat)
+    upstream_client = TestClient(TestServer(upstream))
+    await upstream_client.start_server()
+
+    shim_client = TestClient(TestServer(ShimServer(_byok_settings(upstream_client, tmp_path)).app()))
+    await shim_client.start_server()
+    try:
+        resp = await shim_client.post(
+            "/v1/responses",
+            json={"model": "real-openai", "input": "hi", "stream": True},
+        )
+        assert resp.status == 200
+        events = _sse_events((await resp.read()).decode())
+        created = [event for event in events if event.get("type") == "response.created"]
+        assert len(created) == 1
+        deltas = [event.get("delta") for event in events if event.get("type") == "response.output_text.delta"]
+        assert deltas == ["The plan is", " to ship it"]
+        terminal = [
+            event.get("type")
+            for event in events
+            if event.get("type")
+            in {"response.completed", "response.incomplete", "response.failed"}
+        ]
+        assert terminal == ["response.completed"]
+        assert len(captured) == 2
+        assert [msg.get("role") for msg in captured[1]["messages"]] == ["user", "assistant"]
+        assert captured[1]["messages"][-1] == {"role": "assistant", "content": "The plan is"}
+    finally:
+        await shim_client.close()
+        await upstream_client.close()
+
+
+async def test_byok_stream_skips_replayed_prefill_prefix(tmp_path):
+    captured: list[dict] = []
+
+    async def chat(request):
+        captured.append(await request.json())
+        response = web.StreamResponse(headers={"Content-Type": "text/event-stream"})
+        await response.prepare(request)
+        if len(captured) == 1:
+            await response.write(b'data: {"choices":[{"delta":{"content":"The plan is"}}]}\n\n')
+            await response.write_eof()
+            return response
+        await response.write(b'data: {"choices":[{"delta":{"content":"The plan is to ship"}}]}\n\n')
+        await response.write(b'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n')
+        await response.write(b"data: [DONE]\n\n")
+        await response.write_eof()
+        return response
+
+    upstream = web.Application()
+    upstream.router.add_post("/v1/chat/completions", chat)
+    upstream_client = TestClient(TestServer(upstream))
+    await upstream_client.start_server()
+
+    shim_client = TestClient(TestServer(ShimServer(_byok_settings(upstream_client, tmp_path)).app()))
+    await shim_client.start_server()
+    try:
+        resp = await shim_client.post(
+            "/v1/responses",
+            json={"model": "real-openai", "input": "hi", "stream": True},
+        )
+        assert resp.status == 200
+        events = _sse_events((await resp.read()).decode())
+        deltas = [event.get("delta") for event in events if event.get("type") == "response.output_text.delta"]
+        assert deltas == ["The plan is", " to ship"]
+        assert [event.get("type") for event in events if event.get("type") == "response.completed"]
+    finally:
+        await shim_client.close()
+        await upstream_client.close()
+
+
+async def test_byok_stream_prefills_truncated_tool_call_and_completes(tmp_path):
+    captured: list[dict] = []
+
+    async def chat(request):
+        captured.append(await request.json())
+        response = web.StreamResponse(headers={"Content-Type": "text/event-stream"})
+        await response.prepare(request)
+        if len(captured) == 1:
+            await response.write(
+                b'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1",'
+                b'"function":{"name":"exec_command","arguments":"{\\"cmd\\": \\"ls"}}]}}]}\n\n'
+            )
+            await response.write_eof()
+            return response
+        await response.write(
+            b'data: {"choices":[{"delta":{"tool_calls":[{"index":0,'
+            b'"function":{"arguments":"\\"}"}}]}}]}\n\n'
+        )
+        await response.write(b'data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}\n\n')
+        await response.write(b"data: [DONE]\n\n")
+        await response.write_eof()
+        return response
+
+    upstream = web.Application()
+    upstream.router.add_post("/v1/chat/completions", chat)
+    upstream_client = TestClient(TestServer(upstream))
+    await upstream_client.start_server()
+
+    shim_client = TestClient(TestServer(ShimServer(_byok_settings(upstream_client, tmp_path)).app()))
+    await shim_client.start_server()
+    try:
+        resp = await shim_client.post(
+            "/v1/responses",
+            json={"model": "real-openai", "input": "hi", "stream": True},
+        )
+        assert resp.status == 200
+        events = _sse_events((await resp.read()).decode())
+        terminal = [
+            event.get("type")
+            for event in events
+            if event.get("type")
+            in {"response.completed", "response.incomplete", "response.failed"}
+        ]
+        assert terminal == ["response.completed"]
+        assert len(captured) == 2
+        assert captured[1]["messages"][-1]["role"] == "assistant"
+        assert captured[1]["messages"][-1]["tool_calls"][0]["function"]["arguments"] == '{"cmd": "ls'
+        assert all(msg.get("role") != "user" or i == 0 for i, msg in enumerate(captured[1]["messages"]))
+    finally:
+        await shim_client.close()
+        await upstream_client.close()
+
+
+async def test_byok_stream_prefill_400_ends_incomplete_without_nudge(tmp_path):
+    captured: list[dict] = []
+
+    async def chat(request):
+        body = await request.json()
+        captured.append(body)
+        if len(captured) == 1:
+            response = web.StreamResponse(headers={"Content-Type": "text/event-stream"})
+            await response.prepare(request)
+            await response.write(b'data: {"choices":[{"delta":{"content":"The plan is"}}]}\n\n')
+            await response.write_eof()
+            return response
+        return web.json_response({"error": {"message": "last message must be user"}}, status=400)
+
+    upstream = web.Application()
+    upstream.router.add_post("/v1/chat/completions", chat)
+    upstream_client = TestClient(TestServer(upstream))
+    await upstream_client.start_server()
+
+    shim_client = TestClient(TestServer(ShimServer(_byok_settings(upstream_client, tmp_path)).app()))
+    await shim_client.start_server()
+    try:
+        resp = await shim_client.post(
+            "/v1/responses",
+            json={"model": "real-openai", "input": "hi", "stream": True},
+        )
+        assert resp.status == 200
+        events = _sse_events((await resp.read()).decode())
+        terminal = [
+            event.get("type")
+            for event in events
+            if event.get("type")
+            in {"response.completed", "response.incomplete", "response.failed"}
+        ]
+        assert terminal == ["response.incomplete"]
+        assert len(captured) == 2
+        assert captured[1]["messages"][-1]["role"] == "assistant"
+        assert all(msg.get("role") != "user" or msg.get("content") == "hi" for msg in captured[1]["messages"])
+    finally:
+        await shim_client.close()
+        await upstream_client.close()
+
+
 async def test_byok_stream_emits_incomplete_when_truncated_without_done(tmp_path):
-    """Upstream dying mid tool-call must emit a terminal event, not close silently."""
+    """Prefill continuation that never gets a finish_reason still terminates."""
 
     async def chat(request):
         response = web.StreamResponse(headers={"Content-Type": "text/event-stream"})
@@ -3050,9 +3310,9 @@ async def test_finish_emits_response_completed_when_items_complete():
     assert events[-1]["type"] == "response.completed"
     assert b"data: [DONE]" in b"".join(downstream.chunks)
 
-    # A missing upstream [DONE] sentinel still terminates the turn: closing the
-    # SSE silently makes Desktop abort with "stream closed before
-    # response.completed" and throw away the whole turn.
+    # Silent EOF without a conclusive finish_reason is not "the model is done".
+    # Fake completed stops a no-goal Codex turn. Incomplete still terminates the
+    # SSE so Desktop does not abort with "stream closed before response.completed".
     downstream2 = FakeResponse()
     state2 = ResponsesStreamState("local-llama")
     await state2.start(downstream2)
@@ -3062,7 +3322,7 @@ async def test_finish_emits_response_completed_when_items_complete():
     )
     await state2.finish(downstream2, upstream_saw_done=False)
     events2 = _sse_events(b"".join(downstream2.chunks).decode())
-    assert events2[-1]["type"] == "response.completed"
+    assert events2[-1]["type"] == "response.incomplete"
     assert b"data: [DONE]" in b"".join(downstream2.chunks)
 
 

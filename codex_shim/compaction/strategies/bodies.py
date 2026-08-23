@@ -57,6 +57,7 @@ def build_summarization_compact_body(
 ) -> dict[str, Any]:
     user_prompt = build_summarization_user_prompt(
         previous_summary=prepared.previous_summary,
+        extra_context=prepared.extra_context,
         recent_user_turns_excluded=prepared.excluded_user_turns,
     )
     input_items = list(prepared.summarization_input)

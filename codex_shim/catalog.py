@@ -26,6 +26,7 @@ from .settings import (
     usable_byok_models,
 )
 from .cursor_passthrough import cursor_passthrough_available, cursor_passthrough_entries
+from .discover import context_limit_for_discovered_model
 from .naming import catalog_display_name
 
 
@@ -91,6 +92,73 @@ def _reasoning_catalog_fields(model: ShimModel) -> dict[str, Any]:
     }
 
 
+_DEFAULT_REASONING_LEVELS = [
+    {"effort": "low", "description": "Faster, lighter reasoning"},
+    {"effort": "medium", "description": "Balanced speed and reasoning"},
+    {"effort": "high", "description": "Deeper reasoning"},
+    {"effort": "xhigh", "description": "Maximum reasoning where supported"},
+]
+_REASONING_LEVEL_DESCRIPTIONS = {
+    "minimal": "Minimal reasoning",
+    "low": "Faster, lighter reasoning",
+    "medium": "Balanced speed and reasoning",
+    "high": "Deeper reasoning",
+    "xhigh": "Maximum reasoning where supported",
+    "max": "Maximum reasoning depth for the hardest problems",
+    "ultra": "Maximum reasoning with automatic task delegation",
+}
+
+
+def _model_raw(model: ShimModel) -> dict[str, Any]:
+    raw = model.raw
+    return raw if isinstance(raw, dict) else {}
+
+
+def _supported_reasoning_levels(model: ShimModel) -> list[dict[str, str]]:
+    efforts = _model_raw(model).get("reasoning_efforts")
+    if isinstance(efforts, (list, tuple)) and efforts:
+        levels: list[dict[str, str]] = []
+        seen: set[str] = set()
+        for effort in efforts:
+            name = str(effort or "").strip().lower()
+            if not name or name in seen:
+                continue
+            seen.add(name)
+            levels.append(
+                {
+                    "effort": name,
+                    "description": _REASONING_LEVEL_DESCRIPTIONS.get(name, name),
+                }
+            )
+        if levels:
+            return levels
+    return [dict(level) for level in _DEFAULT_REASONING_LEVELS]
+
+
+def _input_modalities(model: ShimModel) -> list[str]:
+    raw = _model_raw(model).get("input_modalities")
+    if isinstance(raw, (list, tuple)) and raw:
+        items: list[str] = []
+        seen: set[str] = set()
+        for item in raw:
+            name = str(item or "").strip().lower()
+            if name and name not in seen:
+                seen.add(name)
+                items.append(name)
+        if items and "text" not in items:
+            items.insert(0, "text")
+        if items:
+            return items
+    return ["text"] if model.no_image_support else ["text", "image"]
+
+
+def _catalog_description(model: ShimModel, display_name: str) -> str:
+    description = str(_model_raw(model).get("upstream_description") or "").strip()
+    if description:
+        return description
+    return f"{display_name} via local Codex shim."
+
+
 def _finalize_catalog_entry(entry: dict[str, Any], *, tier: str, context_settings: CatalogContextSettings | None) -> dict:
     return apply_catalog_context_to_entry(entry, tier=tier, settings=context_settings)
 
@@ -99,23 +167,21 @@ def catalog_entry(model: ShimModel, *, context_settings: CatalogContextSettings 
     context = model.max_context_limit or _default_context(model)
     compact = max(8_000, int(context * 0.8))
     truncation = min(64_000, max(8_000, int(context * 0.32)))
-    reasoning = _reasoning_effort(model)
+    reasoning_levels = _supported_reasoning_levels(model)
+    reasoning = _reasoning_effort(model, [level["effort"] for level in reasoning_levels])
     display_name = catalog_display_name(model)
+    modalities = _input_modalities(model)
+    no_image = "image" not in modalities
     entry = {
         "slug": model.slug,
         "display_name": display_name,
-        "description": f"{display_name} via local Codex shim.",
+        "description": _catalog_description(model, display_name),
         "context_window": context,
         "max_context_window": context,
         "auto_compact_token_limit": compact,
         "truncation_policy": {"mode": "tokens", "limit": truncation},
         "default_reasoning_level": reasoning,
-        "supported_reasoning_levels": [
-            {"effort": "low", "description": "Faster, lighter reasoning"},
-            {"effort": "medium", "description": "Balanced speed and reasoning"},
-            {"effort": "high", "description": "Deeper reasoning"},
-            {"effort": "xhigh", "description": "Maximum reasoning where supported"},
-        ],
+        "supported_reasoning_levels": reasoning_levels,
         **_reasoning_catalog_fields(model),
         "default_verbosity": "low",
         "support_verbosity": False,
@@ -124,8 +190,8 @@ def catalog_entry(model: ShimModel, *, context_settings: CatalogContextSettings 
         "supports_search_tool": True,
         "supports_parallel_tool_calls": supports_parallel_tool_calls_in_catalog(model),
         "experimental_supported_tools": [],
-        "input_modalities": ["text"] if model.no_image_support else ["text", "image"],
-        "supports_image_detail_original": not model.no_image_support,
+        "input_modalities": modalities,
+        "supports_image_detail_original": not no_image,
         "shell_type": "shell_command",
         "visibility": "list",
         "minimal_client_version": "0.0.1",
@@ -249,6 +315,11 @@ def codex_config_overrides(catalog_path: Path, default_slug: str, port: int) -> 
 
 
 def _default_context(model: ShimModel) -> int:
+    inferred = context_limit_for_discovered_model(model.model) or context_limit_for_discovered_model(
+        model.slug
+    )
+    if inferred:
+        return inferred
     lower = f"{model.model} {model.display_name}".lower()
     if "claude" in lower:
         return 200_000
@@ -259,7 +330,7 @@ def _default_context(model: ShimModel) -> int:
     return 128_000
 
 
-def _reasoning_effort(model: ShimModel) -> str:
+def _guess_reasoning_effort(model: ShimModel) -> str:
     lower = model.display_name.lower()
     if "xhigh" in lower or "x-high" in lower:
         return "xhigh"
@@ -270,6 +341,20 @@ def _reasoning_effort(model: ShimModel) -> str:
     if "low" in lower:
         return "low"
     return "medium"
+
+
+def _reasoning_effort(model: ShimModel, levels: list[str] | None = None) -> str:
+    available = [str(level).strip().lower() for level in (levels or []) if str(level).strip()]
+    if not available:
+        available = [item["effort"] for item in _supported_reasoning_levels(model)]
+    guessed = _guess_reasoning_effort(model)
+    if guessed in available:
+        return guessed
+    if "medium" in available:
+        return "medium"
+    if "high" in available:
+        return "high"
+    return available[0] if available else "medium"
 
 
 def _toml_escape(value: str) -> str:

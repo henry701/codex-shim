@@ -65,6 +65,67 @@ def test_prepare_compaction_input_synthesizes_orphans_and_splits_summarization_i
     assert len(prepared.summarization_input) == 3
 
 
+def _msg(role: str, text: str) -> dict:
+    return {
+        "type": "message",
+        "role": role,
+        "content": [{"type": "input_text", "text": text}],
+    }
+
+
+def _tool_round(index: int, *, output: str = "ok") -> list[dict]:
+    call_id = f"call_{index}"
+    return [
+        {
+            "type": "function_call",
+            "call_id": call_id,
+            "name": "exec_command",
+            "arguments": '{"cmd":"ls"}',
+        },
+        {
+            "type": "function_call_output",
+            "call_id": call_id,
+            "output": output,
+        },
+    ]
+
+
+def test_developer_preamble_is_not_a_user_turn_and_does_not_drop_work():
+    """Codex prefixes developer instructions; those must not eat tail_turns."""
+    items: list[dict] = [
+        _msg("developer", "You are Codex."),
+        _msg("developer", "Follow the repo AGENTS.md."),
+        _msg("user", "Implement local compaction that never drops the task."),
+    ]
+    for index in range(40):
+        items.extend(_tool_round(index, output=f"changed file_{index}.py"))
+    items.append(_msg("user", "continue"))
+
+    prepared = prepare_compaction_input(items, CompactionSettings(tail_turns=2))
+    blob = str(prepared.summarization_input)
+    assert "Implement local compaction that never drops the task." in blob
+    assert any(
+        isinstance(item, dict) and item.get("type") == "function_call"
+        for item in prepared.summarization_input
+    )
+    assert prepared.stats["summarization_items"] > 4
+
+
+def test_single_user_turn_with_long_tool_trace_stays_in_summarization_input():
+    items: list[dict] = [
+        _msg("developer", "system preamble"),
+        _msg("developer", "more preamble"),
+        _msg("user", "Port the compaction module from OpenCode/Pi/Hermes."),
+    ]
+    for index in range(25):
+        items.extend(_tool_round(index))
+
+    prepared = prepare_compaction_input(items, CompactionSettings(tail_turns=2))
+    blob = str(prepared.summarization_input)
+    assert "Port the compaction module from OpenCode/Pi/Hermes." in blob
+    assert sum(1 for item in prepared.summarization_input if item.get("type") == "function_call") == 25
+
+
 def test_extract_previous_summary_reads_shim_compaction_item():
     summary = "Prior task state"
     items = [

@@ -315,3 +315,63 @@ def test_fetch_chatgpt_codex_backend_models_returns_empty_without_auth(monkeypat
     monkeypatch.setattr("codex_shim.discover.fetch_http_json", boom)
     assert fetch_chatgpt_codex_backend_models() == []
     assert called["n"] == 0
+
+
+def test_load_chatgpt_preserves_backend_reasoning_context_and_verbosity(monkeypatch, tmp_path):
+    cache = tmp_path / "models_cache.json"
+    monkeypatch.setattr(
+        "codex_shim.discover.fetch_chatgpt_codex_backend_models",
+        lambda: [
+            {
+                "slug": "gpt-5.6-sol",
+                "display_name": "GPT-5.6 Sol",
+                "visibility": "list",
+                "context_window": 272000,
+                "max_context_window": 872000,
+                "default_reasoning_level": "low",
+                "supported_reasoning_levels": [
+                    {"effort": "low", "description": "Fast responses with lighter reasoning"},
+                    {"effort": "medium", "description": "Balances speed and reasoning depth for everyday tasks"},
+                    {"effort": "high", "description": "Greater reasoning depth for complex problems"},
+                    {"effort": "xhigh", "description": "Extra high reasoning depth for complex problems"},
+                    {"effort": "max", "description": "Maximum reasoning depth for the hardest problems"},
+                    {"effort": "ultra", "description": "Maximum reasoning with automatic task delegation"},
+                ],
+                "support_verbosity": True,
+                "default_verbosity": "low",
+                "input_modalities": ["text", "image"],
+                "supports_reasoning_summaries": True,
+            }
+        ],
+    )
+    monkeypatch.setattr("codex_shim.discover.persist_chatgpt_models_cache", lambda *a, **k: None)
+    entries = load_chatgpt_passthrough_catalog_models(cache)
+    entry = entries[0]
+    assert entry["slug"] == "codex-gpt-5-6-sol"
+    assert [level["effort"] for level in entry["supported_reasoning_levels"]] == [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max",
+        "ultra",
+    ]
+    assert entry["default_reasoning_level"] == "low"
+    assert entry["context_window"] == 272000
+    assert entry["max_context_window"] == 872000
+    assert entry["support_verbosity"] is True
+    assert entry["default_verbosity"] == "low"
+    assert entry["input_modalities"] == ["text", "image"]
+
+
+def test_minimal_chatgpt_passthrough_includes_max_and_ultra():
+    from codex_shim.settings import _minimal_chatgpt_passthrough_entry
+
+    entry = _minimal_chatgpt_passthrough_entry(
+        "codex-gpt-5-6-sol",
+        "GPT-5.6-Sol",
+        upstream_model="gpt-5.6-sol",
+    )
+    efforts = [level["effort"] for level in entry["supported_reasoning_levels"]]
+    assert efforts[-2:] == ["max", "ultra"]
+    assert "xhigh" in efforts

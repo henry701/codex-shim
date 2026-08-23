@@ -2,9 +2,10 @@ from __future__ import annotations
 
 from typing import Any
 
-from .errors import describe_upstream_error, format_compaction_failure_detail, upstream_error_message
+from .errors import describe_upstream_error, upstream_error_message
 from .logging import log_compaction_fallback, log_compaction_phase, log_compaction_path, log_compaction_warnings
 from .model_resolver import CompactionModelResolver, ResolvedCompactionModels
+from .local import deterministic_fallback_summary, summary_is_usable
 from .pipeline import PreparedInput, prepare_compaction_input
 from .protocol import (
     apply_compaction_fallback_notice,
@@ -122,20 +123,28 @@ class CompactionOrchestrator:
             )
 
         summary_result = await self._try_summarization(request, prepared, native_message)
-        if summary_result.summary.strip():
+        accepted_summary = _accepted_summary(summary_result.summary, prepared)
+        if summary_result.summary.strip() and not accepted_summary:
+            log_compaction_phase(
+                "summarization-unusable",
+                provider=request.provider,
+                slug=request.requested_slug,
+                summary_chars=len(summary_result.summary.strip()),
+            )
+        if accepted_summary:
             log_compaction_path(
                 "summarization",
                 provider=request.provider,
                 slug=request.requested_slug,
                 native_items=len(prepared.native_input),
                 summarization_items=len(prepared.summarization_input),
-                summary_chars=len(summary_result.summary.strip()),
+                summary_chars=len(accepted_summary),
                 native_error=native_message,
             )
             return CompactionResult(
                 item=compaction_output_item(
                     apply_compaction_fallback_notice(
-                        summary_result.summary,
+                        accepted_summary,
                         native_message,
                         provider=request.provider,
                         warnings=prepared_warnings or None,
@@ -162,20 +171,28 @@ class CompactionOrchestrator:
 
         tertiary_models = await self._resolve_models(request)
         tertiary = await self._try_tertiary(request, prepared, native_message, tertiary_models)
-        if tertiary.summary.strip():
+        accepted_tertiary = _accepted_summary(tertiary.summary, prepared)
+        if tertiary.summary.strip() and not accepted_tertiary:
+            log_compaction_phase(
+                "tertiary-unusable",
+                provider=request.provider,
+                slug=request.requested_slug,
+                summary_chars=len(tertiary.summary.strip()),
+            )
+        if accepted_tertiary:
             log_compaction_path(
                 "tertiary",
                 provider=request.provider,
                 slug=request.requested_slug,
                 native_items=len(prepared.native_input),
                 summarization_items=len(prepared.summarization_input),
-                summary_chars=len(tertiary.summary.strip()),
+                summary_chars=len(accepted_tertiary),
                 native_error=native_message,
             )
             return CompactionResult(
                 item=compaction_output_item(
                     apply_compaction_fallback_notice(
-                        tertiary.summary,
+                        accepted_tertiary,
                         native_message,
                         provider=request.provider,
                         warnings=prepared_warnings or None,
@@ -212,26 +229,36 @@ class CompactionOrchestrator:
                 skip_fields["configured"] = tertiary_models.tertiary_configured_slug
             log_compaction_phase("tertiary-skip", **skip_fields)
 
-        detail = format_compaction_failure_detail(
-            slug=request.requested_slug,
+        fallback = deterministic_fallback_summary(
+            prepared.native_input,
+            previous_summary=prepared.previous_summary,
+            reason=summarization_message,
+        )
+        log_compaction_path(
+            "local_fallback",
             provider=request.provider,
-            native_message=native_message,
-            summarization_message=summarization_message,
-            summarization_attempted=True,
-            tertiary_slug=tertiary_slug,
-            tertiary_message=tertiary_message if tertiary_slug else None,
-            tertiary_attempted=bool(tertiary_slug),
-            tertiary_skip_reason=tertiary_models.tertiary_skip_reason,
-            tertiary_configured_slug=tertiary_models.tertiary_configured_slug,
+            slug=request.requested_slug,
+            native_items=len(prepared.native_input),
+            summarization_items=len(prepared.summarization_input),
+            summary_chars=len(fallback),
+            native_error=native_message,
         )
-        last_error_response = (
-            tertiary.error_response
-            or summary_result.error_response
-            or native.error_response
-        )
-        raise CompactionOrchestratorError(
-            detail,
-            error_response=last_error_response,
+        fallback_warnings = list(prepared_warnings) + [
+            "used deterministic local compaction fallback after unusable LLM summaries"
+        ]
+        return CompactionResult(
+            item=compaction_output_item(
+                apply_compaction_fallback_notice(
+                    fallback,
+                    native_message,
+                    provider=request.provider,
+                    warnings=fallback_warnings,
+                )
+            ),
+            response_slug=request.requested_slug,
+            warnings=fallback_warnings,
+            native_error=native_message,
+            phase="local_fallback",
         )
 
     async def _resolve_models(self, request: CompactionRequest) -> ResolvedCompactionModels:
@@ -305,6 +332,17 @@ class CompactionOrchestratorError(Exception):
     def __init__(self, message: str, *, error_response: Any = None) -> None:
         super().__init__(message)
         self.error_response = error_response
+
+
+def _accepted_summary(summary: str, prepared: PreparedInput) -> str:
+    text = (summary or "").strip()
+    if summary_is_usable(
+        text,
+        items=prepared.native_input,
+        previous_summary=prepared.previous_summary,
+    ):
+        return text
+    return ""
 
 
 def native_item_from_payload(payload: dict[str, Any]) -> dict[str, Any] | None:

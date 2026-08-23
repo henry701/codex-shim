@@ -36,7 +36,7 @@ class CompactionResult:
     response_slug: str = ""
     warnings: list[str] = field(default_factory=list)
     native_error: str | None = None
-    phase: Literal["native", "summarization", "tertiary", "sanitization_only"] = "native"
+    phase: Literal["native", "summarization", "tertiary", "sanitization_only", "local_fallback"] = "native"
     legacy_payload: dict[str, Any] | None = None
 
 

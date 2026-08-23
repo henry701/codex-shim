@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 from codex_shim.translate import (
     anthropic_messages_to_chat,
     anthropic_to_response,
@@ -901,3 +903,112 @@ def test_agent_message_skips_opaque_encrypted_blobs():
     joined = "\n".join(str(message.get("content") or "") for message in out["messages"])
     assert "Message Type: NEW_TASK" in joined
     assert "A" * 400 not in joined
+
+
+def test_responses_to_chat_keeps_custom_tool_call_history_and_user_task():
+    """BYOK chat must not drop apply_patch custom_tool_call rounds or the original goal."""
+    patch = "*** Begin Patch\n*** Update File: locale.json\n@@\n-en\n+pt-BR\n*** End of File\n"
+    input_items: list[dict] = [
+        {"type": "message", "role": "developer", "content": [{"type": "input_text", "text": "You are Codex."}]},
+        {
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": "Verify the live-campaign locale is pt-BR and do not restart the task."}],
+        },
+    ]
+    for index in range(8):
+        call_id = f"call_patch_{index}"
+        input_items.extend(
+            [
+                {"type": "reasoning", "summary": [{"type": "summary_text", "text": f"Need to keep locale work round {index}."}]},
+                {
+                    "type": "custom_tool_call",
+                    "call_id": call_id,
+                    "name": "apply_patch",
+                    "input": patch,
+                },
+                {
+                    "type": "custom_tool_call_output",
+                    "call_id": call_id,
+                    "output": f"Success. Updated locale.json round {index}.",
+                },
+            ]
+        )
+    input_items.append(
+        {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "Continue after the last tool."}]}
+    )
+    out = responses_to_chat({"model": "slug", "input": input_items}, "stealth/ox-alpha")
+    joined = json.dumps(out["messages"])
+    assert "Verify the live-campaign locale is pt-BR" in joined
+    assert "apply_patch" in joined
+    assert "Success. Updated locale.json round 7" in joined
+    assert joined.count("tool_calls") >= 8
+    assert len(out["messages"]) >= 18
+
+
+def test_responses_to_chat_maps_chatgpt_function_call_cache_items():
+    body = {
+        "model": "slug",
+        "input": [
+            {"type": "message", "role": "user", "content": "Keep the live campaign going."},
+            {
+                "type": "function_call",
+                "call_id": "call_shell",
+                "name": "exec_command",
+                "arguments": '{"cmd":"ls"}',
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "call_shell",
+                "output": "verifier-report.json",
+            },
+        ],
+    }
+    out = responses_to_chat(body, "real-model")
+    joined = json.dumps(out["messages"])
+    assert "Keep the live campaign going." in joined
+    assert "exec_command" in joined
+    assert "verifier-report.json" in joined
+    assert "unknown_tool" not in joined
+
+
+def test_responses_to_chat_uses_plaintext_compaction_summary_and_undecodable_fallback():
+    from codex_shim.compaction import encode_shim_compaction_summary
+
+    body = {
+        "model": "slug",
+        "input": [
+            {
+                "type": "compaction",
+                "encrypted_content": encode_shim_compaction_summary(
+                    "Original task: finish locale verification for the live campaign."
+                ),
+            },
+            {"type": "compaction", "summary": "User asked to keep the playtest locale as pt-BR."},
+            {"type": "compaction", "encrypted_content": "gAAAA-openai-native-blob"},
+            {"type": "message", "role": "user", "content": "Continue."},
+        ],
+    }
+    out = responses_to_chat(body, "stealth/ox-alpha")
+    joined = "\n".join(str(message.get("content") or "") for message in out["messages"])
+    assert "finish locale verification for the live campaign" in joined
+    assert "keep the playtest locale as pt-BR" in joined
+    assert "encrypted for another provider" in joined.lower() or "do not restart" in joined.lower()
+
+
+def test_responses_to_chat_orphan_output_uses_advertised_tool_name():
+    body = {
+        "model": "slug",
+        "tools": [{"type": "function", "name": "exec_command", "parameters": {"type": "object"}}],
+        "input": [
+            {
+                "type": "function_call_output",
+                "call_id": "call_orphan",
+                "output": "report-validation=PASS",
+            },
+        ],
+    }
+    out = responses_to_chat(body, "stealth/ox-alpha")
+    tool_calls = out["messages"][0]["tool_calls"]
+    assert tool_calls[0]["function"]["name"] == "exec_command"
+    assert out["messages"][1]["content"] == "report-validation=PASS"

@@ -18,7 +18,7 @@ from urllib.request import urlopen
 from pathlib import Path
 
 from .header_passthrough import KEYLESS_API_KEY
-from .naming import description_for_route, display_name_from_slug
+from .naming import ROUTE_LABEL_PREFIXES, description_for_route, display_name_from_slug
 from .net.retry import RetryPolicy, request_urllib
 from .nous_auth import resolve_nous_api_key
 from .settings import ShimModel, slugify
@@ -126,6 +126,250 @@ NOUS_PORTAL_TEMPLATE = DiscoverTemplate(
     },
     label_prefix="nous",
 )
+
+# Published Ox Alpha window is 1_048_576. Nous /v1/models often omits
+# context_length, so discovery used to fall through to the 128k catalog
+# default and Desktop auto-compacted around 102k (UI then shows ~122k).
+OX_ALPHA_CONTEXT_TOKENS = 1_048_576
+_OX_ALPHA_MODEL_MARKERS = (
+    "ox-alpha",
+    "ox_alpha",
+    "x-preview-f-free",
+)
+
+
+def context_limit_for_discovered_model(model_id: str, reported: int | None = None) -> int | None:
+    """Prefer a real listing window; never trust tiny stand-ins for Ox Alpha."""
+    known = None
+    haystack = model_id.strip().lower().replace("_", "-")
+    if any(marker in haystack for marker in _OX_ALPHA_MODEL_MARKERS):
+        known = OX_ALPHA_CONTEXT_TOKENS
+    if known is not None:
+        if reported is None or reported < 500_000:
+            return known
+        return max(known, reported)
+    if reported is not None and reported > 0:
+        return reported
+    return None
+
+
+_MODELS_DEV_PROVIDERS_BY_KIND = {
+    "zen_public": ("opencode",),
+    "zen": ("opencode",),
+    "openrouter_free": ("openrouter",),
+    "openrouter": ("openrouter",),
+    "nvidia_integrate": ("nvidia",),
+    "nvidia": ("nvidia",),
+    "nous": ("openrouter",),
+    "nous_portal": ("openrouter",),
+}
+_EFFORT_ALIASES = {
+    "x-high": "xhigh",
+    "x_high": "xhigh",
+    "xhigh": "xhigh",
+    "extra-high": "xhigh",
+    "maximum": "max",
+    "min": "minimal",
+}
+_MODELS_DEV_CATALOG_TTL_SEC = 3 * 60 * 60
+_models_dev_catalog_cache: tuple[float, dict[str, Any]] | None = None
+_models_dev_catalog_lock = threading.Lock()
+
+
+def clear_models_dev_catalog_cache() -> None:
+    global _models_dev_catalog_cache
+    with _models_dev_catalog_lock:
+        _models_dev_catalog_cache = None
+
+
+def fetch_models_dev_catalog() -> dict[str, Any]:
+    """Return the models.dev provider catalog, cached for a few hours."""
+    global _models_dev_catalog_cache
+    now = time.monotonic()
+    with _models_dev_catalog_lock:
+        cached = _models_dev_catalog_cache
+        if cached is not None and now - cached[0] < _MODELS_DEV_CATALOG_TTL_SEC:
+            return cached[1]
+    try:
+        payload = fetch_http_json(MODELS_DEV_API_URL)
+    except (OSError, URLError, json.JSONDecodeError, ValueError):
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+    with _models_dev_catalog_lock:
+        _models_dev_catalog_cache = (time.monotonic(), payload)
+    return payload
+
+
+def _positive_int(value: Any) -> int | None:
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return None
+    return number if number > 0 else None
+
+
+def _unique_strings(values: list[str]) -> list[str]:
+    seen: set[str] = set()
+    items: list[str] = []
+    for value in values:
+        if value and value not in seen:
+            seen.add(value)
+            items.append(value)
+    return items
+
+
+def _normalize_effort(value: Any) -> str:
+    raw = str(value or "").strip().lower().replace("_", "-")
+    if not raw:
+        return ""
+    if raw in _EFFORT_ALIASES:
+        return _EFFORT_ALIASES[raw]
+    return raw
+
+
+def _string_list(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    items: list[str] = []
+    for item in value:
+        text = str(item or "").strip().lower()
+        if text:
+            items.append(text)
+    return _unique_strings(items)
+
+
+def _efforts_from_models_dev_row(row: dict[str, Any]) -> list[str]:
+    efforts: list[str] = []
+    options = row.get("reasoning_options")
+    if isinstance(options, list):
+        for option in options:
+            if not isinstance(option, dict):
+                continue
+            kind = str(option.get("type") or "").strip().lower()
+            if kind not in {"effort", "reasoning_effort", "reasoning"}:
+                continue
+            values = option.get("values") or option.get("options") or []
+            if isinstance(values, list):
+                efforts.extend(_normalize_effort(item) for item in values)
+    variants = row.get("variants")
+    if isinstance(variants, dict):
+        for key, value in variants.items():
+            if isinstance(value, dict):
+                nested = value.get("effort") or value.get("reasoning_effort")
+                if isinstance(nested, list):
+                    efforts.extend(_normalize_effort(item) for item in nested)
+                elif nested:
+                    efforts.append(_normalize_effort(nested))
+            elif isinstance(value, str):
+                efforts.append(_normalize_effort(value))
+    for key in ("reasoning_efforts", "supported_reasoning_efforts"):
+        raw = row.get(key)
+        if isinstance(raw, list):
+            efforts.extend(_normalize_effort(item) for item in raw)
+    return _unique_strings([item for item in efforts if item])
+
+
+def metadata_from_models_dev_row(row: dict[str, Any] | None) -> dict[str, Any]:
+    """Map a models.dev model row onto catalog-facing metadata."""
+    if not isinstance(row, dict) or not row:
+        return {}
+    limit = row.get("limit") if isinstance(row.get("limit"), dict) else {}
+    modalities = row.get("modalities") if isinstance(row.get("modalities"), dict) else {}
+    interleaved = row.get("interleaved") if isinstance(row.get("interleaved"), dict) else {}
+    input_modalities = _string_list(modalities.get("input"))
+    efforts = _efforts_from_models_dev_row(row)
+    reasoning = row.get("reasoning")
+    attachment = row.get("attachment")
+    name = str(row.get("name") or "").strip()
+    description = str(row.get("description") or "").strip()
+    no_image = False
+    if input_modalities:
+        no_image = "image" not in input_modalities
+    elif attachment is False:
+        no_image = True
+    meta: dict[str, Any] = {}
+    if name:
+        meta["upstream_name"] = name
+    if description:
+        meta["upstream_description"] = description
+    if efforts:
+        meta["reasoning_efforts"] = efforts
+    if input_modalities:
+        meta["input_modalities"] = input_modalities
+    reported = _positive_int(limit.get("context"))
+    output = _positive_int(limit.get("output"))
+    if reported:
+        meta["reported_context_limit"] = reported
+    if output:
+        meta["output_limit"] = output
+    if isinstance(reasoning, bool):
+        meta["reasoning"] = reasoning
+    if isinstance(attachment, bool):
+        meta["attachment"] = attachment
+    field = str(interleaved.get("field") or "").strip()
+    if field:
+        meta["interleaved_reasoning_field"] = field
+    meta["no_image_support"] = no_image
+    return meta
+
+
+def lookup_models_dev_row(
+    catalog: dict[str, Any],
+    *,
+    providers: tuple[str, ...],
+    model_id: str,
+) -> dict[str, Any] | None:
+    needle = model_id.strip()
+    if not needle or not isinstance(catalog, dict):
+        return None
+    for provider_name in providers:
+        provider = catalog.get(provider_name)
+        if not isinstance(provider, dict):
+            continue
+        models = provider.get("models")
+        if not isinstance(models, dict):
+            continue
+        exact = models.get(needle)
+        if isinstance(exact, dict):
+            return exact
+        for key, row in models.items():
+            if not isinstance(row, dict):
+                continue
+            row_id = str(row.get("id") or key).strip()
+            if _model_id_matches(needle, key, row_id):
+                return row
+    return None
+
+
+def _model_id_matches(needle: str, *candidates: str) -> bool:
+    lowered = needle.lower()
+    aliases = {lowered, lowered.removesuffix(":free")}
+    needle_tail = lowered.split("/")[-1]
+    for candidate in candidates:
+        value = str(candidate or "").strip().lower()
+        if not value:
+            continue
+        if value in aliases or value.removesuffix(":free") in aliases:
+            return True
+        if value.split("/")[-1] == needle_tail:
+            return True
+        if value.endswith("/" + lowered) or lowered.endswith("/" + value):
+            return True
+    return False
+
+
+def _metadata_for_discovered_model(template: DiscoverTemplate, model_id: str) -> dict[str, Any]:
+    providers = _MODELS_DEV_PROVIDERS_BY_KIND.get(template.kind, ())
+    if not providers:
+        return {}
+    row = lookup_models_dev_row(
+        fetch_models_dev_catalog(),
+        providers=providers,
+        model_id=model_id,
+    )
+    return metadata_from_models_dev_row(row)
+
 
 _BUILTIN_TEMPLATES: dict[str, DiscoverTemplate] = {
     "zen_public": ZEN_PUBLIC_TEMPLATE,
@@ -666,11 +910,7 @@ def _parse_models_dev_opencode_free_ids(payload: Any) -> list[str]:
 
 
 def fetch_models_dev_opencode_free_model_ids() -> list[str]:
-    try:
-        payload = fetch_http_json(MODELS_DEV_API_URL)
-    except (OSError, URLError, json.JSONDecodeError, ValueError):
-        return []
-    return _parse_models_dev_opencode_free_ids(payload)
+    return _parse_models_dev_opencode_free_ids(fetch_models_dev_catalog())
 
 
 def _parse_models_dev_opencode_paid_ids(payload: Any) -> list[str]:
@@ -698,11 +938,7 @@ def _parse_models_dev_opencode_paid_ids(payload: Any) -> list[str]:
 
 
 def fetch_models_dev_opencode_paid_model_ids() -> list[str]:
-    try:
-        payload = fetch_http_json(MODELS_DEV_API_URL)
-    except (OSError, URLError, json.JSONDecodeError, ValueError):
-        return []
-    return _parse_models_dev_opencode_paid_ids(payload)
+    return _parse_models_dev_opencode_paid_ids(fetch_models_dev_catalog())
 
 
 def fetch_zen_paid_model_ids(*, api_key: str = "") -> list[str]:
@@ -899,7 +1135,12 @@ def _rows_to_shim_models(model_ids: list[str], template: DiscoverTemplate) -> li
     used_slugs: set[str] = set()
     for offset, model_id in enumerate(sorted(model_ids, key=str.lower)):
         slug = _catalog_slug_for_model(model_id, template.slug_prefix, used_slugs, offset)
+        meta = _metadata_for_discovered_model(template, model_id)
         display_name = display_name_from_slug(slug, label_prefix=template.label_prefix)
+        upstream_name = str(meta.get("upstream_name") or "").strip()
+        if upstream_name:
+            prefix = ROUTE_LABEL_PREFIXES.get((template.label_prefix or "").lower())
+            display_name = f"{prefix} — {upstream_name}" if prefix else upstream_name
         models.append(
             ShimModel(
                 slug=slug,
@@ -910,7 +1151,14 @@ def _rows_to_shim_models(model_ids: list[str], template: DiscoverTemplate) -> li
                 api_key=_resolved_api_key(_api_key_for_discovered_model(model_id, template)),
                 index=DISCOVER_INDEX_BASE + offset,
                 extra_headers=dict(template.extra_headers),
-                raw={"discovered": True, "discover_kind": template.kind},
+                max_context_limit=context_limit_for_discovered_model(
+                    model_id,
+                    reported=meta.get("reported_context_limit"),
+                ),
+                max_output_tokens=meta.get("output_limit"),
+                no_image_support=bool(meta.get("no_image_support")),
+                supports_reasoning_summaries=bool(meta.get("reasoning")),
+                raw={"discovered": True, "discover_kind": template.kind, **meta},
             )
         )
     return models

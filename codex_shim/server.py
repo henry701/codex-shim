@@ -38,6 +38,15 @@ from .net.sse import (
     write_bytes as _safe_write,
     write_sse as _net_write_sse,
 )
+from .net.prefill import (
+    MAX_PREFILL_CONTINUES,
+    PREFILL_REJECT_STATUS,
+    ReplaySkipper,
+    assistant_prefill_message,
+    is_conclusive_finish,
+    should_prefill_continue,
+    with_assistant_prefill,
+)
 from .net.stream_guard import StreamGuard
 
 from .compaction import (
@@ -169,7 +178,12 @@ from .translate import (
     _chat_finish_to_anthropic_stop,
     _responses_usage_to_anthropic_usage,
 )
-from .upstream_compat import learn_parallel_tool_calls_compat_if_needed, prepare_openai_chat_body
+from .upstream_compat import (
+    is_console_invalid_parameter_error,
+    learn_console_chat_compat_if_needed,
+    learn_parallel_tool_calls_compat_if_needed,
+    prepare_openai_chat_body,
+)
 from .upstream_io_trace import log_upstream_request, log_upstream_response, shim_io_log_enabled
 
 DEBUG_DIR = Path(__file__).resolve().parents[1] / ".codex-shim"
@@ -3548,7 +3562,7 @@ class ShimServer:
         )
         last_error: tuple[int, str, str, str] | None = None
         policy = retry_policy_from_env()
-        for attempt in range(2):
+        for attempt in range(3):
             prepared = prepare_openai_chat_body(route, body)
             log_upstream_request(f"byok-openai-chat:{route.slug}", url, prepared)
             posted = await retry_aiohttp_post(
@@ -3580,13 +3594,29 @@ class ShimServer:
             )
             code, message = parse_upstream_error(text, status)
             last_error = (status, text, code, message)
-            if attempt == 0 and learn_parallel_tool_calls_compat_if_needed(route, status, message):
+            if learn_parallel_tool_calls_compat_if_needed(route, status, message):
                 print(
                     f"[compat] model={route.slug} retrying without parallel_tool_calls after upstream "
                     f"{status}: {message[:200]}",
                     flush=True,
                 )
                 continue
+            if is_console_invalid_parameter_error(status, message):
+                learned = learn_console_chat_compat_if_needed(route, status, message)
+                if learned:
+                    print(
+                        f"[compat] model={route.slug} retrying with console chat sanitizer after "
+                        f"upstream {status}: {message[:200]}",
+                        flush=True,
+                    )
+                    continue
+                if attempt < 2:
+                    print(
+                        f"[compat] model={route.slug} retrying console {status} (transient): "
+                        f"{message[:200]}",
+                        flush=True,
+                    )
+                    continue
             break
         return None, last_error
 
@@ -3686,7 +3716,8 @@ class ShimServer:
             else RawChatEmitter()
         )
         policy = retry_policy_from_env()
-        messages = list(body.get("messages", []))
+        original_messages = list(body.get("messages", []))
+        messages = list(original_messages)
         chat_body = {k: v for k, v in body.items() if k != "stream"}
         chat_body["stream"] = True
         response = _sse_response()
@@ -3698,7 +3729,19 @@ class ShimServer:
                 label=label,
                 finish_reason=(lambda: state.upstream_finish_reason if state is not None else None),
             ) as guard:
-                for attempt in range(policy.attempts):
+                http_attempt = 0
+                continues = 0
+                prefill_in_flight = False
+                state_started = False
+                skipper = ReplaySkipper()
+
+                async def drop_upstream() -> None:
+                    src = guard.upstream
+                    guard.attach_upstream(None)
+                    if src is not None:
+                        await _close_upstream(src)
+
+                while True:
                     turn_body = {**chat_body, "messages": messages}
                     upstream, err = await self._post_openai_chat_completions(
                         session, route, turn_body, request.headers
@@ -3709,8 +3752,17 @@ class ShimServer:
                             f"[stream] model={route.slug} upstream HTTP {status}: {message[:500]}",
                             flush=True,
                         )
+                        if prefill_in_flight and status in PREFILL_REJECT_STATUS:
+                            print(
+                                f"[stream] model={route.slug} assistant prefill rejected; "
+                                "ending incomplete",
+                                flush=True,
+                            )
+                            break
                         if state is not None:
-                            await state.start(response)
+                            if not state_started:
+                                await state.start(response)
+                                state_started = True
                             await state.fail(response, message, code=code)
                         else:
                             await emitter.fail(
@@ -3719,9 +3771,12 @@ class ShimServer:
                                 code=code,
                             )
                         return response
+                    prefill_in_flight = False
                     observe_upstream_response(f"byok-openai-chat-stream:{route.slug}", upstream)
                     guard.attach_upstream(upstream)
-                    state_started = False
+                    if state is not None:
+                        state.upstream_finish_reason = None
+                    disconnect_exc: BaseException | None = None
                     try:
                         async for line in guard.iter_sse(request=request):
                             if state is not None and not state_started:
@@ -3744,16 +3799,52 @@ class ShimServer:
                                     await emitter.fail(response, message, code=code)
                                 break
                             if state is not None:
-                                await state.write_chat_delta(response, event)
+                                filtered = (
+                                    skipper.filter_chunk(event)
+                                    if isinstance(event, dict)
+                                    else event
+                                )
+                                if filtered is None:
+                                    continue
+                                await state.write_chat_delta(response, filtered)
                             else:
                                 await _write_sse(response, event)
                     except ClientError as exc:
-                        if guard.can_retry and attempt + 1 < policy.attempts:
-                            await _close_upstream(upstream)
-                            guard.attach_upstream(None)
-                            await policy.sleep(attempt)
+                        disconnect_exc = exc
+                    await drop_upstream()
+                    if (
+                        disconnect_exc is not None
+                        and guard.can_retry
+                        and http_attempt + 1 < policy.attempts
+                    ):
+                        http_attempt += 1
+                        await policy.sleep(http_attempt - 1)
+                        continue
+                    if (
+                        state is not None
+                        and not state.failed
+                        and should_prefill_continue(
+                            finish_reason=state.upstream_finish_reason,
+                            saw_done=guard.upstream_saw_done,
+                            continues=continues,
+                            as_responses=as_responses,
+                        )
+                    ):
+                        prefill = assistant_prefill_message(state)
+                        if prefill is not None:
+                            continues += 1
+                            messages = with_assistant_prefill(original_messages, prefill)
+                            skipper = ReplaySkipper.from_state(state)
+                            prefill_in_flight = True
+                            http_attempt = 0
+                            print(
+                                f"[stream] model={route.slug} silent EOF; "
+                                f"prefill continue {continues}/{MAX_PREFILL_CONTINUES}",
+                                flush=True,
+                            )
                             continue
-                        await guard.note_upstream_disconnect(exc)
+                    if disconnect_exc is not None and guard.can_retry:
+                        await guard.note_upstream_disconnect(disconnect_exc)
                         return response
                     if (
                         as_responses
@@ -3768,8 +3859,7 @@ class ShimServer:
                             state.response_id,
                             state.output_items(),
                         )
-                    return response
-                await emitter.fail(response, "upstream unavailable", code="upstream_error")
+                    break
         return response
 
     async def _post_openai_chat_as_anthropic(
@@ -4723,7 +4813,14 @@ class ResponsesStreamState:
                 "synthesizing terminal event",
                 flush=True,
             )
-        if not self._has_open_incomplete_items():
+        conclusive = is_conclusive_finish(
+            self.upstream_finish_reason, saw_done=upstream_saw_done
+        )
+        if (
+            not self._has_open_incomplete_items()
+            and conclusive
+            and self.upstream_finish_reason != "length"
+        ):
             await _write_sse(
                 response,
                 {"type": "response.completed", "response": self._response("completed", final=True)},

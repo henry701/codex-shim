@@ -14,6 +14,7 @@ from .logging import (
     log_compaction_input_snapshot,
     log_compaction_sanitization,
 )
+from .local import select_summarization_span, verbatim_user_quotes
 from .protocol import decode_shim_compaction_summary, sanitize_compaction_input_items
 
 STILL_OVER_BUDGET_WARNING = (
@@ -38,21 +39,6 @@ def estimate_input_tokens(items: list[Any], *, instructions_chars: int = 0) -> i
     for item in items:
         total += max(1, _estimate_item_chars(item) // 4)
     return total
-
-
-def _is_user_turn_boundary(item: dict[str, Any]) -> bool:
-    if item.get("type") != "message":
-        return False
-    role = item.get("role")
-    return role in {"user", "developer"}
-
-
-def _user_turn_start_indices(items: list[Any]) -> list[int]:
-    indices: list[int] = []
-    for index, raw in enumerate(items):
-        if isinstance(raw, dict) and _is_user_turn_boundary(raw):
-            indices.append(index)
-    return indices
 
 
 def extract_previous_summary(items: list[Any]) -> str | None:
@@ -168,15 +154,17 @@ def exclude_recent_user_turns(
     items: list[Any],
     *,
     tail_turns: int,
+    preserve_recent_tokens: int = 8000,
+    max_recent_user_prompts: int = 50,
 ) -> tuple[list[Any], list[Any], int]:
-    """Split for summarization input only; client retains user messages post-compact."""
-    if tail_turns <= 0 or not items:
-        return items, [], 0
-    turn_starts = _user_turn_start_indices(items)
-    if len(turn_starts) <= tail_turns:
-        return [], items, len(turn_starts)
-    split_at = turn_starts[-tail_turns]
-    return items[:split_at], items[split_at:], tail_turns
+    """Split for summarization input only; client retains recent *user* turns post-compact."""
+    span = select_summarization_span(
+        items,
+        tail_turns=tail_turns,
+        preserve_recent_tokens=preserve_recent_tokens,
+        max_recent_user_prompts=max_recent_user_prompts,
+    )
+    return span.head, span.tail, span.excluded_user_turns
 
 
 @dataclass
@@ -186,6 +174,7 @@ class PreparedInput:
     previous_summary: str | None
     warnings: list[str] = field(default_factory=list)
     excluded_user_turns: int = 0
+    extra_context: list[str] = field(default_factory=list)
     stats: dict[str, int] = field(default_factory=dict)
     sanitization_audit: CompactionSanitizationAudit | None = None
 
@@ -357,8 +346,14 @@ def prepare_compaction_input(
     head, tail, excluded = exclude_recent_user_turns(
         working,
         tail_turns=settings.tail_turns,
+        preserve_recent_tokens=settings.preserve_recent_tokens,
+        max_recent_user_prompts=settings.max_recent_user_prompts,
     )
     summarization_input = head if head else working
+    extra_context: list[str] = []
+    quotes = verbatim_user_quotes(working, max_prompts=settings.max_recent_user_prompts)
+    if quotes:
+        extra_context.append(quotes)
     stats["summarization_items"] = len(summarization_input)
     stats["excluded_tail_items"] = len(tail)
 
@@ -368,6 +363,7 @@ def prepare_compaction_input(
         previous_summary=previous_summary,
         warnings=warnings,
         excluded_user_turns=excluded,
+        extra_context=extra_context,
         stats=stats,
         sanitization_audit=sanitization_audit,
     )

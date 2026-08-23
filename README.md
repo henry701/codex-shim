@@ -34,7 +34,7 @@ multi-provider local catalog that stays in sync with Codex Desktop.
 
 | Area | What the fork adds |
 |---|---|
-| **Auto-discovery** | `codex-shim discover` lists models pulled from provider APIs/CLIs: OpenCode Zen (keyless free via models.dev + paid), OpenRouter `:free` models, NVIDIA Integrate, Nous Portal (`stealth/ox-alpha` and `/v1/models`), and local OpenAI-compatible endpoints. `discover --refresh` busts cached Cursor catalog metadata. |
+| **Auto-discovery** | `codex-shim discover` lists models pulled from provider APIs/CLIs: OpenCode Zen (keyless free via models.dev + paid), OpenRouter `:free` models, NVIDIA Integrate, Nous Portal (`stealth/ox-alpha` and `/v1/models`), and local OpenAI-compatible endpoints. Discovery copies useful models.dev fields into the Desktop catalog (context/output limits, reasoning efforts/variants, input modalities, descriptions). ChatGPT passthrough already maps the Codex backend `/models` row. Cursor stays CLI-driven. `discover --refresh` busts cached Cursor catalog metadata. |
 | **Provider-prefixed slugs** | Discovered routes get stable prefixes (`or-`, `zen-`, `nvidia-`, `oc-free-`, `nous-`, …) so hundreds of models stay identifiable in the picker and logs. |
 | **`sync-desktop`** | Writes `~/.codex/custom_model_catalog.json` only. Does **not** change `~/.codex/config.toml` — use `codex-shim enable` (or `app`) to wire OpenAI-provider shim routing. |
 | **systemd user service** | `codex-shim install-service` installs a user unit with `ExecStartPre=sync-desktop` (45s discovery budget; keeps the existing catalog on timeout) and `ExecStart=serve`. `TimeoutStartSec=180`. `codex-shim restart` reloads and restarts the user unit when it is installed. CLI `run` still syncs then serves for interactive use. Config stays untouched until `enable`. Targets `graphical-session.target` and, when present, a local `network-ready-user.service` drop-in so model refresh waits for NM + DNS. Also installs an hourly user logrotate timer for `~/.codex-shim/shim.log` (30M, keep 10 compressed). |
@@ -123,7 +123,14 @@ Set `"discover": false` to disable all auto-discovery, or toggle individual keys
 `zen_public` (slug prefix `oc-free-`) is the hermes-cli OpenCode Free path:
 models from `https://models.dev/api.json` (provider `opencode`, `cost.input == 0`,
 not deprecated) and inference at `https://opencode.ai/zen/v1` with **no**
-`Authorization` header. Free Zen 401s unrecognized bearers, including
+`Authorization` header. The same models.dev row is mapped into the Desktop
+catalog: context/output limits, `reasoning_options` effort values, input
+modalities, and the upstream name/description. Nous Portal overlays the
+OpenRouter models.dev row for `stealth/ox-alpha` (efforts `low`/`high`/`max`).
+OpenRouter `:free` and NVIDIA Integrate do the same against their models.dev
+providers. ChatGPT passthrough keeps the Codex backend `/models` payload,
+including `max`/`ultra`. Cursor remains CLI-driven and is not scraped this way.
+Free Zen 401s unrecognized bearers, including
 `Bearer public`. The shim keeps `public` as an internal keyless sentinel so
 the route still counts as credentialed; it is never sent upstream, and Desktop's
 ChatGPT bearer is stripped so it cannot leak. Desktop's User-Agent is left
@@ -143,6 +150,9 @@ The shim updates `providers.nous` only and does not change Hermes
 `active_provider`.
 Hermes `HTTP-Referer` / `X-Title` are setdefaults; Desktop's User-Agent still
 wins. Listing uses inference `/v1/models` and always includes `stealth/ox-alpha`.
+Ox Alpha is advertised at 1,048,576 tokens (same window as OpenCode Zen
+`x-preview-f-free`); Nous listings that omit `context_length` no longer fall
+back to 128k.
 
 ---
 
@@ -754,6 +764,11 @@ Debug env knobs:
 | `CODEX_SHIM_CHATGPT_CACHE_MAX_BYTES` | Global disk cap for expansion cache; coldest entries evicted LRU (default: `512M`) |
 | `CODEX_SHIM_CHATGPT_CACHE_MAX_MEMORY_ENTRIES` | In-memory LRU cap for deserialized snapshots (default: `256`) |
 
+BYOK OpenAI-chat streams that end without `stop`, `tool_calls`, or `[DONE]`
+reconnect on the same Codex turn using assistant prefill: a trailing truncated
+assistant message, with no user nudge, up to three times. A conclusive
+`stop` / `tool_calls` still completes even when `[DONE]` is missing.
+
 Live smoke test (alternate port, `codex exec` with tool call + cache check):
 
 ```bash
@@ -910,7 +925,9 @@ OpenAI chat completions or Anthropic Messages. The shim bridges the gap:
 |---|---|---|
 | `tools: [{type: "function", ...}]` | `tools: [{type: "function", function: ...}]` | `tools: [{name, description, input_schema}]` |
 | `function_call` output item | Chat `tool_calls[]` | `tool_use` content block |
+| `custom_tool_call` / `apply_patch` history | Chat `tool_calls[]` (`apply_patch`) | `tool_use` content block |
 | `function_call_output` input item | Chat `role: "tool"` message | `tool_result` user content block |
+| `custom_tool_call_output` input item | Chat `role: "tool"` message | `tool_result` user content block |
 | streamed argument deltas | `response.function_call_arguments.delta` | `response.function_call_arguments.delta` |
 | parallel calls | Preserved via `parallel_tool_calls` where supported | Multiple `tool_use` blocks |
 
@@ -948,6 +965,10 @@ Known edge cases:
   valid JSON by the end of the call.
 - If a provider ignores `parallel_tool_calls`, Codex may still request one tool
   at a time. That is an upstream behavior, not a catalog issue.
+- OpenCode Zen Console (GLM/Z.AI error `[1210]` / `[1214]`) rejects extra chat
+  fields. The shim strips `reasoning_content`, `reasoning_effort`,
+  `parallel_tool_calls`, image parts, and empty user turns for `oc-free-*` /
+  discovered Zen routes, and retries the same Codex turn.
 
 ---
 
@@ -980,12 +1001,23 @@ pass through unless ChatGPT 400s on them. Legacy `/compact` still omits
 
 Cursor, BYOK, and OpenCode-style custom models still share the
 `codex_shim.compaction` orchestrator: prepare input (orphan sanitization,
-optional tool-output rewrite, optional recent-user-turn exclusion for
-summarization), native compact, then OpenCode-style summarization fallback, then
+optional tool-output rewrite, token-budgeted recent-*user*-turn exclusion for
+summarization), native compact, then structured summarization fallback, then
 optional BYOK tertiary fallback (`compaction.tertiary_fallback_slug` in
-`models.json`). Turn-level `passthrough_error_fallback` is separate: it only
-applies when ChatGPT/Cursor passthrough **turns** fail, not to compaction
-phases.
+`models.json`). If native compact is missing (typical for chat-completions
+endpoints such as Nous/Ox) and LLM summarization returns an empty or unusable
+handoff, a deterministic local fallback still emits Goal / Progress / Files
+from the raw items so the task is never dropped. Turn-level
+`passthrough_error_fallback` is separate: it only applies when ChatGPT/Cursor
+passthrough **turns** fail, not to compaction phases.
+
+Summarization turn splitting follows OpenCode/Pi/Hermes: only real `role=user`
+messages are turn boundaries (developer/system preamble is not). The last
+`max_recent_user_prompts` user prompts (default 50) are kept in play; older
+user turns are dropped from the summarizer (prior compaction summaries still
+carry them). A last turn that overflows `preserve_recent_tokens` stays in the
+summarizer. Recent user texts are quoted verbatim into the summarization
+prompt — never paraphrased, but capped so a stale first goal cannot dominate.
 
 ChatGPT passthrough expands compact-v2 requests from the conversation cache when
 `previous_response_id` is set, and synthesizes missing `function_call` items for
@@ -1005,6 +1037,8 @@ Optional `compaction` block in `~/.codex-shim/models.json`:
     "model": "gpt-5.4-mini",
     "fallback_enabled": true,
     "tail_turns": 2,
+    "preserve_recent_tokens": 8000,
+    "max_recent_user_prompts": 50,
     "tool_output_max_chars": 2000,
     "compaction_output_token_reserve": 16000,
     "prompt_cache_key_version": "v1",
@@ -1015,7 +1049,16 @@ Optional `compaction` block in `~/.codex-shim/models.json`:
 
 `tertiary_fallback_slug` is independent of `passthrough_error_fallback`. When
 native compact and summarization both fail, tertiary runs a BYOK compact on that
-slug if route credentials are available.
+slug if route credentials are available. If that is also empty or too thin to
+keep a recent user goal, the shim writes a deterministic local summary
+instead of replacing hundreds of items with a 400-character stub.
+
+`tail_turns` caps how many **user** turns may stay out of the summarizer
+(default 2). `preserve_recent_tokens` (default 8000) is the OpenCode-style
+token budget for that suffix. `max_recent_user_prompts` (default 50, `0` =
+unlimited) is the recency window for verbatim quotes, usability checks, and
+the summarization head. Developer messages do not consume `tail_turns` and
+are kept even when older user turns fall out of the window.
 
 Compaction input shaping uses the compaction model's context window minus an
 output reserve. By default the reserve is 20000 tokens, or an explicit
