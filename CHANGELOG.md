@@ -13,10 +13,13 @@ and this project does not yet follow semantic versioning (pre-1.0).
   `audio`). models.dev `video` values made `config.toml` fail to parse, so
   ChatGPT could not load the thread.
 
-- Catalog no longer invents `supported_reasoning_levels` (`low`/`medium`/`high`/
-  `xhigh`) when upstream sent none. Toggle-only and non-reasoning models keep
-  the required key as `[]` (Desktop serde rejects a missing field) instead of
-  advertising variants the backend does not have.
+- Catalog JSON always includes `supported_reasoning_levels` and
+  `default_reasoning_level`. CLI serde requires the levels key (`Vec`, no
+  `#[serde(default)]`); `default_reasoning_level` is `Option` (missing is
+  `None`), but Desktop's picker still needs a selected row. When upstream
+  listed no variants, the catalog file stubs `low`/`medium`/`high` with default
+  `medium`; otherwise the default is kept only if it is one of the listed
+  efforts. Discovery/raw metadata still does not invent levels.
 
 - Nous `stealth/ox-alpha` and OpenCode Zen `x-preview-f-free` now advertise the
   published 1,048,576-token window. Discovery was dropping context and falling

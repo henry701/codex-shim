@@ -101,6 +101,18 @@ _REASONING_LEVEL_DESCRIPTIONS = {
     "max": "Maximum reasoning depth for the hardest problems",
     "ultra": "Maximum reasoning with automatic task delegation",
 }
+# Catalog JSON (`custom_model_catalog.json`) only — never discovery/raw.
+# CLI and Desktop both parse model_catalog_json as ModelsResponse
+# { models: Vec<ModelInfo> }. ModelInfo.supported_reasoning_levels is a
+# required Vec<ReasoningEffortPreset> with no #[serde(default)]; omitting
+# the key fails config.toml: missing field `supported_reasoning_levels`.
+# Empty [] deserializes, but Desktop's effort picker wants real rows.
+# When upstream listed no variants, write low/medium/high on this file.
+_CATALOG_FILE_FALLBACK_REASONING_LEVELS = (
+    {"effort": "low", "description": _REASONING_LEVEL_DESCRIPTIONS["low"]},
+    {"effort": "medium", "description": _REASONING_LEVEL_DESCRIPTIONS["medium"]},
+    {"effort": "high", "description": _REASONING_LEVEL_DESCRIPTIONS["high"]},
+)
 # Desktop serde for InputModality is a closed enum: text | image | audio.
 # models.dev (and some ChatGPT copy-through rows) also emit `video` and other
 # values. Writing those into custom_model_catalog.json makes Desktop fail:
@@ -118,10 +130,8 @@ def _model_raw(model: ShimModel) -> dict[str, Any]:
 
 
 def _supported_reasoning_levels(model: ShimModel) -> list[dict[str, str]]:
-    # Only advertise effort variants the upstream row actually listed.
-    # Toggle-only / no-reasoning models.dev rows have no effort values;
-    # inventing low/medium/high/xhigh makes Desktop show a picker the
-    # backend does not support.
+    # Upstream only. Catalog-file fallback is applied later; discovery/raw
+    # must not invent low/medium/high for models with no effort variants.
     efforts = _model_raw(model).get("reasoning_efforts")
     if not isinstance(efforts, (list, tuple)) or not efforts:
         return []
@@ -139,6 +149,30 @@ def _supported_reasoning_levels(model: ShimModel) -> list[dict[str, str]]:
             }
         )
     return levels
+
+
+def _catalog_file_reasoning_levels(levels: Any) -> list[dict[str, str]]:
+    if isinstance(levels, list) and levels:
+        return levels
+    return [dict(level) for level in _CATALOG_FILE_FALLBACK_REASONING_LEVELS]
+
+
+def _catalog_file_default_reasoning_level(levels: list[dict[str, str]], existing: Any) -> str:
+    # Catalog file contract: always write a default, and it must be one of the
+    # listed efforts. CLI ModelInfo.default_reasoning_level is Option (missing
+    # deserializes as None); Desktop's picker still needs a selected row.
+    efforts = [
+        str(level.get("effort") or "").strip().lower()
+        for level in levels
+        if isinstance(level, dict) and str(level.get("effort") or "").strip()
+    ]
+    current = str(existing or "").strip().lower()
+    if current and current in efforts:
+        return current
+    for preferred in ("medium", "high", "low"):
+        if preferred in efforts:
+            return preferred
+    return efforts[0] if efforts else "medium"
 
 
 def _desktop_input_modalities(raw: Any) -> list[str]:
@@ -173,14 +207,13 @@ def _finalize_catalog_entry(entry: dict[str, Any], *, tier: str, context_setting
     finalized = apply_catalog_context_to_entry(entry, tier=tier, settings=context_settings)
     if "input_modalities" in finalized:
         finalized["input_modalities"] = _desktop_input_modalities(finalized.get("input_modalities"))
-    # Desktop serde requires this key (Vec<ReasoningEffortPreset>, no
-    # #[serde(default)]). Omitting it fails config.toml load:
-    #   missing field `supported_reasoning_levels`
-    # Empty list = model has no effort picker. Do not invent
-    # low/medium/high/xhigh for toggle-only or non-reasoning upstreams.
-    levels = finalized.get("supported_reasoning_levels")
-    if not isinstance(levels, list):
-        finalized["supported_reasoning_levels"] = []
+    finalized["supported_reasoning_levels"] = _catalog_file_reasoning_levels(
+        finalized.get("supported_reasoning_levels")
+    )
+    finalized["default_reasoning_level"] = _catalog_file_default_reasoning_level(
+        finalized["supported_reasoning_levels"],
+        finalized.get("default_reasoning_level"),
+    )
     return finalized
 
 
@@ -188,7 +221,7 @@ def catalog_entry(model: ShimModel, *, context_settings: CatalogContextSettings 
     context = model.max_context_limit or _default_context(model)
     compact = max(8_000, int(context * 0.8))
     truncation = min(64_000, max(8_000, int(context * 0.32)))
-    reasoning_levels = _supported_reasoning_levels(model)
+    reasoning_levels = _catalog_file_reasoning_levels(_supported_reasoning_levels(model))
     display_name = catalog_display_name(model)
     modalities = _input_modalities(model)
     no_image = "image" not in modalities
@@ -226,13 +259,11 @@ def catalog_entry(model: ShimModel, *, context_settings: CatalogContextSettings 
             ),
             "instructions_variables": {"model_name": display_name},
         },
-        # Always present: Desktop serde requires the field. [] means none.
+        "default_reasoning_level": _reasoning_effort(
+            model, [level["effort"] for level in reasoning_levels]
+        ),
         "supported_reasoning_levels": reasoning_levels,
     }
-    if reasoning_levels:
-        entry["default_reasoning_level"] = _reasoning_effort(
-            model, [level["effort"] for level in reasoning_levels]
-        )
     return _finalize_catalog_entry(entry, tier=CATALOG_TIER_BYOK, context_settings=context_settings)
 
 
@@ -304,9 +335,46 @@ def write_catalog(
         for model in usable_byok_models(models)
     )
     entries = assign_catalog_display_priorities(tiered_entries)
+    _validate_catalog_file_models(entries)
     payload = {"models": sort_catalog_entries(entries)}
     path.write_text(json.dumps(payload, indent=2, sort_keys=False) + "\n")
     return path
+
+
+def _validate_catalog_file_models(models: list[dict[str, Any]]) -> None:
+    """Refuse to write a catalog Desktop/CLI serde will reject or that has a broken picker.
+
+    CLI ``ModelInfo.default_reasoning_level`` is ``Option`` (missing is None).
+    ``supported_reasoning_levels`` is a required ``Vec`` with no ``#[serde(default)]``.
+    Empty ``[]`` parses, but Desktop's effort picker wants real rows, and a
+    missing ``default_reasoning_level`` leaves the UI without a selection.
+    Always emit both on this file; default must be one of the listed efforts.
+    """
+    for entry in models:
+        slug = entry.get("slug") or "<missing-slug>"
+        levels = entry.get("supported_reasoning_levels")
+        if not isinstance(levels, list) or not levels:
+            raise ValueError(f"{slug}: catalog supported_reasoning_levels must be a non-empty list")
+        efforts: list[str] = []
+        for level in levels:
+            if not isinstance(level, dict):
+                raise ValueError(f"{slug}: catalog reasoning level must be an object")
+            effort = str(level.get("effort") or "").strip()
+            if not effort or "description" not in level:
+                raise ValueError(f"{slug}: catalog reasoning level needs effort and description")
+            efforts.append(effort)
+        default = entry.get("default_reasoning_level")
+        if not default:
+            raise ValueError(f"{slug}: catalog default_reasoning_level is required on this file")
+        if str(default) not in efforts:
+            raise ValueError(
+                f"{slug}: catalog default_reasoning_level {default!r} is not in {efforts}"
+            )
+        modalities = entry.get("input_modalities")
+        if isinstance(modalities, list):
+            unknown = [item for item in modalities if item not in _DESKTOP_INPUT_MODALITY_SET]
+            if unknown:
+                raise ValueError(f"{slug}: catalog input_modalities not in Desktop enum: {unknown}")
 
 
 def write_config(models: list[ShimModel], path: Path, catalog_path: Path, port: int) -> Path:

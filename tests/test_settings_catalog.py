@@ -1092,7 +1092,7 @@ def test_catalog_entry_uses_discovered_reasoning_efforts_and_modalities():
     assert entry["supports_reasoning_summaries"] is True
 
 
-def test_catalog_entry_without_upstream_metadata_uses_empty_reasoning_levels():
+def test_catalog_entry_without_upstream_metadata_stubs_desktop_reasoning_levels():
     from codex_shim.catalog import _finalize_catalog_entry
     from codex_shim.settings import ShimModel
 
@@ -1105,10 +1105,14 @@ def test_catalog_entry_without_upstream_metadata_uses_empty_reasoning_levels():
         api_key="k",
     )
     entry = catalog_entry(model)
-    # Desktop serde requires the key (Vec, no #[serde(default)]). Empty list
-    # means no picker — do not invent low/medium/high/xhigh.
-    assert entry["supported_reasoning_levels"] == []
-    assert "default_reasoning_level" not in entry
+    # Catalog JSON only: CLI/Desktop ModelInfo requires the key, and Desktop's
+    # picker wants real effort rows. Discovery still stores no invented list.
+    assert [level["effort"] for level in entry["supported_reasoning_levels"]] == [
+        "low",
+        "medium",
+        "high",
+    ]
+    assert entry["default_reasoning_level"] == "medium"
     assert entry["input_modalities"] == ["text", "image"]
 
     empty = catalog_entry(
@@ -1122,15 +1126,132 @@ def test_catalog_entry_without_upstream_metadata_uses_empty_reasoning_levels():
             raw={"reasoning_efforts": [], "reasoning": True},
         )
     )
-    assert empty["supported_reasoning_levels"] == []
-    assert "default_reasoning_level" not in empty
+    assert [level["effort"] for level in empty["supported_reasoning_levels"]] == [
+        "low",
+        "medium",
+        "high",
+    ]
+    assert empty["default_reasoning_level"] == "medium"
 
     passthrough = _finalize_catalog_entry(
         {"slug": "codex-gpt-5-6-sol"},
         tier="chatgpt",
         context_settings=None,
     )
-    assert passthrough["supported_reasoning_levels"] == []
+    assert [level["effort"] for level in passthrough["supported_reasoning_levels"]] == [
+        "low",
+        "medium",
+        "high",
+    ]
+    assert passthrough["default_reasoning_level"] == "medium"
+
+    ox = _finalize_catalog_entry(
+        {
+            "slug": "nous-stealth-ox-alpha",
+            "supported_reasoning_levels": [
+                {"effort": "low", "description": "Faster, lighter reasoning"},
+                {"effort": "high", "description": "Deeper reasoning"},
+                {"effort": "max", "description": "Maximum reasoning depth for the hardest problems"},
+            ],
+        },
+        tier="byok",
+        context_settings=None,
+    )
+    assert [level["effort"] for level in ox["supported_reasoning_levels"]] == [
+        "low",
+        "high",
+        "max",
+    ]
+    assert ox["default_reasoning_level"] == "high"
+
+
+def test_write_catalog_requires_default_reasoning_level_in_effort_list(tmp_path, auth_missing):
+    from codex_shim.catalog import _validate_catalog_file_models
+    from codex_shim.settings import ShimModel
+
+    catalog_path = tmp_path / "custom_model_catalog.json"
+    write_catalog(
+        [
+            ShimModel(
+                slug="or-openrouter-free",
+                model="openrouter/free",
+                display_name="OpenRouter — Free",
+                provider="generic-chat-completion-api",
+                base_url="https://openrouter.ai/api/v1",
+                api_key="k",
+            )
+        ],
+        catalog_path,
+    )
+    payload = json.loads(catalog_path.read_text())
+    for entry in payload["models"]:
+        levels = entry["supported_reasoning_levels"]
+        assert levels
+        efforts = [level["effort"] for level in levels]
+        assert entry["default_reasoning_level"] in efforts
+
+    with pytest.raises(ValueError, match="default_reasoning_level is required"):
+        _validate_catalog_file_models(
+            [
+                {
+                    "slug": "broken",
+                    "supported_reasoning_levels": [
+                        {"effort": "low", "description": "x"},
+                    ],
+                }
+            ]
+        )
+    with pytest.raises(ValueError, match="not in"):
+        _validate_catalog_file_models(
+            [
+                {
+                    "slug": "broken-default",
+                    "supported_reasoning_levels": [
+                        {"effort": "low", "description": "x"},
+                        {"effort": "high", "description": "y"},
+                    ],
+                    "default_reasoning_level": "medium",
+                }
+            ]
+        )
+
+
+def test_codex_cli_parses_catalog_with_stubbed_default_and_levels(tmp_path, auth_missing):
+    import json
+    import shutil
+    import subprocess
+
+    if shutil.which("codex") is None:
+        pytest.skip("codex CLI is not installed")
+
+    from codex_shim.settings import ShimModel
+
+    catalog_path = tmp_path / "custom_model_catalog.json"
+    write_catalog(
+        [
+            ShimModel(
+                slug="or-openrouter-free",
+                model="openrouter/free",
+                display_name="OpenRouter — Free",
+                provider="generic-chat-completion-api",
+                base_url="https://openrouter.ai/api/v1",
+                api_key="k",
+            )
+        ],
+        catalog_path,
+    )
+    raw = subprocess.check_output(
+        ["codex", "debug", "models", "-c", f'model_catalog_json="{catalog_path}"'],
+        text=True,
+    )
+    parsed = json.loads(raw[raw.find("{") :])
+    entry = next(model for model in parsed["models"] if model["slug"] == "or-openrouter-free")
+    assert entry["default_reasoning_level"] == "medium"
+    assert [level["effort"] for level in entry["supported_reasoning_levels"]] == [
+        "low",
+        "medium",
+        "high",
+    ]
 
 
 def test_catalog_entry_keeps_only_desktop_input_modalities():
