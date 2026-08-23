@@ -105,7 +105,7 @@ async def test_post_retries_503_then_returns_200(monkeypatch):
     async def fake_sleep(seconds: float) -> None:
         sleeps.append(seconds)
 
-    monkeypatch.setattr("codex_shim.chatgpt_edge.asyncio.sleep", fake_sleep)
+    monkeypatch.setattr("codex_shim.net.retry.asyncio.sleep", fake_sleep)
     session = FakeSession(
         [
             FakeResponse(503, "envoy unavailable", "text/plain"),
@@ -132,7 +132,7 @@ async def test_post_exhausts_html_403_as_502_without_html_body(monkeypatch):
     async def fake_sleep(seconds: float) -> None:
         return None
 
-    monkeypatch.setattr("codex_shim.chatgpt_edge.asyncio.sleep", fake_sleep)
+    monkeypatch.setattr("codex_shim.net.retry.asyncio.sleep", fake_sleep)
     session = FakeSession(
         [
             FakeResponse(403, HTML_SITE_DOWN, "text/html"),
@@ -175,7 +175,7 @@ async def test_post_retries_connect_timeout_then_succeeds(monkeypatch):
     async def fake_sleep(seconds: float) -> None:
         sleeps.append(seconds)
 
-    monkeypatch.setattr("codex_shim.chatgpt_edge.asyncio.sleep", fake_sleep)
+    monkeypatch.setattr("codex_shim.net.retry.asyncio.sleep", fake_sleep)
     session = FakeSession(
         [
             ClientOSError(110, "Connection timed out"),
@@ -202,7 +202,7 @@ async def test_post_retries_econnreset_then_succeeds(monkeypatch):
     async def fake_sleep(seconds: float) -> None:
         sleeps.append(seconds)
 
-    monkeypatch.setattr("codex_shim.chatgpt_edge.asyncio.sleep", fake_sleep)
+    monkeypatch.setattr("codex_shim.net.retry.asyncio.sleep", fake_sleep)
     session = FakeSession(
         [
             ClientOSError(104, "Connection reset by peer"),
@@ -235,3 +235,36 @@ async def test_compact_404_is_not_retryable(monkeypatch):
     assert posted.status == 404
     assert posted.error_text == '{"detail":"Not Found"}'
     assert len(session.urls) == 1
+
+
+def test_html_403_classifier_remains_edge_owned():
+    from codex_shim.net.errors import is_retryable_status
+
+    assert is_retryable_status(403) is False
+    assert is_retryable_chatgpt_edge(status=403, content_type="text/html", body=HTML_SITE_DOWN) is True
+    assert is_retryable_chatgpt_edge(status=403, content_type="application/json", body=JSON_403) is False
+
+
+async def test_chatgpt_terminal_without_done_only_appends_done():
+    from codex_shim.net.emitters import ChatgptRelayEmitter
+
+    class Recording:
+        prepared = True
+
+        def __init__(self) -> None:
+            self.chunks: list[bytes] = []
+
+        async def write(self, data: bytes):
+            self.chunks.append(data)
+
+        async def write_eof(self):
+            pass
+
+    response = Recording()
+    emitter = ChatgptRelayEmitter(model="test")
+    emitter.observe({"type": "response.failed", "response": {"id": "r1", "status": "failed"}})
+    await emitter.fail(response, "upstream closed", code="upstream_disconnect")
+    await emitter.complete(response, upstream_saw_done=False)
+    joined = b"".join(response.chunks)
+    assert joined.count(b"response.failed") == 0
+    assert joined.count(b"data: [DONE]") == 1

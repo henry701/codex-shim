@@ -5,9 +5,10 @@ import json
 import os
 from pathlib import Path
 from typing import Any
-from urllib.error import HTTPError, URLError
-from urllib.request import Request, urlopen
+from urllib.error import URLError
+from urllib.request import urlopen
 
+from .net.retry import request_urllib, retry_policy_from_env
 from .settings import slugify
 
 
@@ -189,16 +190,21 @@ def _request_json(
 ) -> tuple[int, dict[str, Any]]:
     data = json.dumps(body).encode("utf-8") if body is not None else None
     request_headers = {"User-Agent": "codex-shim", "Accept": "application/json", **headers}
-    request = Request(url, data=data, headers=request_headers, method=method)
     try:
-        with urlopen(request, timeout=timeout) as response:
-            raw = response.read().decode("utf-8", errors="replace")
-            return int(response.status), _json_payload(raw)
-    except HTTPError as exc:
-        raw = exc.read().decode("utf-8", errors="replace")
-        return int(exc.code), _json_payload(raw)
+        result = request_urllib(
+            url,
+            method=method,
+            headers=request_headers,
+            data=data,
+            timeout=timeout,
+            policy=retry_policy_from_env(),
+            raise_on_http_error=False,
+            urlopen_fn=urlopen,
+            label=f"opencode-go {method} {url}",
+        )
     except URLError as exc:
         raise RuntimeError(f"Could not reach OpenCode Go: {exc.reason}") from exc
+    return int(result.status), _json_payload(result.body.decode("utf-8", errors="replace"))
 
 
 def _json_payload(text: str) -> dict[str, Any]:

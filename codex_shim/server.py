@@ -19,6 +19,26 @@ from urllib.parse import urljoin
 from aiohttp import ClientError, ClientSession, ClientTimeout, WSMsgType, web
 
 from .chatgpt_edge import post_chatgpt_with_retry
+from .net.emitters import (
+    AnthropicMessagesEmitter,
+    AnthropicRelayEmitter,
+    ChatgptRelayEmitter,
+    RawChatEmitter,
+    ResponsesEmitter,
+    WsRelayEmitter,
+)
+from .net.errors import parse_upstream_error
+from .net.retry import retry_aiohttp_post, retry_policy_from_env
+from .net.sse import (
+    ClientDisconnected,
+    close_upstream as _close_upstream,
+    request_disconnected as _request_disconnected,
+    sse_lines as _sse_lines,
+    write_anthropic_sse as _net_write_anthropic_sse,
+    write_bytes as _safe_write,
+    write_sse as _net_write_sse,
+)
+from .net.stream_guard import StreamGuard
 
 from .compaction import (
     CompactionTriggerError,
@@ -155,7 +175,6 @@ from .upstream_io_trace import log_upstream_request, log_upstream_response, shim
 DEBUG_DIR = Path(__file__).resolve().parents[1] / ".codex-shim"
 CODEX_CONFIG_PATH = Path.home() / ".codex" / "config.toml"
 PICKER_TOKEN_HEADER = "X-Codex-Shim-Picker-Token"
-SSE_KEEPALIVE_INTERVAL = 15.0
 CHATGPT_ACCEPT_ENCODING = "zstd, gzip, deflate"
 # Align with opencode CLI discover cache: automatic in-process refresh is rare.
 _MODELS_CACHE_TTL_SEC = 3 * 60 * 60
@@ -2439,49 +2458,49 @@ class ShimServer:
             response = prepare_downstream_sse_response(upstream)
             await response.prepare(request)
             collector = ChatgptPassthroughResponseCollector(forwarded)
-
-            try:
-                async for line in _iter_sse_lines_with_keepalive(upstream, request, response):
-                    if line == "[DONE]":
-                        await _safe_write(response, b"data: [DONE]\n\n")
-                        break
-                    try:
-                        payload = json.loads(line)
-                    except json.JSONDecodeError:
-                        await _safe_write(response, f"data: {line}\n\n".encode())
-                        continue
-                    collector.record(payload)
-                    if response_model_override:
-                        _rewrite_response_model(payload, response_model_override)
-                    if payload.get("type") == "response.completed":
-                        response_obj = payload.get("response")
-                        usage = response_obj.get("usage") if isinstance(response_obj, dict) else None
-                        observe_upstream_response(
-                            "chatgpt-passthrough",
-                            upstream,
-                            usage=usage if isinstance(usage, dict) else None,
-                        )
-                    await _write_sse(response, payload)
-            except asyncio.CancelledError:
-                print("[cancel] client disconnected during ChatGPT passthrough stream", flush=True)
-                raise
-            except ClientDisconnected:
-                print("[cancel] client disconnected during ChatGPT passthrough stream", flush=True)
-            finally:
-                if collector.response_id and collector.output_items():
-                    cache_items = self._build_turn_cache_items(request, raw_body, collector.output_items())
-                    if cache_items:
-                        await self._store_chatgpt_passthrough_conversation_async(
-                            session_key,
-                            collector.response_id,
-                            cache_items,
-                            terminal=True,
-                        )
-                await _close_upstream(upstream)
-            try:
-                await response.write_eof()
-            except Exception:
-                pass
+            emitter = ChatgptRelayEmitter(model=requested or "chatgpt")
+            async with StreamGuard(
+                response,
+                emitter,
+                label="chatgpt-passthrough",
+                upstream=upstream,
+            ) as guard:
+                try:
+                    async for line in guard.iter_sse(request=request):
+                        if line == "[DONE]":
+                            guard.mark_upstream_done()
+                            break
+                        try:
+                            payload = json.loads(line)
+                        except json.JSONDecodeError:
+                            await _safe_write(response, f"data: {line}\n\n".encode())
+                            continue
+                        collector.record(payload)
+                        if response_model_override:
+                            _rewrite_response_model(payload, response_model_override)
+                        if isinstance(payload, dict):
+                            emitter.observe(payload)
+                        if payload.get("type") == "response.completed":
+                            response_obj = payload.get("response")
+                            usage = response_obj.get("usage") if isinstance(response_obj, dict) else None
+                            observe_upstream_response(
+                                "chatgpt-passthrough",
+                                upstream,
+                                usage=usage if isinstance(usage, dict) else None,
+                            )
+                        await _write_sse(response, payload)
+                except ClientError as exc:
+                    await guard.note_upstream_disconnect(exc)
+                finally:
+                    if collector.response_id and collector.output_items():
+                        cache_items = self._build_turn_cache_items(request, raw_body, collector.output_items())
+                        if cache_items:
+                            await self._store_chatgpt_passthrough_conversation_async(
+                                session_key,
+                                collector.response_id,
+                                cache_items,
+                                terminal=True,
+                            )
             return response
 
     async def _chatgpt_compact_passthrough(
@@ -2792,46 +2811,44 @@ class ShimServer:
                     prompt, upstream, workspace=cursor_workspace_path
                 )
             try:
-                await state.start(response)
-                async for event in agent_events:
-                    if state.terminal_emitted or state.failed:
+                async with StreamGuard(
+                    response,
+                    ResponsesEmitter(state),
+                    label=f"cursor:{slug}",
+                    finish_reason=lambda: state.upstream_finish_reason,
+                ) as guard:
+                    try:
+                        await state.start(response)
+                        async for event in agent_events:
+                            if state.terminal_emitted or state.failed:
+                                if bridge_session is not None:
+                                    break
+                                continue
+                            if event.get("type") == BRIDGE_TURN_CLOSED_EVENT:
+                                continue
+                            if event.get("type") == BRIDGE_CALL_EVENT and bridge_session is not None:
+                                await bridge_session.deliver_queued_call(event)
+                                continue
+                            if event["type"] == "usage":
+                                normalized_usage = normalize_responses_usage(event.get("usage"))
+                                if normalized_usage:
+                                    state.usage = normalized_usage
+                            elif event["type"] == "error":
+                                message = str(event.get("message") or "cursor-agent failed")
+                                await state.fail(response, message, code="upstream_error")
+                                break
+                            else:
+                                await _apply_cursor_stream_event(state, response, event)
+                        guard.mark_upstream_done()
+                        await _persist_turn_cache()
+                    except ClientDisconnected:
                         if bridge_session is not None:
-                            # Leave the remainder buffered for the adopting turn rather
-                            # than draining it into a stream Codex has stopped reading.
-                            break
-                        continue
-                    if event.get("type") == BRIDGE_TURN_CLOSED_EVENT:
-                        continue
-                    if event.get("type") == BRIDGE_CALL_EVENT and bridge_session is not None:
-                        await bridge_session.deliver_queued_call(event)
-                        continue
-                    if event["type"] == "usage":
-                        normalized_usage = normalize_responses_usage(event.get("usage"))
-                        if normalized_usage:
-                            state.usage = normalized_usage
-                    elif event["type"] == "error":
-                        message = str(event.get("message") or "cursor-agent failed")
-                        await state.fail(response, message, code="upstream_error")
-                        break
-                    else:
-                        await _apply_cursor_stream_event(state, response, event)
-                await state.finish(response, upstream_saw_done=True)
-                await _persist_turn_cache()
-            except ClientDisconnected:
-                if bridge_session is not None:
-                    bridge_session.cancel_agent_on_disconnect(
-                        "Codex disconnected (user cancel / steer / interrupt)"
-                    )
-            except Exception as exc:
-                detail = str(exc).strip() or repr(exc)
-                print(f"[err] cursor passthrough {slug}: {type(exc).__name__}: {detail}", flush=True)
-                raise web.HTTPBadGateway(text=detail) from exc
+                            bridge_session.cancel_agent_on_disconnect(
+                                "Codex disconnected (user cancel / steer / interrupt)"
+                            )
+                        raise
             finally:
                 await _persist_turn_cache()
-            try:
-                await response.write_eof()
-            except Exception:
-                pass
             return response
         finally:
             if bridge_session is not None:
@@ -2916,64 +2933,72 @@ class ShimServer:
 
         agent_done = False
         try:
-            async for event in _bridge_agent_events(session):
-                if state.terminal_emitted or state.failed:
-                    break
-                event_type = event.get("type")
-                if event_type == BRIDGE_TURN_CLOSED_EVENT:
-                    continue
-                if event_type == BRIDGE_CALL_EVENT:
-                    await _ensure_prepared()
-                    await session.deliver_queued_call(event)
-                    continue
-                if event_type == "usage":
-                    normalized_usage = normalize_responses_usage(event.get("usage"))
-                    if normalized_usage:
-                        state.usage = normalized_usage
-                elif event_type == "error":
-                    await _ensure_prepared()
-                    await state.fail(
-                        response,
-                        str(event.get("message") or "cursor-agent failed"),
-                        code="upstream_error",
+            async with StreamGuard(
+                response,
+                ResponsesEmitter(state),
+                label=f"cursor-adopt:{slug}",
+                finish_reason=lambda: state.upstream_finish_reason,
+            ) as guard:
+                try:
+                    async for event in _bridge_agent_events(session):
+                        if state.terminal_emitted or state.failed:
+                            break
+                        event_type = event.get("type")
+                        if event_type == BRIDGE_TURN_CLOSED_EVENT:
+                            continue
+                        if event_type == BRIDGE_CALL_EVENT:
+                            await _ensure_prepared()
+                            await session.deliver_queued_call(event)
+                            continue
+                        if event_type == "usage":
+                            normalized_usage = normalize_responses_usage(event.get("usage"))
+                            if normalized_usage:
+                                state.usage = normalized_usage
+                        elif event_type == "error":
+                            await _ensure_prepared()
+                            await state.fail(
+                                response,
+                                str(event.get("message") or "cursor-agent failed"),
+                                code="upstream_error",
+                            )
+                            break
+                        else:
+                            await _ensure_prepared()
+                            await _apply_cursor_stream_event(state, response, event)
+                    else:
+                        agent_done = not session.agent_alive()
+                    guard.mark_upstream_done()
+                except ClientDisconnected:
+                    session.cancel_agent_on_disconnect(
+                        "Codex disconnected mid-adopt (user cancel / steer / interrupt)"
                     )
-                    break
-                else:
-                    await _ensure_prepared()
-                    await _apply_cursor_stream_event(state, response, event)
-            else:
-                agent_done = not session.agent_alive()
-        except ClientDisconnected:
-            session.cancel_agent_on_disconnect(
-                "Codex disconnected mid-adopt (user cancel / steer / interrupt)"
-            )
-        except Exception as exc:
-            detail = str(exc).strip() or repr(exc)
-            print(f"[err] cursor adopt {slug}: {type(exc).__name__}: {detail}", flush=True)
-            if not prepared:
-                session.detach_passthrough()
-                return None
+                    if not prepared:
+                        guard.abandon()
+                    raise
+                except Exception as exc:
+                    detail = str(exc).strip() or repr(exc)
+                    print(f"[err] cursor adopt {slug}: {type(exc).__name__}: {detail}", flush=True)
+                    if not prepared:
+                        guard.abandon()
+                        session.detach_passthrough()
+                        return None
+                    raise
+                if not prepared:
+                    guard.abandon()
+                    session.detach_passthrough()
+                    return None
+                cache_items = self._build_turn_cache_items(request, raw_body, state.output_items())
+                if cache_items:
+                    await self._store_chatgpt_passthrough_conversation_async(
+                        self._session_key(request),
+                        state.response_id,
+                        cache_items,
+                    )
         finally:
             session.mark_passthrough_finished()
 
-        if not prepared:
-            session.detach_passthrough()
-            return None
-
-        await state.finish(response, upstream_saw_done=True)
-        cache_items = self._build_turn_cache_items(request, raw_body, state.output_items())
-        if cache_items:
-            await self._store_chatgpt_passthrough_conversation_async(
-                self._session_key(request),
-                state.response_id,
-                cache_items,
-            )
         if agent_done:
             cursor_bridge_registry.release_if_idle(session.bridge_id)
-        try:
-            await response.write_eof()
-        except Exception:
-            pass
         return response
 
     async def _cursor_bridge_delivery_response(
@@ -3426,23 +3451,30 @@ class ShimServer:
         _dump_debug_request(route.slug, url, forwarded)
         log_upstream_request(f"byok-openai-responses:{route.slug}", url, forwarded)
         async with ClientSession(timeout=self.timeout) as session:
-            upstream = await session.post(url, json=forwarded, headers=headers)
-            if upstream.status >= 400:
+            posted = await retry_aiohttp_post(
+                session,
+                url,
+                json=forwarded,
+                headers=headers,
+                policy=retry_policy_from_env(),
+                label=f"byok-openai-responses:{route.slug}",
+            )
+            upstream = posted.response
+            if posted.status >= 400:
                 observe_upstream_response(f"byok-openai-responses:{route.slug}", upstream)
-                text = await upstream.text()
+                text = posted.error_text or ""
                 log_upstream_response(
                     f"byok-openai-responses:{route.slug}",
                     url,
-                    upstream.status,
+                    posted.status,
                     text,
                     request_body=forwarded,
                     stream=bool(forwarded.get("stream")),
                 )
-                code, message = parse_upstream_error(text, upstream.status)
-                upstream.release()
+                code, message = parse_upstream_error(text, posted.status)
                 error = web.json_response(
                     _responses_error_payload(route.slug, code, message),
-                    status=upstream.status,
+                    status=posted.status,
                 )
                 apply_upstream_headers_to_response(error, upstream_headers_from_response(upstream))
                 return error
@@ -3475,17 +3507,30 @@ class ShimServer:
             )
             response = prepare_downstream_sse_response(upstream)
             await response.prepare(request)
-            try:
-                async for chunk in _iter_upstream_chunks(upstream.content, request):
-                    await _safe_write(response, chunk)
-            except ClientDisconnected:
-                pass
-            finally:
-                upstream.release()
-            try:
-                await response.write_eof()
-            except Exception:
-                pass
+            emitter = ChatgptRelayEmitter(model=route.slug)
+            async with StreamGuard(
+                response,
+                emitter,
+                label=f"byok-openai-responses:{route.slug}",
+                upstream=upstream,
+            ) as guard:
+                try:
+                    async for line in guard.iter_sse(request=request):
+                        if line == "[DONE]":
+                            guard.mark_upstream_done()
+                            break
+                        try:
+                            payload = json.loads(line)
+                        except json.JSONDecodeError:
+                            await _safe_write(response, f"data: {line}\n\n".encode())
+                            continue
+                        if isinstance(payload, dict):
+                            emitter.observe(payload)
+                            await _write_sse(response, payload)
+                        else:
+                            await _safe_write(response, f"data: {line}\n\n".encode())
+                except ClientError as exc:
+                    await guard.note_upstream_disconnect(exc)
             return response
 
     async def _post_openai_chat_completions(
@@ -3502,21 +3547,29 @@ class ShimServer:
             accept="text/event-stream" if body.get("stream") else None,
         )
         last_error: tuple[int, str, str, str] | None = None
+        policy = retry_policy_from_env()
         for attempt in range(2):
             prepared = prepare_openai_chat_body(route, body)
             log_upstream_request(f"byok-openai-chat:{route.slug}", url, prepared)
-            upstream = await session.post(url, json=prepared, headers=headers)
-            if upstream.status < 400:
+            posted = await retry_aiohttp_post(
+                session,
+                url,
+                json=prepared,
+                headers=headers,
+                policy=policy,
+                label=f"byok-openai-chat:{route.slug}",
+            )
+            if posted.status < 400:
                 log_upstream_response(
                     f"byok-openai-chat:{route.slug}",
                     url,
-                    upstream.status,
+                    posted.status,
                     request_body=prepared,
                     stream=bool(body.get("stream")),
                 )
-                return upstream, None
-            status = upstream.status
-            text = await upstream.text()
+                return posted.response, None
+            status = posted.status
+            text = posted.error_text or ""
             log_upstream_response(
                 f"byok-openai-chat:{route.slug}",
                 url,
@@ -3526,7 +3579,6 @@ class ShimServer:
                 stream=bool(body.get("stream")),
             )
             code, message = parse_upstream_error(text, status)
-            upstream.release()
             last_error = (status, text, code, message)
             if attempt == 0 and learn_parallel_tool_calls_compat_if_needed(route, status, message):
                 print(
@@ -3620,21 +3672,33 @@ class ShimServer:
         max_turns: int = 6,
         responses_body: dict[str, Any] | None = None,
     ) -> web.StreamResponse:
+        del max_turns
         client_slug = response_slug or route.slug
-        response: web.StreamResponse | None = None
+        label = f"byok-openai-chat:{route.slug}"
         state = (
             ResponsesStreamState(client_slug, tool_types=tool_types, tool_resolve=tool_resolve)
             if as_responses
             else None
         )
-        state_started = False
+        emitter: Any = (
+            ResponsesEmitter(state)
+            if state is not None
+            else RawChatEmitter()
+        )
+        policy = retry_policy_from_env()
         messages = list(body.get("messages", []))
         chat_body = {k: v for k, v in body.items() if k != "stream"}
         chat_body["stream"] = True
-        upstream_saw_done = False
-        try:
-            async with ClientSession(timeout=self.timeout) as session:
-                for _ in range(max_turns):
+        response = _sse_response()
+        await response.prepare(request)
+        async with ClientSession(timeout=self.timeout) as session:
+            async with StreamGuard(
+                response,
+                emitter,
+                label=label,
+                finish_reason=(lambda: state.upstream_finish_reason if state is not None else None),
+            ) as guard:
+                for attempt in range(policy.attempts):
                     turn_body = {**chat_body, "messages": messages}
                     upstream, err = await self._post_openai_chat_completions(
                         session, route, turn_body, request.headers
@@ -3645,90 +3709,67 @@ class ShimServer:
                             f"[stream] model={route.slug} upstream HTTP {status}: {message[:500]}",
                             flush=True,
                         )
-                        if response is None:
-                            response = _sse_response()
-                            await response.prepare(request)
-                        if as_responses and state is not None:
-                            if not state_started:
-                                await state.start(response)
-                                state_started = True
+                        if state is not None:
+                            await state.start(response)
                             await state.fail(response, message, code=code)
                         else:
-                            await _safe_write(
+                            await emitter.fail(
                                 response,
-                                json.dumps({"error": f"upstream {status}: {message[:200]}"}).encode()
-                                + b"\n",
+                                f"upstream {status}: {message[:200]}",
+                                code=code,
                             )
-                        break
+                        return response
                     observe_upstream_response(f"byok-openai-chat-stream:{route.slug}", upstream)
-                    if response is None:
-                        response = prepare_downstream_sse_response(upstream)
-                        await response.prepare(request)
-                    if as_responses and state is not None and not state_started:
-                        await state.start(response)
-                        state_started = True
+                    guard.attach_upstream(upstream)
+                    state_started = False
                     try:
-                        async for line in _sse_lines(upstream, request):
+                        async for line in guard.iter_sse(request=request):
+                            if state is not None and not state_started:
+                                await state.start(response)
+                                state_started = True
                             if line == "[DONE]":
-                                upstream_saw_done = True
+                                guard.mark_upstream_done()
                                 break
                             try:
                                 event = json.loads(line)
                             except json.JSONDecodeError:
                                 continue
-                            if isinstance(event, dict) and event.get("error"):
-                                if as_responses and state is not None:
-                                    code, message = parse_upstream_error(json.dumps(event), 502)
-                                    await state.fail(response, message, code=code)
-                                    break
-                                await _write_sse(response, event)
+                            if isinstance(event, dict) and event.get("type") == "ping":
                                 continue
-                            if as_responses and state is not None:
+                            if isinstance(event, dict) and event.get("error"):
+                                code, message = parse_upstream_error(json.dumps(event), 502)
+                                if state is not None:
+                                    await state.fail(response, message, code=code)
+                                else:
+                                    await emitter.fail(response, message, code=code)
+                                break
+                            if state is not None:
                                 await state.write_chat_delta(response, event)
                             else:
                                 await _write_sse(response, event)
                     except ClientError as exc:
-                        print(
-                            f"[stream] model={route.slug} upstream stream disconnected: "
-                            f"{type(exc).__name__}: {exc}",
-                            flush=True,
+                        if guard.can_retry and attempt + 1 < policy.attempts:
+                            await _close_upstream(upstream)
+                            guard.attach_upstream(None)
+                            await policy.sleep(attempt)
+                            continue
+                        await guard.note_upstream_disconnect(exc)
+                        return response
+                    if (
+                        as_responses
+                        and state is not None
+                        and responses_body is not None
+                        and not state.failed
+                        and not state._has_open_incomplete_items()
+                    ):
+                        self._store_responses_turn_conversation(
+                            request,
+                            responses_body,
+                            state.response_id,
+                            state.output_items(),
                         )
-                        if as_responses and state is not None and not state.failed:
-                            await state.fail(
-                                response,
-                                f"Upstream stream disconnected: {exc}",
-                                code="upstream_disconnect",
-                            )
-                    finally:
-                        await _close_upstream(upstream)
-                    break
-            if as_responses and state is not None and not state.failed:
-                await state.finish(response, upstream_saw_done=upstream_saw_done)
-                if (
-                    upstream_saw_done
-                    and responses_body is not None
-                    and not state._has_open_incomplete_items()
-                ):
-                    self._store_responses_turn_conversation(
-                        request,
-                        responses_body,
-                        state.response_id,
-                        state.output_items(),
-                    )
-            elif upstream_saw_done:
-                await _safe_write(response, b"data: [DONE]\n\n")
-        except asyncio.CancelledError:
-            print("[cancel] client disconnected during BYOK stream", flush=True)
-            raise
-        except ClientDisconnected:
-            print("[cancel] client disconnected during BYOK stream", flush=True)
-        if response is None:
-            response = _sse_response()
-            await response.prepare(request)
-        try:
-            await response.write_eof()
-        except Exception:
-            pass
+                    return response
+                await emitter.fail(response, "upstream unavailable", code="upstream_error")
         return response
 
     async def _post_openai_chat_as_anthropic(
@@ -3738,8 +3779,16 @@ class ShimServer:
         headers = _openai_headers(request.headers, route)
         _dump_debug_request(route.slug, url, body)
         async with ClientSession(timeout=self.timeout) as session:
-            upstream = await session.post(url, json=body, headers=headers)
-            if upstream.status >= 400:
+            posted = await retry_aiohttp_post(
+                session,
+                url,
+                json=body,
+                headers=headers,
+                policy=retry_policy_from_env(),
+                label=f"byok-openai-chat-anthropic:{route.slug}",
+            )
+            upstream = posted.response
+            if posted.status >= 400:
                 observe_upstream_response(f"byok-openai-chat-anthropic:{route.slug}", upstream)
                 return await _anthropic_error_response(upstream)
             observe_upstream_response(f"byok-openai-chat-anthropic:{route.slug}", upstream)
@@ -3759,12 +3808,20 @@ class ShimServer:
         headers = _anthropic_headers(request.headers, route)
         log_upstream_request(f"byok-anthropic-messages:{route.slug}", url, body)
         async with ClientSession(timeout=self.timeout) as session:
-            upstream = await session.post(url, json=body, headers=headers)
-            if upstream.status >= 400:
+            posted = await retry_aiohttp_post(
+                session,
+                url,
+                json=body,
+                headers=headers,
+                policy=retry_policy_from_env(),
+                label=f"byok-anthropic-messages:{route.slug}",
+            )
+            upstream = posted.response
+            if posted.status >= 400:
                 observe_upstream_response(f"byok-anthropic-messages:{route.slug}", upstream)
-                text = await upstream.text()
-                status = upstream.status
-                content_type = upstream.content_type or "text/plain"
+                text = posted.error_text or ""
+                status = posted.status
+                content_type = posted.content_type or "text/plain"
                 log_upstream_response(
                     f"byok-anthropic-messages:{route.slug}",
                     url,
@@ -3816,8 +3873,16 @@ class ShimServer:
         )
         log_upstream_request(f"byok-anthropic:{route.slug}", url, body)
         async with ClientSession(timeout=self.timeout) as session:
-            upstream = await session.post(url, json=body, headers=headers)
-            if upstream.status >= 400:
+            posted = await retry_aiohttp_post(
+                session,
+                url,
+                json=body,
+                headers=headers,
+                policy=retry_policy_from_env(),
+                label=f"byok-anthropic:{route.slug}",
+            )
+            upstream = posted.response
+            if posted.status >= 400:
                 observe_upstream_response(f"byok-anthropic:{route.slug}", upstream)
                 if as_responses and body.get("stream"):
                     return await _stream_responses_upstream_error(
@@ -3826,9 +3891,9 @@ class ShimServer:
                         upstream,
                         slug=route.slug,
                     )
-                text = await upstream.text()
-                status = upstream.status
-                content_type = upstream.content_type or "text/plain"
+                text = posted.error_text or ""
+                status = posted.status
+                content_type = posted.content_type or "text/plain"
                 log_upstream_response(
                     f"byok-anthropic:{route.slug}",
                     url,
@@ -3889,25 +3954,26 @@ class ShimServer:
         response = prepare_downstream_sse_response(upstream)
         await response.prepare(request)
         state = AnthropicMessagesStreamState(route.slug)
-        try:
-            await state.start(response)
-            async for line in _sse_lines(upstream):
-                if line == "[DONE]":
-                    break
-                try:
-                    event = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                await state.write_chat_delta(response, event)
-            await state.finish(response)
-        except ClientDisconnected:
-            pass
-        finally:
-            upstream.release()
-        try:
-            await response.write_eof()
-        except Exception:
-            pass
+        emitter = AnthropicMessagesEmitter(state)
+        async with StreamGuard(
+            response,
+            emitter,
+            label=f"byok-openai-chat-anthropic:{route.slug}",
+            upstream=upstream,
+        ) as guard:
+            try:
+                await state.start(response)
+                async for line in guard.iter_sse(request=request):
+                    if line == "[DONE]":
+                        guard.mark_upstream_done()
+                        break
+                    try:
+                        event = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    await state.write_chat_delta(response, event)
+            except ClientError as exc:
+                await guard.note_upstream_disconnect(exc)
         return response
 
     async def _stream_anthropic(
@@ -3925,101 +3991,91 @@ class ShimServer:
         client_slug = response_slug or route.slug
         response = prepare_downstream_sse_response(upstream)
         await response.prepare(request)
-        if as_responses:
-            state = ResponsesStreamState(
-                client_slug, tool_types=tool_types, tool_resolve=tool_resolve
-            )
-        else:
-            state = None
-        upstream_saw_done = False
-        try:
-            if as_responses:
-                await state.start(response)
+        state = (
+            ResponsesStreamState(client_slug, tool_types=tool_types, tool_resolve=tool_resolve)
+            if as_responses
+            else None
+        )
+        emitter: Any = ResponsesEmitter(state) if state is not None else RawChatEmitter()
+        async with StreamGuard(
+            response,
+            emitter,
+            label=f"byok-anthropic:{route.slug}",
+            finish_reason=(lambda: state.upstream_finish_reason if state is not None else None),
+            upstream=upstream,
+        ) as guard:
+            state_started = False
             try:
-                async for line in _sse_lines(upstream, request):
+                async for line in guard.iter_sse(request=request):
+                    if state is not None and not state_started:
+                        await state.start(response)
+                        state_started = True
                     if line == "[DONE]":
-                        upstream_saw_done = True
+                        guard.mark_upstream_done()
                         break
                     try:
                         event = json.loads(line)
                     except json.JSONDecodeError:
                         continue
                     if isinstance(event, dict) and event.get("error"):
-                        if as_responses and state is not None:
-                            code, message = parse_upstream_error(json.dumps(event), 502)
+                        code, message = parse_upstream_error(json.dumps(event), 502)
+                        if state is not None:
                             await state.fail(response, message, code=code)
-                            break
-                        await _write_sse(response, event)
-                        continue
-                    if as_responses:
+                        else:
+                            await emitter.fail(response, message, code=code)
+                        break
+                    if state is not None:
                         await state.write_anthropic_delta(response, event)
                     else:
                         await _write_sse(response, _anthropic_stream_to_chat_chunk(event, client_slug))
             except ClientError as exc:
-                print(
-                    f"[stream] model={route.slug} upstream stream disconnected: "
-                    f"{type(exc).__name__}: {exc}",
-                    flush=True,
-                )
-                if as_responses and not state.failed:
-                    await state.fail(
-                        response,
-                        f"Upstream stream disconnected: {exc}",
-                        code="upstream_disconnect",
-                    )
-            if as_responses and not state.failed:
-                await state.finish(response, upstream_saw_done=upstream_saw_done)
-                if (
-                    upstream_saw_done
-                    and responses_body is not None
-                    and not state._has_open_incomplete_items()
-                ):
-                    self._store_responses_turn_conversation(
-                        request,
-                        responses_body,
-                        state.response_id,
-                        state.output_items(),
-                    )
-            elif upstream_saw_done:
-                await _safe_write(response, b"data: [DONE]\n\n")
-        except asyncio.CancelledError:
-            print("[cancel] client disconnected during Anthropic stream", flush=True)
-            raise
-        except ClientDisconnected:
-            print("[cancel] client disconnected during Anthropic stream", flush=True)
-        finally:
-            await _close_upstream(upstream)
-        try:
-            await response.write_eof()
-        except Exception:
-            pass
+                await guard.note_upstream_disconnect(exc)
+        if (
+            as_responses
+            and state is not None
+            and responses_body is not None
+            and not state.failed
+            and not state._has_open_incomplete_items()
+        ):
+            self._store_responses_turn_conversation(
+                request,
+                responses_body,
+                state.response_id,
+                state.output_items(),
+            )
         return response
 
     async def _stream_raw_sse(self, request: web.Request, upstream, model_slug: str | None = None) -> web.StreamResponse:
         response = prepare_downstream_sse_response(upstream)
         await response.prepare(request)
-        try:
-            async for line in _sse_lines(upstream):
-                if model_slug and line.startswith("{"):
-                    try:
-                        event = json.loads(line)
-                        if isinstance(event, dict) and event.get("type") == "message_start":
-                            msg = event.get("message")
-                            if isinstance(msg, dict):
-                                msg["model"] = model_slug
-                        await _write_anthropic_sse(response, event.get("type", "message"), event)
-                        continue
-                    except json.JSONDecodeError:
-                        pass
-                await _safe_write(response, f"data: {line}\n\n".encode())
-        except ClientDisconnected:
-            pass
-        finally:
-            upstream.release()
-        try:
-            await response.write_eof()
-        except Exception:
-            pass
+        emitter = AnthropicRelayEmitter(model=model_slug or "anthropic")
+        async with StreamGuard(
+            response,
+            emitter,
+            label=f"byok-anthropic-messages:{model_slug or 'anthropic'}",
+            upstream=upstream,
+        ) as guard:
+            try:
+                async for line in guard.iter_sse(request=request):
+                    if line == "[DONE]":
+                        guard.mark_upstream_done()
+                        break
+                    if model_slug and line.startswith("{"):
+                        try:
+                            event = json.loads(line)
+                            if isinstance(event, dict) and event.get("type") == "message_start":
+                                msg = event.get("message")
+                                if isinstance(msg, dict):
+                                    msg["model"] = model_slug
+                            if isinstance(event, dict):
+                                emitter.observe(event)
+                            await _write_anthropic_sse(response, event.get("type", "message"), event)
+                            continue
+                        except json.JSONDecodeError:
+                            pass
+                    await _safe_write(response, f"data: {line}\n\n".encode())
+            except ClientError as exc:
+                await guard.note_upstream_disconnect(exc)
         return response
 
 
@@ -4344,6 +4400,8 @@ class AnthropicMessagesStreamState:
         self.tool_calls: dict[int, dict[str, Any]] = {}
         self.usage: dict[str, Any] | None = None
         self.stop_reason = "end_turn"
+        self.failed = False
+        self.terminal_emitted = False
 
     async def start(self, response: web.StreamResponse) -> None:
         await _write_anthropic_sse(
@@ -4385,6 +4443,8 @@ class AnthropicMessagesStreamState:
             await self._tool_delta(response, call)
 
     async def finish(self, response: web.StreamResponse) -> None:
+        if self.failed or self.terminal_emitted:
+            return
         if self.reasoning_open:
             await self._close_reasoning(response)
         if self.text_open:
@@ -4403,6 +4463,26 @@ class AnthropicMessagesStreamState:
             },
         )
         await _write_anthropic_sse(response, "message_stop", {"type": "message_stop"})
+        self.terminal_emitted = True
+
+    async def fail(self, response: web.StreamResponse, message: str, *, code: str = "upstream_error") -> None:
+        if self.failed or self.terminal_emitted:
+            return
+        if self.reasoning_open:
+            await self._close_reasoning(response)
+        if self.text_open:
+            await self._close_text(response)
+        for index in sorted(self.tool_calls):
+            state = self.tool_calls[index]
+            if state.get("open") and not state.get("closed"):
+                await self._close_tool(response, index, state)
+        await _write_anthropic_sse(
+            response,
+            "error",
+            {"type": "error", "error": {"type": code, "message": message}},
+        )
+        self.failed = True
+        self.terminal_emitted = True
 
     async def _text_delta(self, response: web.StreamResponse, text: str) -> None:
         if self.text_index is None:
@@ -4553,8 +4633,8 @@ class ResponsesStreamState:
     each tool call as separate output items with stable indices, and emits
     proper .added / .delta / .done / .completed events plus a final
     proper .added / .delta / .done / .completed events. Emits ``response.completed``
-    and client ``[DONE]`` only when upstream sent ``[DONE]`` and every open item
-    was fully received."""
+    only when every open item was fully received, and ``response.incomplete``
+    otherwise; either way the turn always ends with a terminal event."""
 
     def __init__(
         self,
@@ -4567,6 +4647,7 @@ class ResponsesStreamState:
         self.model = model
         self.failed = False
         self.terminal_emitted = False
+        self.terminal_event: str | None = None
         self.message_index: int | None = None  # output_index for the assistant message
         self.message_text = ""
         self.message_opened = False
@@ -4601,10 +4682,8 @@ class ResponsesStreamState:
         *,
         code: str = "upstream_error",
     ) -> None:
-        if self.failed:
+        if self.failed or self.terminal_emitted:
             return
-        self.failed = True
-        self.terminal_emitted = True
         await self.close_turn_items(response)
         await _write_sse(
             response,
@@ -4620,20 +4699,37 @@ class ResponsesStreamState:
             response,
             {"type": "response.failed", "response": failed_response},
         )
-        await response.write(b"data: [DONE]\n\n")
+        await _safe_write(response, b"data: [DONE]\n\n")
+        self.failed = True
+        self.terminal_emitted = True
+        self.terminal_event = "response.failed"
 
     async def finish(self, response: web.StreamResponse, *, upstream_saw_done: bool) -> None:
+        """Terminate the turn, always emitting a terminal event.
+
+        Plenty of OpenAI-compatible upstreams (and any proxy that cuts a long
+        stream) end the SSE with a bare EOF instead of ``data: [DONE]``. Closing
+        our own stream without a terminal event makes Codex Desktop abort the
+        turn with "stream closed before response.completed" and lose the whole
+        turn, so a missing sentinel is downgraded to ``response.incomplete``
+        rather than silence.
+        """
         if self.failed or self.terminal_emitted:
             return
         await self.close_turn_items(response)
-        if upstream_saw_done and not self._has_open_incomplete_items():
+        if not upstream_saw_done:
+            print(
+                f"[stream] model={self.model} upstream ended without [DONE]; "
+                "synthesizing terminal event",
+                flush=True,
+            )
+        if not self._has_open_incomplete_items():
             await _write_sse(
                 response,
                 {"type": "response.completed", "response": self._response("completed", final=True)},
             )
-            await response.write(b"data: [DONE]\n\n")
-            self.terminal_emitted = True
-        elif upstream_saw_done:
+            self.terminal_event = "response.completed"
+        else:
             self._log_incomplete_tool_calls()
             incomplete_response = self._response("incomplete", final=True)
             if self.upstream_finish_reason == "length":
@@ -4642,10 +4738,9 @@ class ResponsesStreamState:
                 response,
                 {"type": "response.incomplete", "response": incomplete_response},
             )
-            await response.write(b"data: [DONE]\n\n")
-            self.terminal_emitted = True
-        elif self._has_open_incomplete_items():
-            self._log_incomplete_tool_calls()
+            self.terminal_event = "response.incomplete"
+        await _safe_write(response, b"data: [DONE]\n\n")
+        self.terminal_emitted = True
 
     def _has_open_incomplete_items(self) -> bool:
         if self.message_opened and not self.message_closed:
@@ -6089,21 +6184,6 @@ def _sse_response() -> web.StreamResponse:
     return response
 
 
-async def _safe_write(response: web.StreamResponse, data: bytes) -> None:
-    try:
-        await response.write(data)
-    except (ConnectionResetError, ConnectionError):
-        raise ClientDisconnected()
-    except Exception as exc:
-        if exc.__class__.__name__ in {
-            "ClientConnectionResetError",
-            "ClientConnectionError",
-            "ClientPayloadError",
-        }:
-            raise ClientDisconnected() from exc
-        raise
-
-
 def _stream_log_enabled() -> bool:
     return os.environ.get("CODEX_SHIM_STREAM_LOG", "").lower() in {"1", "true", "yes", "on"}
 
@@ -6134,20 +6214,7 @@ def _log_stream_event(payload: dict[str, Any]) -> None:
 
 async def _write_sse(response: web.StreamResponse, payload: dict[str, Any]) -> None:
     _log_stream_event(payload)
-    try:
-        await response.write(f"data: {json.dumps(payload, separators=(',', ':'))}\n\n".encode())
-    except (ConnectionResetError, ConnectionError) as exc:
-        raise ClientDisconnected() from exc
-    except Exception as exc:
-        # aiohttp raises ClientConnectionResetError (an OSError subclass on
-        # some versions, a ClientConnectionError on others). Trap both.
-        if exc.__class__.__name__ in {
-            "ClientConnectionResetError",
-            "ClientConnectionError",
-            "ClientPayloadError",
-        }:
-            raise ClientDisconnected() from exc
-        raise
+    await _net_write_sse(response, payload)
 
 
 async def _write_ws_json(ws: web.WebSocketResponse, payload: dict[str, Any]) -> None:
@@ -6265,6 +6332,11 @@ async def _relay_sse_response_to_ws(
     upstream_forward_headers: dict[str, str] | None = None,
 ) -> None:
     _ = upstream_forward_headers
+
+    async def _emit(event: dict[str, Any]) -> None:
+        await _write_ws_json(ws, event)
+
+    emitter = WsRelayEmitter(_emit, model=response_model_override or "chatgpt")
     async for line in _sse_lines(upstream, request):
         if line == "[DONE]":
             break
@@ -6277,6 +6349,8 @@ async def _relay_sse_response_to_ws(
             collector.record(event)
         if response_model_override:
             _rewrite_response_model(event, response_model_override)
+        if isinstance(event, dict):
+            emitter.observe(event)
         if event.get("type") == "response.completed":
             response_obj = event.get("response")
             usage = response_obj.get("usage") if isinstance(response_obj, dict) else None
@@ -6286,26 +6360,12 @@ async def _relay_sse_response_to_ws(
                 usage=usage if isinstance(usage, dict) else None,
             )
         await _write_ws_json(ws, event)
+    if not emitter.saw_terminal:
+        await emitter.complete()
 
 
 async def _write_anthropic_sse(response: web.StreamResponse, event: str, payload: dict[str, Any]) -> None:
-    data = json.dumps(payload, separators=(",", ":"))
-    try:
-        await response.write(f"event: {event}\ndata: {data}\n\n".encode())
-    except (ConnectionResetError, ConnectionError) as exc:
-        raise ClientDisconnected() from exc
-    except Exception as exc:
-        if exc.__class__.__name__ in {
-            "ClientConnectionResetError",
-            "ClientConnectionError",
-            "ClientPayloadError",
-        }:
-            raise ClientDisconnected() from exc
-        raise
-
-
-class ClientDisconnected(Exception):
-    """Raised when the downstream Codex client closes the SSE connection."""
+    await _net_write_anthropic_sse(response, event, payload)
 
 
 def _passthrough_trace_enabled() -> bool:
@@ -6550,107 +6610,6 @@ def _log_incoming_request(endpoint: str, body: dict[str, Any]) -> None:
     _log_client_request(endpoint, body)
 
 
-def _request_disconnected(request: web.Request | None) -> bool:
-    if request is None:
-        return False
-    transport = request.transport
-    if transport is not None and transport.is_closing():
-        return True
-    protocol = getattr(request, "protocol", None)
-    if protocol is not None:
-        proto_transport = getattr(protocol, "transport", None)
-        if proto_transport is not None and proto_transport.is_closing():
-            return True
-    return False
-
-
-async def _close_upstream(upstream) -> None:
-    if upstream is None:
-        return
-    try:
-        upstream.close()
-    except Exception:
-        pass
-    try:
-        upstream.release()
-    except Exception:
-        pass
-
-
-async def _iter_upstream_chunks(content, request: web.Request | None = None):
-    """Read upstream bytes until EOF or client disconnect.
-
-    With ``handler_cancellation=True`` on the aiohttp runner, client STOP
-    cancels the handler task and ``readany()`` raises ``CancelledError``.
-    """
-    del request  # reserved for future transport-level hooks
-    try:
-        while True:
-            chunk = await content.readany()
-            if not chunk:
-                break
-            yield chunk
-    except asyncio.CancelledError:
-        raise
-
-
-async def _sse_lines(upstream, request: web.Request | None = None) -> Any:
-    buffer = b""
-    content = upstream.content
-    try:
-        async for chunk in _iter_upstream_chunks(content, request):
-            buffer += chunk
-            while b"\n" in buffer:
-                raw, buffer = buffer.split(b"\n", 1)
-                line = raw.decode("utf-8", errors="replace").strip()
-                if line.startswith("data:"):
-                    yield line[5:].strip()
-    except asyncio.CancelledError:
-        await _close_upstream(upstream)
-        raise
-    tail = buffer.decode("utf-8", errors="replace").strip()
-    if tail.startswith("data:"):
-        yield tail[5:].strip()
-
-
-async def _iter_sse_lines_with_keepalive(
-    upstream,
-    request: web.Request | None,
-    response: web.StreamResponse,
-    *,
-    interval: float | None = None,
-) -> Any:
-    """Yield SSE data lines and write ``: ping`` while the upstream is silent.
-
-    The upstream reader stays running across ping timeouts. ``asyncio.wait_for``
-    would cancel ``readany()`` and ``_sse_lines`` would close a live ChatGPT
-    stream.
-    """
-    timeout = SSE_KEEPALIVE_INTERVAL if interval is None else interval
-    agen = _sse_lines(upstream, request)
-    read_task = asyncio.create_task(anext(agen))
-    try:
-        while True:
-            done, _pending = await asyncio.wait({read_task}, timeout=timeout)
-            if not done:
-                await _safe_write(response, b": ping\n\n")
-                continue
-            try:
-                line = read_task.result()
-            except StopAsyncIteration:
-                break
-            yield line
-            read_task = asyncio.create_task(anext(agen))
-    finally:
-        if not read_task.done():
-            read_task.cancel()
-        try:
-            await read_task
-        except (asyncio.CancelledError, StopAsyncIteration):
-            pass
-        await agen.aclose()
-
-
 def _anthropic_stream_to_chat_chunk(event: dict[str, Any], model: str) -> dict[str, Any]:
     content = ""
     if event.get("type") == "content_block_delta":
@@ -6716,48 +6675,6 @@ def _compaction_orchestrator_error_response(
         _responses_error_payload(slug, code, str(exc)),
         status=status,
     )
-
-
-def parse_upstream_error(body: str, http_status: int) -> tuple[str, str]:
-    text = (body or "").strip()
-    code = f"upstream_http_{http_status}"
-    message = text or f"Upstream returned HTTP {http_status}"
-    if not text:
-        return code, message
-    try:
-        payload = json.loads(text)
-    except json.JSONDecodeError:
-        return code, text[:2000]
-    if not isinstance(payload, dict):
-        return code, text[:2000]
-
-    err = payload.get("error")
-    if isinstance(err, dict):
-        nested_message = err.get("message")
-        if isinstance(nested_message, str) and nested_message.strip():
-            message = nested_message.strip()
-        nested_code = err.get("type") or err.get("code")
-        if isinstance(nested_code, str) and nested_code.strip():
-            code = nested_code.strip()
-    elif isinstance(err, str) and err.strip():
-        message = err.strip()
-
-    top_message = payload.get("message")
-    if isinstance(top_message, str) and top_message.strip():
-        message = top_message.strip()
-    top_code = payload.get("code")
-    if isinstance(top_code, str) and top_code.strip():
-        code = top_code.strip()
-
-    detail = payload.get("detail")
-    if isinstance(detail, str) and detail.strip():
-        message = detail.strip()
-    elif isinstance(detail, list):
-        parts = [str(item).strip() for item in detail if str(item).strip()]
-        if parts:
-            message = "; ".join(parts)
-
-    return code, message
 
 
 def _responses_error_payload(model: str, code: str, message: str) -> dict[str, Any]:

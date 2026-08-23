@@ -17,11 +17,12 @@ from .header_passthrough import (
     observe_upstream_response,
     upstream_headers_from_response,
 )
+from .net.emitters import WsRelayEmitter
 
 CHATGPT_WS_URL = "wss://chatgpt.com/backend-api/codex/responses"
 UPSTREAM_WS_HEARTBEAT = 30
 _VERSIONED_BASE_RE = re.compile(r"/v\d+$")
-_TERMINAL_EVENT_TYPES = frozenset({"response.completed", "response.failed", "error"})
+_TERMINAL_EVENT_TYPES = frozenset({"response.completed", "response.failed", "response.incomplete", "error"})
 
 
 def _upstream_lane_reusable(ws: Any) -> bool:
@@ -179,12 +180,15 @@ class WsPassthroughSession:
             raise WsPassthroughConnectError("upstream websocket is not connected")
 
         terminal_event: dict[str, Any] | None = None
+        content_forwarded = False
 
         async def _write_event(event: dict[str, Any]) -> None:
             if write_event is not None:
                 await write_event(event)
             else:
                 await self.client_ws.send_str(json.dumps(event, separators=(",", ":")))
+
+        emitter = WsRelayEmitter(_write_event, model=model_override or source)
 
         try:
             async for msg in upstream_ws:
@@ -205,6 +209,7 @@ class WsPassthroughSession:
                         on_event(event)
                     if rewrite_model is not None and model_override:
                         rewrite_model(event, model_override)
+                    emitter.observe(event)
                     if event.get("type") == "response.completed":
                         response_obj = event.get("response")
                         usage = response_obj.get("usage") if isinstance(response_obj, dict) else None
@@ -217,8 +222,10 @@ class WsPassthroughSession:
                         terminal_event = event
                         if forward_terminal is None or forward_terminal(event):
                             await _write_event(event)
+                            content_forwarded = True
                         break
                     await _write_event(event)
+                    content_forwarded = True
                 elif msg.type in {WSMsgType.CLOSE, WSMsgType.CLOSED, WSMsgType.ERROR}:
                     break
         except Exception as exc:
@@ -229,9 +236,17 @@ class WsPassthroughSession:
             except Exception:
                 self.upstream_by_url.pop(upstream_url, None)
                 self.last_chained_response_id_by_url.pop(upstream_url, None)
+            if content_forwarded:
+                if not emitter.saw_terminal:
+                    await emitter.complete()
+                    terminal_event = emitter.last_emitted
+                return terminal_event
             raise WsPassthroughConnectError(str(exc)) from exc
         if terminal_event is None:
             await self.close_upstream(upstream_url)
+            if not emitter.saw_terminal:
+                await emitter.complete()
+                terminal_event = emitter.last_emitted
         return terminal_event
 
     async def close_upstream(self, upstream_url: str | None = None) -> None:

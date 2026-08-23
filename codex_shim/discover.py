@@ -14,11 +14,12 @@ from typing import Any
 from datetime import datetime, timezone
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode, urlparse
-from urllib.request import Request, urlopen
+from urllib.request import urlopen
 from pathlib import Path
 
 from .header_passthrough import KEYLESS_API_KEY
 from .naming import description_for_route, display_name_from_slug
+from .net.retry import RetryPolicy, request_urllib
 from .nous_auth import resolve_nous_api_key
 from .settings import ShimModel, slugify
 
@@ -327,34 +328,21 @@ def fetch_http_json(
     }
     if headers:
         merged.update(headers)
-    request = Request(url, headers=merged)
-    attempts = max(1, int(retries))
-    last_error: BaseException | None = None
-    for attempt in range(attempts):
-        try:
-            with urlopen(request, timeout=timeout) as response:
-                return json.loads(response.read().decode("utf-8"))
-        except HTTPError as exc:
-            last_error = exc
-            # Retry transient upstream / gateway failures only.
-            if exc.code not in {408, 425, 429, 500, 502, 503, 504} or attempt + 1 >= attempts:
-                raise
-        except (OSError, URLError, TimeoutError, json.JSONDecodeError) as exc:
-            last_error = exc
-            if attempt + 1 >= attempts:
-                raise
-        delay = backoff_base * (backoff_factor**attempt)
-        logger.warning(
-            "HTTP GET %s failed (attempt %s/%s): %s; retrying in %.2fs",
-            url,
-            attempt + 1,
-            attempts,
-            last_error,
-            delay,
-        )
-        time.sleep(delay)
-    assert last_error is not None
-    raise last_error
+    result = request_urllib(
+        url,
+        headers=merged,
+        timeout=timeout,
+        policy=RetryPolicy(
+            attempts=max(1, int(retries)),
+            backoff_base=backoff_base,
+            backoff_factor=backoff_factor,
+        ),
+        urlopen_fn=urlopen,
+        sleep_fn=time.sleep,
+        label=f"GET {url}",
+        ensure_json=True,
+    )
+    return json.loads(result.body.decode("utf-8"))
 
 
 def _load_codex_auth_tokens(auth_path: Any | None = None) -> tuple[str, str] | None:
@@ -404,15 +392,19 @@ def refresh_codex_auth_tokens(auth_path: Any | None = None, *, timeout: float = 
             "client_id": CODEX_OAUTH_CLIENT_ID,
         }
     ).encode("utf-8")
-    request = Request(
-        CODEX_OAUTH_TOKEN_URL,
-        data=body,
-        headers={"Content-Type": "application/x-www-form-urlencoded", "Accept": "application/json"},
-        method="POST",
-    )
     try:
-        with urlopen(request, timeout=timeout) as response:
-            payload = json.loads(response.read().decode("utf-8"))
+        result = request_urllib(
+            CODEX_OAUTH_TOKEN_URL,
+            method="POST",
+            headers={"Content-Type": "application/x-www-form-urlencoded", "Accept": "application/json"},
+            data=body,
+            timeout=timeout,
+            policy=RetryPolicy(attempts=1, retry_json_decode=False),
+            urlopen_fn=urlopen,
+            sleep_fn=time.sleep,
+            label="codex-oauth-refresh",
+        )
+        payload = json.loads(result.body.decode("utf-8"))
     except (OSError, URLError, HTTPError, TimeoutError, json.JSONDecodeError, ValueError) as exc:
         logger.warning("Codex auth refresh failed: %s", exc)
         return False
