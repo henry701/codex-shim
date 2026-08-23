@@ -512,4 +512,4 @@ def test_discovered_nvidia_text_only_maps_output_limit(monkeypatch):
     assert route.max_output_tokens == 65_536
     assert route.no_image_support is True
     assert route.supports_reasoning_summaries is True
-    assert route.raw.get("reasoning_efforts") in (None, [], ["low", "medium", "high", "xhigh"])
+    assert not route.raw.get("reasoning_efforts")

@@ -92,12 +92,6 @@ def _reasoning_catalog_fields(model: ShimModel) -> dict[str, Any]:
     }
 
 
-_DEFAULT_REASONING_LEVELS = [
-    {"effort": "low", "description": "Faster, lighter reasoning"},
-    {"effort": "medium", "description": "Balanced speed and reasoning"},
-    {"effort": "high", "description": "Deeper reasoning"},
-    {"effort": "xhigh", "description": "Maximum reasoning where supported"},
-]
 _REASONING_LEVEL_DESCRIPTIONS = {
     "minimal": "Minimal reasoning",
     "low": "Faster, lighter reasoning",
@@ -107,6 +101,15 @@ _REASONING_LEVEL_DESCRIPTIONS = {
     "max": "Maximum reasoning depth for the hardest problems",
     "ultra": "Maximum reasoning with automatic task delegation",
 }
+# Desktop serde for InputModality is a closed enum: text | image | audio.
+# models.dev (and some ChatGPT copy-through rows) also emit `video` and other
+# values. Writing those into custom_model_catalog.json makes Desktop fail:
+#   failed to parse model_catalog_json ... unknown variant `video`,
+#   expected one of `text`, `image`, `audio`
+# Strip at every catalog write path, including ChatGPT passthrough finalize.
+# Never copy models.dev modalities through verbatim.
+_DESKTOP_INPUT_MODALITIES = ("text", "image", "audio")
+_DESKTOP_INPUT_MODALITY_SET = frozenset(_DESKTOP_INPUT_MODALITIES)
 
 
 def _model_raw(model: ShimModel) -> dict[str, Any]:
@@ -115,40 +118,47 @@ def _model_raw(model: ShimModel) -> dict[str, Any]:
 
 
 def _supported_reasoning_levels(model: ShimModel) -> list[dict[str, str]]:
+    # Only advertise effort variants the upstream row actually listed.
+    # Toggle-only / no-reasoning models.dev rows have no effort values;
+    # inventing low/medium/high/xhigh makes Desktop show a picker the
+    # backend does not support.
     efforts = _model_raw(model).get("reasoning_efforts")
-    if isinstance(efforts, (list, tuple)) and efforts:
-        levels: list[dict[str, str]] = []
-        seen: set[str] = set()
-        for effort in efforts:
-            name = str(effort or "").strip().lower()
-            if not name or name in seen:
-                continue
-            seen.add(name)
-            levels.append(
-                {
-                    "effort": name,
-                    "description": _REASONING_LEVEL_DESCRIPTIONS.get(name, name),
-                }
-            )
-        if levels:
-            return levels
-    return [dict(level) for level in _DEFAULT_REASONING_LEVELS]
+    if not isinstance(efforts, (list, tuple)) or not efforts:
+        return []
+    levels: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for effort in efforts:
+        name = str(effort or "").strip().lower()
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        levels.append(
+            {
+                "effort": name,
+                "description": _REASONING_LEVEL_DESCRIPTIONS.get(name, name),
+            }
+        )
+    return levels
+
+
+def _desktop_input_modalities(raw: Any) -> list[str]:
+    items: list[str] = []
+    seen: set[str] = set()
+    if isinstance(raw, (list, tuple)):
+        for item in raw:
+            name = str(item or "").strip().lower()
+            if name in _DESKTOP_INPUT_MODALITY_SET and name not in seen:
+                seen.add(name)
+                items.append(name)
+    if "text" not in seen:
+        items.insert(0, "text")
+    return items
 
 
 def _input_modalities(model: ShimModel) -> list[str]:
     raw = _model_raw(model).get("input_modalities")
     if isinstance(raw, (list, tuple)) and raw:
-        items: list[str] = []
-        seen: set[str] = set()
-        for item in raw:
-            name = str(item or "").strip().lower()
-            if name and name not in seen:
-                seen.add(name)
-                items.append(name)
-        if items and "text" not in items:
-            items.insert(0, "text")
-        if items:
-            return items
+        return _desktop_input_modalities(raw)
     return ["text"] if model.no_image_support else ["text", "image"]
 
 
@@ -160,7 +170,18 @@ def _catalog_description(model: ShimModel, display_name: str) -> str:
 
 
 def _finalize_catalog_entry(entry: dict[str, Any], *, tier: str, context_settings: CatalogContextSettings | None) -> dict:
-    return apply_catalog_context_to_entry(entry, tier=tier, settings=context_settings)
+    finalized = apply_catalog_context_to_entry(entry, tier=tier, settings=context_settings)
+    if "input_modalities" in finalized:
+        finalized["input_modalities"] = _desktop_input_modalities(finalized.get("input_modalities"))
+    # Desktop serde requires this key (Vec<ReasoningEffortPreset>, no
+    # #[serde(default)]). Omitting it fails config.toml load:
+    #   missing field `supported_reasoning_levels`
+    # Empty list = model has no effort picker. Do not invent
+    # low/medium/high/xhigh for toggle-only or non-reasoning upstreams.
+    levels = finalized.get("supported_reasoning_levels")
+    if not isinstance(levels, list):
+        finalized["supported_reasoning_levels"] = []
+    return finalized
 
 
 def catalog_entry(model: ShimModel, *, context_settings: CatalogContextSettings | None = None) -> dict:
@@ -168,7 +189,6 @@ def catalog_entry(model: ShimModel, *, context_settings: CatalogContextSettings 
     compact = max(8_000, int(context * 0.8))
     truncation = min(64_000, max(8_000, int(context * 0.32)))
     reasoning_levels = _supported_reasoning_levels(model)
-    reasoning = _reasoning_effort(model, [level["effort"] for level in reasoning_levels])
     display_name = catalog_display_name(model)
     modalities = _input_modalities(model)
     no_image = "image" not in modalities
@@ -180,8 +200,6 @@ def catalog_entry(model: ShimModel, *, context_settings: CatalogContextSettings 
         "max_context_window": context,
         "auto_compact_token_limit": compact,
         "truncation_policy": {"mode": "tokens", "limit": truncation},
-        "default_reasoning_level": reasoning,
-        "supported_reasoning_levels": reasoning_levels,
         **_reasoning_catalog_fields(model),
         "default_verbosity": "low",
         "support_verbosity": False,
@@ -208,7 +226,13 @@ def catalog_entry(model: ShimModel, *, context_settings: CatalogContextSettings 
             ),
             "instructions_variables": {"model_name": display_name},
         },
+        # Always present: Desktop serde requires the field. [] means none.
+        "supported_reasoning_levels": reasoning_levels,
     }
+    if reasoning_levels:
+        entry["default_reasoning_level"] = _reasoning_effort(
+            model, [level["effort"] for level in reasoning_levels]
+        )
     return _finalize_catalog_entry(entry, tier=CATALOG_TIER_BYOK, context_settings=context_settings)
 
 

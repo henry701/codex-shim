@@ -9,6 +9,15 @@ and this project does not yet follow semantic versioning (pre-1.0).
 
 ### Fixed
 
+- Catalog `input_modalities` now keep only Desktop's schema (`text`, `image`,
+  `audio`). models.dev `video` values made `config.toml` fail to parse, so
+  ChatGPT could not load the thread.
+
+- Catalog no longer invents `supported_reasoning_levels` (`low`/`medium`/`high`/
+  `xhigh`) when upstream sent none. Toggle-only and non-reasoning models keep
+  the required key as `[]` (Desktop serde rejects a missing field) instead of
+  advertising variants the backend does not have.
+
 - Nous `stealth/ox-alpha` and OpenCode Zen `x-preview-f-free` now advertise the
   published 1,048,576-token window. Discovery was dropping context and falling
   through to the 128k catalog default, so Desktop auto-compacted at ~102k and

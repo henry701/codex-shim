@@ -1087,12 +1087,13 @@ def test_catalog_entry_uses_discovered_reasoning_efforts_and_modalities():
         "max",
     ]
     assert entry["default_reasoning_level"] == "high"
-    assert entry["input_modalities"] == ["text", "image", "video"]
+    assert entry["input_modalities"] == ["text", "image"]
     assert "visual analysis" in entry["description"]
     assert entry["supports_reasoning_summaries"] is True
 
 
-def test_catalog_entry_without_upstream_metadata_keeps_default_reasoning_levels():
+def test_catalog_entry_without_upstream_metadata_uses_empty_reasoning_levels():
+    from codex_shim.catalog import _finalize_catalog_entry
     from codex_shim.settings import ShimModel
 
     model = ShimModel(
@@ -1104,11 +1105,53 @@ def test_catalog_entry_without_upstream_metadata_keeps_default_reasoning_levels(
         api_key="k",
     )
     entry = catalog_entry(model)
-    assert [level["effort"] for level in entry["supported_reasoning_levels"]] == [
-        "low",
-        "medium",
-        "high",
-        "xhigh",
-    ]
-    assert entry["default_reasoning_level"] == "medium"
+    # Desktop serde requires the key (Vec, no #[serde(default)]). Empty list
+    # means no picker — do not invent low/medium/high/xhigh.
+    assert entry["supported_reasoning_levels"] == []
+    assert "default_reasoning_level" not in entry
     assert entry["input_modalities"] == ["text", "image"]
+
+    empty = catalog_entry(
+        ShimModel(
+            slug="nvidia-text-only",
+            model="nvidia/text-only",
+            display_name="NVIDIA — Text Only",
+            provider="generic-chat-completion-api",
+            base_url="https://integrate.api.nvidia.com/v1",
+            api_key="k",
+            raw={"reasoning_efforts": [], "reasoning": True},
+        )
+    )
+    assert empty["supported_reasoning_levels"] == []
+    assert "default_reasoning_level" not in empty
+
+    passthrough = _finalize_catalog_entry(
+        {"slug": "codex-gpt-5-6-sol"},
+        tier="chatgpt",
+        context_settings=None,
+    )
+    assert passthrough["supported_reasoning_levels"] == []
+
+
+def test_catalog_entry_keeps_only_desktop_input_modalities():
+    from codex_shim.catalog import _finalize_catalog_entry
+    from codex_shim.settings import ShimModel
+
+    model = ShimModel(
+        slug="or-multimodal",
+        model="vendor/multimodal",
+        display_name="OpenRouter — Multimodal",
+        provider="generic-chat-completion-api",
+        base_url="https://openrouter.ai/api/v1",
+        api_key="k",
+        raw={"input_modalities": ["video", "text", "pdf", "audio", "image", "video"]},
+    )
+    entry = catalog_entry(model)
+    assert entry["input_modalities"] == ["text", "audio", "image"]
+
+    passthrough = _finalize_catalog_entry(
+        {"slug": "codex-gpt-5-6-sol", "input_modalities": ["text", "image", "video"]},
+        tier="chatgpt",
+        context_settings=None,
+    )
+    assert passthrough["input_modalities"] == ["text", "image"]
