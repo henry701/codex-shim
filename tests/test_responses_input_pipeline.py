@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 from codex_shim.responses_input_pipeline import (
+    STALE_TOOL_OUTPUT_MESSAGE,
     UNKNOWN_FUNCTION_TOOL_NAME,
+    align_responses_tool_call_ids,
     expand_cached_responses_input,
     prepare_responses_input_items,
+    synthesize_missing_tool_outputs,
     synthesize_orphan_tool_calls,
 )
 
@@ -127,3 +130,101 @@ def test_synthesize_orphan_tool_calls_uses_resolved_bridge_tool_name():
     assert repaired[0]["name"] == "create_goal"
     assert repaired[2]["name"] == UNKNOWN_FUNCTION_TOOL_NAME
     assert len(warnings) == 2
+
+
+def test_synthesize_missing_tool_outputs_stubs_unanswered_function_call():
+    input_items = [
+        {
+            "type": "function_call",
+            "call_id": "call_stale",
+            "name": "exec_command",
+            "arguments": '{"cmd":"ps"}',
+        },
+        {"type": "message", "role": "user", "content": "continue the fork update"},
+    ]
+    repaired, warnings = synthesize_missing_tool_outputs(input_items)
+    assert repaired[0]["type"] == "function_call"
+    assert repaired[1]["type"] == "function_call_output"
+    assert repaired[1]["call_id"] == "call_stale"
+    assert repaired[1]["output"] == STALE_TOOL_OUTPUT_MESSAGE
+    assert repaired[2]["role"] == "user"
+    assert len(warnings) == 1
+    assert "call_stale" in warnings[0]
+
+
+def test_synthesize_missing_tool_outputs_leaves_paired_call_alone():
+    input_items = [
+        {"type": "function_call", "call_id": "call_ok", "name": "exec_command", "arguments": "{}"},
+        {"type": "function_call_output", "call_id": "call_ok", "output": "done"},
+    ]
+    repaired, warnings = synthesize_missing_tool_outputs(input_items)
+    assert repaired == input_items
+    assert warnings == []
+
+
+def test_prepare_responses_input_items_stubs_unanswered_call_when_synthesis_enabled():
+    repaired, warnings = prepare_responses_input_items(
+        cache=None,
+        session_key="s",
+        previous_response_id=None,
+        input_items=[
+            {
+                "type": "function_call",
+                "call_id": "call_2b12cbfa-56f5-46a1-8ff9-6f1215aee5a2",
+                "name": "exec_command",
+                "arguments": "{}",
+            }
+        ],
+        expand_enabled=False,
+        context="turn",
+    )
+    assert repaired[1]["type"] == "function_call_output"
+    assert repaired[1]["output"] == STALE_TOOL_OUTPUT_MESSAGE
+    assert warnings
+
+
+def test_align_responses_tool_call_ids_prefixes_bare_uuid_pair():
+    uuid = "2b12cbfa-56f5-46a1-8ff9-6f1215aee5a2"
+    aligned = align_responses_tool_call_ids(
+        [
+            {
+                "type": "function_call",
+                "call_id": uuid,
+                "name": "exec_command",
+                "arguments": "{}",
+            },
+            {"type": "function_call_output", "call_id": uuid, "output": "ps hit"},
+        ]
+    )
+    assert aligned[0]["call_id"] == f"call_{uuid}"
+    assert aligned[1]["call_id"] == f"call_{uuid}"
+    assert aligned[1]["output"] == "ps hit"
+
+
+def test_prepare_keeps_real_output_when_cache_uuid_and_call_prefix_differ():
+    """GLM cache + ChatGPT rewrite of the call must still pair; do not stub or compact."""
+    uuid = "2b12cbfa-56f5-46a1-8ff9-6f1215aee5a2"
+    cache = _FakeCache(
+        [
+            {
+                "type": "function_call",
+                "call_id": f"call_{uuid}",
+                "name": "exec_command",
+                "arguments": "{}",
+            },
+            {"type": "function_call_output", "call_id": uuid, "output": "telegram-desktop"},
+        ]
+    )
+    repaired, warnings = prepare_responses_input_items(
+        cache=cache,
+        session_key="sess",
+        previous_response_id="resp_glm",
+        input_items=[{"type": "message", "role": "user", "content": "continue on GPT"}],
+        expand_enabled=True,
+        context="turn",
+    )
+    outputs = [item for item in repaired if item.get("type") == "function_call_output"]
+    assert len(outputs) == 1
+    assert outputs[0]["call_id"] == f"call_{uuid}"
+    assert outputs[0]["output"] == "telegram-desktop"
+    assert warnings == []

@@ -51,16 +51,24 @@ def strip_function_call_output_item_id(item: dict[str, Any]) -> dict[str, Any]:
 
     Lite validates ``function_call.id`` as ``fc_*``. A copied ``call_*`` string
     on the output item's ``id`` trips the same prefix check; ``call_id`` is the
-    correlator and must stay.
+    correlator and must stay. Bare UUIDs are rewritten to ``call_*`` so they
+    still pair after ``apply_function_call_ids`` prefixes the originating call.
     """
-    if item.get("type") != "function_call_output":
+    if item.get("type") not in {"function_call_output", "custom_tool_call_output"}:
         return item
-    oid = item.get("id")
-    if isinstance(oid, str) and (oid.startswith("call_") or oid.startswith("fc_")):
-        out = dict(item)
+    out = dict(item)
+    raw_call = out.get("call_id")
+    raw_id = out.get("id")
+    if isinstance(raw_call, str) and raw_call.strip():
+        _, call_id = responses_function_call_ids(raw_call)
+        out["call_id"] = call_id
+    if isinstance(raw_id, str) and (
+        raw_id.startswith("call_")
+        or raw_id.startswith("fc_")
+        or raw_id == raw_call
+    ):
         out.pop("id", None)
-        return out
-    return item
+    return out
 
 
 def parse_tool_arguments(raw_args: Any) -> dict[str, Any]:

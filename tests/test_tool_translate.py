@@ -29,6 +29,20 @@ def test_responses_function_call_ids_splits_fc_item_from_call_id():
     assert tool_translate.responses_function_call_ids("tool-7") == ("fc_tool-7", "call_tool-7")
 
 
+def test_strip_function_call_output_item_id_prefixes_bare_uuid_call_id():
+    """ChatGPT pairs on call_*; rewriting only function_call leaves the output unmatched."""
+    item = {
+        "type": "function_call_output",
+        "id": "2b12cbfa-56f5-46a1-8ff9-6f1215aee5a2",
+        "call_id": "2b12cbfa-56f5-46a1-8ff9-6f1215aee5a2",
+        "output": "ps hit",
+    }
+    out = tool_translate.strip_function_call_output_item_id(item)
+    assert "id" not in out or not str(out.get("id", "")).startswith("call_")
+    assert out["call_id"] == "call_2b12cbfa-56f5-46a1-8ff9-6f1215aee5a2"
+    assert out["output"] == "ps hit"
+
+
 def test_mcp_function_call_item_matches_passthrough_shape():
     item = tool_translate.mcp_function_call_item(
         "call_1",

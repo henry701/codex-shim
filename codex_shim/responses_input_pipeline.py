@@ -16,9 +16,18 @@ from typing import Any, Protocol
 
 from .compaction.input_audit import CompactionSanitizationAudit, compaction_input_item_ref
 from .compaction.logging import log_compaction_cache_expansion
+from .tool_translate import (
+    apply_function_call_ids,
+    responses_function_call_ids,
+    strip_function_call_output_item_id,
+)
 
 UNKNOWN_FUNCTION_TOOL_NAME = "unknown_tool"
 UNKNOWN_CUSTOM_TOOL_NAME = "unknown_custom_tool"
+STALE_TOOL_OUTPUT_MESSAGE = (
+    "This tool output is old and no longer available. "
+    "Do not assume a previous result is still valid; continue without it or retry the tool if still needed."
+)
 
 _TOOL_CALL_ITEM_TYPES = frozenset({"function_call", "custom_tool_call"})
 _TOOL_OUTPUT_ITEM_TYPES = frozenset({"function_call_output", "custom_tool_call_output"})
@@ -121,6 +130,91 @@ def synthesize_orphan_tool_calls(
     return repaired, warnings
 
 
+def _synthetic_tool_output_item(call_id: str, *, call_type: str) -> dict[str, Any]:
+    if call_type == "custom_tool_call":
+        return {
+            "type": "custom_tool_call_output",
+            "call_id": call_id,
+            "output": STALE_TOOL_OUTPUT_MESSAGE,
+        }
+    return {
+        "type": "function_call_output",
+        "call_id": call_id,
+        "output": STALE_TOOL_OUTPUT_MESSAGE,
+    }
+
+
+def align_responses_tool_call_ids(input_items: list[Any]) -> list[Any]:
+    """Canonicalize tool ``call_id``s so calls and outputs still pair after expand.
+
+    Cache snapshots from other providers (bare UUIDs) are prepended *after*
+    ChatGPT passthrough sanitization. Rewrite them here so pairing/stubs see the
+    same ``call_*`` ids the Responses API uses. Do not treat a provider switch as
+    a compaction retry.
+    """
+    aligned: list[Any] = []
+    for raw in input_items:
+        if not isinstance(raw, dict):
+            aligned.append(raw)
+            continue
+        item_type = raw.get("type")
+        if item_type == "function_call":
+            aligned.append(apply_function_call_ids(raw))
+            continue
+        if item_type in _TOOL_OUTPUT_ITEM_TYPES:
+            aligned.append(strip_function_call_output_item_id(raw))
+            continue
+        if item_type == "custom_tool_call":
+            item = dict(raw)
+            raw_call = item.get("call_id")
+            if isinstance(raw_call, str) and raw_call.strip():
+                _, call_id = responses_function_call_ids(raw_call)
+                item["call_id"] = call_id
+            aligned.append(item)
+            continue
+        aligned.append(raw)
+    return aligned
+
+
+def synthesize_missing_tool_outputs(
+    input_items: list[Any],
+) -> tuple[list[Any], list[str]]:
+    """Insert a stale-output stub after function calls that have no result.
+
+    ChatGPT Responses rejects ``input`` that contains a ``function_call`` without a
+    matching ``function_call_output``. Stub instead of dropping the call so the
+    model can continue; keep the real output when ids can be aligned.
+    """
+    if not input_items:
+        return [], []
+
+    answered: set[str] = set()
+    for raw in input_items:
+        if not isinstance(raw, dict) or raw.get("type") not in _TOOL_OUTPUT_ITEM_TYPES:
+            continue
+        call_id = _tool_item_call_id(raw)
+        if call_id:
+            answered.add(call_id)
+
+    warnings: list[str] = []
+    repaired: list[Any] = []
+    for raw in input_items:
+        repaired.append(raw)
+        if not isinstance(raw, dict) or raw.get("type") not in _TOOL_CALL_ITEM_TYPES:
+            continue
+        call_id = _tool_item_call_id(raw)
+        if not call_id or call_id in answered:
+            continue
+        synth = _synthetic_tool_output_item(call_id, call_type=str(raw.get("type") or ""))
+        repaired.append(synth)
+        answered.add(call_id)
+        warnings.append(
+            f"synthesized {synth.get('type')} for unanswered {raw.get('type')} "
+            f"call_id={call_id!r} (tool output old/unavailable)"
+        )
+    return repaired, warnings
+
+
 def expand_cached_responses_input(
     *,
     cache: ConversationCache | None,
@@ -208,9 +302,12 @@ def prepare_responses_input_items(
         expand_enabled=expand_enabled,
         context=context,
     )
+    aligned = align_responses_tool_call_ids(expanded)
     if not orphan_synthesis:
-        return expanded, []
-    return synthesize_orphan_tool_calls(expanded, name_resolver=name_resolver)
+        return aligned, []
+    repaired, warnings = synthesize_orphan_tool_calls(aligned, name_resolver=name_resolver)
+    stubbed, extra = synthesize_missing_tool_outputs(repaired)
+    return stubbed, [*warnings, *extra]
 
 
 def _log_pipeline_warnings(warnings: list[str]) -> None:
@@ -259,6 +356,8 @@ def sanitize_compaction_input_with_pipeline(
         return [], [], audit
 
     repaired, warnings = synthesize_orphan_tool_calls(input_items)
+    repaired, extra = synthesize_missing_tool_outputs(repaired)
+    warnings = [*warnings, *extra]
     audit.outgoing_items = len(repaired)
     audit.synthesized = warnings
     return repaired, audit.warning_lines(), audit

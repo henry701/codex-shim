@@ -248,6 +248,34 @@ def test_sanitize_chatgpt_passthrough_body_rewrites_function_call_id_prefix():
     assert already["call_id"] == "call_already"
 
 
+def test_sanitize_chatgpt_passthrough_body_aligns_bare_uuid_call_and_output():
+    sanitized = _sanitize_chatgpt_passthrough_body(
+        {
+            "model": "codex-gpt-5-6-luna",
+            "input": [
+                {
+                    "type": "function_call",
+                    "id": "2b12cbfa-56f5-46a1-8ff9-6f1215aee5a2",
+                    "call_id": "2b12cbfa-56f5-46a1-8ff9-6f1215aee5a2",
+                    "name": "exec_command",
+                    "arguments": '{"cmd":"ps"}',
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "2b12cbfa-56f5-46a1-8ff9-6f1215aee5a2",
+                    "output": "telegram-desktop",
+                },
+            ],
+        }
+    )
+    call = sanitized["input"][0]
+    output = sanitized["input"][1]
+    assert call["id"] == "fc_2b12cbfa-56f5-46a1-8ff9-6f1215aee5a2"
+    assert call["call_id"] == "call_2b12cbfa-56f5-46a1-8ff9-6f1215aee5a2"
+    assert output["call_id"] == call["call_id"]
+    assert output["output"] == "telegram-desktop"
+
+
 def test_sanitize_chatgpt_passthrough_body_can_strip_previous_response_id_for_legacy_expand():
     body = {
         "model": "codex-gpt-5-5",
