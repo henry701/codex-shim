@@ -98,6 +98,15 @@ def test_session_isolation(tmp_path: Path):
     assert cache.get("sess-b", "resp_shared") == [{"content": "b"}]
 
 
+def test_latest_returns_most_recent_put_for_session(tmp_path: Path):
+    cache = ChatgptConversationCache(tmp_path)
+    cache.put("sess-1", "resp_1", [{"n": 1}], terminal=True)
+    cache.put("sess-1", "resp_2", [{"n": 2}], terminal=True)
+    cache.put("sess-other", "resp_9", [{"n": 9}], terminal=True)
+    assert cache.latest("sess-1") == [{"n": 2}]
+    assert cache.latest("missing") is None
+
+
 def test_eviction_removes_oldest_by_mtime(tmp_path: Path):
     cache = ChatgptConversationCache(tmp_path)
     session_dir = tmp_path / sanitize_path_segment("sess-1")

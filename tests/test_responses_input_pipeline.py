@@ -9,11 +9,15 @@ from codex_shim.responses_input_pipeline import (
 
 
 class _FakeCache:
-    def __init__(self, items: list[dict] | None) -> None:
+    def __init__(self, items: list[dict] | None, *, latest_items: list[dict] | None = None) -> None:
         self._items = items
+        self._latest_items = latest_items
 
     def get(self, session_key: str, previous_response_id: str) -> list | None:
         return self._items
+
+    def latest(self, session_key: str) -> list | None:
+        return self._latest_items
 
 
 def test_prepare_responses_input_items_skips_orphan_synthesis_when_disabled():
@@ -46,6 +50,30 @@ def test_synthesize_orphan_tool_calls_inserts_placeholder_before_output():
     assert repaired[1]["call_id"] == "call_orphan"
     assert len(warnings) == 1
     assert "synthesized" in warnings[0]
+
+
+def test_expand_cached_responses_input_falls_back_to_latest_session_snapshot():
+    cached = [
+        {"type": "message", "role": "user", "content": "real task"},
+        {"type": "function_call", "call_id": "call_1", "name": "exec_command", "arguments": "{}"},
+    ]
+    delta = [
+        {"type": "message", "role": "user", "content": "Continue"},
+        {"type": "function_call_output", "call_id": "call_1", "output": "grep hit"},
+    ]
+    cache = _FakeCache(None, latest_items=cached)
+    expanded = expand_cached_responses_input(
+        cache=cache,
+        session_key="sess",
+        previous_response_id="resp_missing",
+        delta_input=delta,
+        expand_enabled=True,
+        context="turn",
+    )
+    assert expanded[0]["content"] == "real task"
+    assert expanded[1]["name"] == "exec_command"
+    assert expanded[-1]["call_id"] == "call_1"
+    assert expanded[-2]["content"] == "Continue"
 
 
 def test_expand_cached_responses_input_prepends_cache_for_any_route():

@@ -140,23 +140,33 @@ def expand_cached_responses_input(
     _, delta_summary = summarize_compaction_input_items(delta_input, tail=6)
     cached = cache.get(session_key, previous_response_id)
     if cached is None:
-        if context == "compaction":
-            log_compaction_cache_expansion(
-                context=context,
-                session_key=session_key,
-                previous_response_id=previous_response_id,
-                cached_items=None,
-                delta_items=len(delta_input),
-                total_items=None,
-                delta_summary=delta_summary,
-            )
-        else:
-            print(
-                f"[chatgpt-cache] {context} MISS session={session_key} "
-                f"previous_response_id={previous_response_id} delta_items={len(delta_input)}",
-                flush=True,
-            )
-        return delta_input
+        latest_fn = getattr(cache, "latest", None)
+        if callable(latest_fn):
+            cached = latest_fn(session_key)
+        if cached is None:
+            if context == "compaction":
+                log_compaction_cache_expansion(
+                    context=context,
+                    session_key=session_key,
+                    previous_response_id=previous_response_id,
+                    cached_items=None,
+                    delta_items=len(delta_input),
+                    total_items=None,
+                    delta_summary=delta_summary,
+                )
+            else:
+                print(
+                    f"[chatgpt-cache] {context} MISS session={session_key} "
+                    f"previous_response_id={previous_response_id} delta_items={len(delta_input)}",
+                    flush=True,
+                )
+            return delta_input
+        print(
+            f"[chatgpt-cache] {context} MISS-FALLBACK session={session_key} "
+            f"previous_response_id={previous_response_id} latest_items={len(cached)} "
+            f"delta_items={len(delta_input)}",
+            flush=True,
+        )
 
     expanded = [*copy.deepcopy(cached), *copy.deepcopy(delta_input)]
     if context == "compaction":

@@ -2259,7 +2259,7 @@ class ShimServer:
         response_id: str | None,
         output_items: list[Any],
     ) -> None:
-        if not response_id or not output_items:
+        if not response_id:
             return
         items = self._build_turn_cache_items(request, responses_body, output_items)
         if not items:
@@ -3748,150 +3748,146 @@ class ShimServer:
                         status=status,
                     )
                 await ensure_prepared()
-            async with StreamGuard(
-                response,
-                emitter,
-                label=label,
-                finish_reason=(lambda: state.upstream_finish_reason if state is not None else None),
-            ) as guard:
-                http_attempt = 0
-                continues = 0
-                prefill_in_flight = False
-                state_started = False
-                skipper = ReplaySkipper()
-
-                async def drop_upstream() -> None:
-                    src = guard.upstream
-                    guard.attach_upstream(None)
-                    if src is not None:
-                        await _close_upstream(src)
-
-                while True:
-                    if pending_upstream is not None:
-                        upstream, err = pending_upstream, None
-                        pending_upstream = None
-                    else:
-                        turn_body = {**chat_body, "messages": messages}
-                        upstream, err = await self._post_openai_chat_completions(
-                            session, route, turn_body, request.headers
-                        )
-                    if err is not None:
-                        status, _text, code, message = err
-                        print(
-                            f"[stream] model={route.slug} upstream HTTP {status}: {message[:500]}",
-                            flush=True,
-                        )
-                        if prefill_in_flight and status in PREFILL_REJECT_STATUS:
-                            print(
-                                f"[stream] model={route.slug} assistant prefill rejected; "
-                                "ending incomplete",
-                                flush=True,
-                            )
-                            break
-                        await ensure_prepared()
-                        if state is not None:
-                            if not state_started:
-                                await state.start(response)
-                                state_started = True
-                            await state.fail(response, message, code=code)
-                        else:
-                            await emitter.fail(
-                                response,
-                                f"upstream {status}: {message[:200]}",
-                                code=code,
-                            )
-                        return response
+            try:
+                async with StreamGuard(
+                    response,
+                    emitter,
+                    label=label,
+                    finish_reason=(lambda: state.upstream_finish_reason if state is not None else None),
+                ) as guard:
+                    http_attempt = 0
+                    continues = 0
                     prefill_in_flight = False
-                    observe_upstream_response(f"byok-openai-chat-stream:{route.slug}", upstream)
-                    guard.attach_upstream(upstream)
-                    if state is not None:
-                        state.upstream_finish_reason = None
-                    disconnect_exc: BaseException | None = None
-                    try:
-                        async for line in guard.iter_sse(request=request):
-                            if state is not None and not state_started:
-                                await state.start(response)
-                                state_started = True
-                            if line == "[DONE]":
-                                guard.mark_upstream_done()
-                                break
-                            try:
-                                event = json.loads(line)
-                            except json.JSONDecodeError:
-                                continue
-                            if isinstance(event, dict) and event.get("type") == "ping":
-                                continue
-                            if isinstance(event, dict):
-                                chunk_error = chat_chunk_upstream_error(event)
-                                if chunk_error is not None:
-                                    code, message = chunk_error
-                                    if state is not None:
-                                        await state.fail(response, message, code=code)
-                                    else:
-                                        await emitter.fail(response, message, code=code)
-                                    break
-                            if state is not None:
-                                filtered = (
-                                    skipper.filter_chunk(event)
-                                    if isinstance(event, dict)
-                                    else event
-                                )
-                                if filtered is None:
-                                    continue
-                                await state.write_chat_delta(response, filtered)
-                            else:
-                                await _write_sse(response, event)
-                    except ClientError as exc:
-                        disconnect_exc = exc
-                    await drop_upstream()
-                    if (
-                        disconnect_exc is not None
-                        and guard.can_retry
-                        and http_attempt + 1 < policy.attempts
-                    ):
-                        http_attempt += 1
-                        await policy.sleep(http_attempt - 1)
-                        continue
-                    if (
-                        state is not None
-                        and not state.failed
-                        and should_prefill_continue(
-                            finish_reason=state.upstream_finish_reason,
-                            saw_done=guard.upstream_saw_done,
-                            continues=continues,
-                            as_responses=as_responses,
-                        )
-                    ):
-                        prefill = assistant_prefill_message(state)
-                        if prefill is not None:
-                            continues += 1
-                            messages = with_assistant_prefill(original_messages, prefill)
-                            skipper = ReplaySkipper.from_state(state)
-                            prefill_in_flight = True
-                            http_attempt = 0
+                    state_started = False
+                    skipper = ReplaySkipper()
+
+                    async def drop_upstream() -> None:
+                        src = guard.upstream
+                        guard.attach_upstream(None)
+                        if src is not None:
+                            await _close_upstream(src)
+
+                    while True:
+                        if pending_upstream is not None:
+                            upstream, err = pending_upstream, None
+                            pending_upstream = None
+                        else:
+                            turn_body = {**chat_body, "messages": messages}
+                            upstream, err = await self._post_openai_chat_completions(
+                                session, route, turn_body, request.headers
+                            )
+                        if err is not None:
+                            status, _text, code, message = err
                             print(
-                                f"[stream] model={route.slug} silent EOF; "
-                                f"prefill continue {continues}/{MAX_PREFILL_CONTINUES}",
+                                f"[stream] model={route.slug} upstream HTTP {status}: {message[:500]}",
                                 flush=True,
                             )
+                            if prefill_in_flight and status in PREFILL_REJECT_STATUS:
+                                print(
+                                    f"[stream] model={route.slug} assistant prefill rejected; "
+                                    "ending incomplete",
+                                    flush=True,
+                                )
+                                break
+                            await ensure_prepared()
+                            if state is not None:
+                                if not state_started:
+                                    await state.start(response)
+                                    state_started = True
+                                await state.fail(response, message, code=code)
+                            else:
+                                await emitter.fail(
+                                    response,
+                                    f"upstream {status}: {message[:200]}",
+                                    code=code,
+                                )
+                            return response
+                        prefill_in_flight = False
+                        observe_upstream_response(f"byok-openai-chat-stream:{route.slug}", upstream)
+                        guard.attach_upstream(upstream)
+                        if state is not None:
+                            state.upstream_finish_reason = None
+                        disconnect_exc: BaseException | None = None
+                        try:
+                            async for line in guard.iter_sse(request=request):
+                                if state is not None and not state_started:
+                                    await state.start(response)
+                                    state_started = True
+                                if line == "[DONE]":
+                                    guard.mark_upstream_done()
+                                    break
+                                try:
+                                    event = json.loads(line)
+                                except json.JSONDecodeError:
+                                    continue
+                                if isinstance(event, dict) and event.get("type") == "ping":
+                                    continue
+                                if isinstance(event, dict):
+                                    chunk_error = chat_chunk_upstream_error(event)
+                                    if chunk_error is not None:
+                                        code, message = chunk_error
+                                        if state is not None:
+                                            await state.fail(response, message, code=code)
+                                        else:
+                                            await emitter.fail(response, message, code=code)
+                                        break
+                                if state is not None:
+                                    filtered = (
+                                        skipper.filter_chunk(event)
+                                        if isinstance(event, dict)
+                                        else event
+                                    )
+                                    if filtered is None:
+                                        continue
+                                    await state.write_chat_delta(response, filtered)
+                                else:
+                                    await _write_sse(response, event)
+                        except ClientError as exc:
+                            disconnect_exc = exc
+                        await drop_upstream()
+                        if (
+                            disconnect_exc is not None
+                            and guard.can_retry
+                            and http_attempt + 1 < policy.attempts
+                        ):
+                            http_attempt += 1
+                            await policy.sleep(http_attempt - 1)
                             continue
-                    if disconnect_exc is not None and guard.can_retry:
-                        await guard.note_upstream_disconnect(disconnect_exc)
-                        return response
-                    if (
-                        as_responses
-                        and state is not None
-                        and responses_body is not None
-                        and not state.failed
-                        and not state._has_open_incomplete_items()
-                    ):
-                        self._store_responses_turn_conversation(
-                            request,
-                            responses_body,
-                            state.response_id,
-                            state.output_items(),
-                        )
-                    break
+                        if (
+                            state is not None
+                            and not state.failed
+                            and should_prefill_continue(
+                                finish_reason=state.upstream_finish_reason,
+                                saw_done=guard.upstream_saw_done,
+                                continues=continues,
+                                as_responses=as_responses,
+                            )
+                        ):
+                            prefill = assistant_prefill_message(state)
+                            if prefill is not None:
+                                continues += 1
+                                messages = with_assistant_prefill(original_messages, prefill)
+                                skipper = ReplaySkipper.from_state(state)
+                                prefill_in_flight = True
+                                http_attempt = 0
+                                print(
+                                    f"[stream] model={route.slug} silent EOF; "
+                                    f"prefill continue {continues}/{MAX_PREFILL_CONTINUES}",
+                                    flush=True,
+                                )
+                                continue
+                        if disconnect_exc is not None and guard.can_retry:
+                            await guard.note_upstream_disconnect(disconnect_exc)
+                            return response
+                        break
+            finally:
+                if as_responses and state is not None and responses_body is not None:
+                    self._store_responses_turn_conversation(
+                        request,
+                        responses_body,
+                        state.response_id,
+                        state.output_items(),
+                    )
         return response
 
     async def _post_openai_chat_as_anthropic(
@@ -4152,13 +4148,7 @@ class ShimServer:
                         await _write_sse(response, _anthropic_stream_to_chat_chunk(event, client_slug))
             except ClientError as exc:
                 await guard.note_upstream_disconnect(exc)
-        if (
-            as_responses
-            and state is not None
-            and responses_body is not None
-            and not state.failed
-            and not state._has_open_incomplete_items()
-        ):
+        if as_responses and state is not None and responses_body is not None:
             self._store_responses_turn_conversation(
                 request,
                 responses_body,

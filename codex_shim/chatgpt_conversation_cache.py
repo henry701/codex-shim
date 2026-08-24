@@ -183,6 +183,24 @@ class ChatgptConversationCache:
             self._note_disk_locked(key, size)
             self._evict_locked()
 
+    def latest(self, session_key: str) -> list[Any] | None:
+        """Most recently stored snapshot for this session, or None."""
+        if not session_key:
+            return None
+        with self._lock:
+            self._ensure_index_locked()
+            response_id = None
+            for key in reversed(self._disk):
+                if key[0] == session_key:
+                    response_id = key[1]
+                    break
+            if response_id is None:
+                for key in reversed(self._memory):
+                    if key[0] == session_key:
+                        return copy.deepcopy(self._memory[key])
+                return None
+        return self.get(session_key, response_id)
+
     def prune_until(self, max_bytes: int) -> dict[str, int]:
         limit = max(0, int(max_bytes))
         with self._lock:
