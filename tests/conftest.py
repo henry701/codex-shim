@@ -4,6 +4,12 @@ import pytest
 
 
 @pytest.fixture(autouse=True)
+def _disable_periodic_catalog_refresh(monkeypatch):
+    # Serve would otherwise rewrite the live Desktop catalog from stubbed discovery.
+    monkeypatch.setattr("codex_shim.server._CATALOG_REFRESH_INITIAL_DELAY_SEC", None)
+
+
+@pytest.fixture(autouse=True)
 def _isolate_hermes_auth_paths(monkeypatch, tmp_path_factory):
     # Refresh tokens are single-use. Tests must never read or rotate ~/.hermes.
     home = tmp_path_factory.mktemp("hermes-home")

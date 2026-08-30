@@ -9,6 +9,18 @@ and this project does not yet follow semantic versioning (pre-1.0).
 
 ### Fixed
 
+- BYOK native compact now accepts a reasoning-only chat completion as the
+  summary (NVIDIA NIM Muse Glimmer returns `reasoning_content` with empty
+  `content`). Thinking is ignored when `content` already has a summary.
+  Empty-summary 502 still falls through to summarization.
+
+- In-process catalog refresh (15s after `serve` binds, then every 3h) rewrites
+  `~/.codex/custom_model_catalog.json` and persists a live ChatGPT
+  `~/.codex/models_cache.json`. Boot `sync-desktop` often misses `/models`
+  because of the OAuth token race. models.dev / `opencode models` keep the last
+  successful payload when a refresh fetch fails, so a blip cannot wipe oc-free
+  or NVIDIA rows.
+
 - Catalog `input_modalities` now keep only Desktop's schema (`text`, `image`,
   `audio`). models.dev `video` values made `config.toml` fail to parse, so
   ChatGPT could not load the thread.

@@ -277,6 +277,52 @@ def test_refresh_local_explicit_models_uses_endpoint_name(monkeypatch):
     assert refreshed.max_context_limit == 65536
 
 
+@pytest.mark.enable_model_discovery
+def test_fetch_models_dev_catalog_keeps_stale_payload_when_refresh_fails(monkeypatch):
+    from urllib.error import URLError
+
+    from codex_shim import discover
+
+    discover.clear_models_dev_catalog_cache()
+    monkeypatch.setattr(
+        discover,
+        "fetch_http_json",
+        lambda *_args, **_kwargs: {"opencode": {"models": {"hy3-free": {"id": "hy3-free"}}}},
+    )
+    first = discover.fetch_models_dev_catalog()
+    assert first["opencode"]["models"]["hy3-free"]["id"] == "hy3-free"
+
+    def boom(*_args, **_kwargs):
+        raise URLError("models.dev down")
+
+    monkeypatch.setattr(discover, "fetch_http_json", boom)
+    discover.expire_models_dev_catalog_cache()
+    assert discover.fetch_models_dev_catalog() == first
+
+
+def test_list_opencode_cli_models_keeps_stale_payload_when_refresh_fails(monkeypatch):
+    from types import SimpleNamespace
+
+    from codex_shim import discover
+
+    discover.clear_opencode_cli_models_cache()
+    monkeypatch.setattr("codex_shim.discover.shutil.which", lambda _name: "/usr/bin/opencode")
+    monkeypatch.setattr(
+        "codex_shim.discover.subprocess.run",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            returncode=0, stdout="nvidia/meta/muse-glimmer-30b\n", stderr=""
+        ),
+    )
+    assert discover.list_opencode_cli_models() == ["nvidia/meta/muse-glimmer-30b"]
+
+    def boom(*_args, **_kwargs):
+        raise OSError("opencode models failed")
+
+    monkeypatch.setattr("codex_shim.discover.subprocess.run", boom)
+    discover.expire_opencode_cli_models_cache()
+    assert discover.list_opencode_cli_models() == ["nvidia/meta/muse-glimmer-30b"]
+
+
 def test_list_opencode_cli_models_caches_subprocess(monkeypatch):
     from types import SimpleNamespace
 

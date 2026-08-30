@@ -182,6 +182,15 @@ def clear_models_dev_catalog_cache() -> None:
         _models_dev_catalog_cache = None
 
 
+def expire_models_dev_catalog_cache() -> None:
+    """Mark the models.dev cache stale while keeping the last successful payload."""
+    global _models_dev_catalog_cache
+    with _models_dev_catalog_lock:
+        cached = _models_dev_catalog_cache
+        if cached is not None:
+            _models_dev_catalog_cache = (0.0, cached[1])
+
+
 def fetch_models_dev_catalog() -> dict[str, Any]:
     """Return the models.dev provider catalog, cached for a few hours."""
     global _models_dev_catalog_cache
@@ -190,12 +199,13 @@ def fetch_models_dev_catalog() -> dict[str, Any]:
         cached = _models_dev_catalog_cache
         if cached is not None and now - cached[0] < _MODELS_DEV_CATALOG_TTL_SEC:
             return cached[1]
+        stale = cached[1] if cached is not None else {}
     try:
         payload = fetch_http_json(MODELS_DEV_API_URL)
     except (OSError, URLError, json.JSONDecodeError, ValueError):
-        return {}
-    if not isinstance(payload, dict):
-        return {}
+        return stale
+    if not isinstance(payload, dict) or not payload:
+        return stale
     with _models_dev_catalog_lock:
         _models_dev_catalog_cache = (time.monotonic(), payload)
     return payload
@@ -1078,6 +1088,15 @@ def clear_opencode_cli_models_cache() -> None:
         _opencode_cli_models_cache = None
 
 
+def expire_opencode_cli_models_cache() -> None:
+    """Mark the OpenCode CLI model list stale while keeping the last successful payload."""
+    global _opencode_cli_models_cache
+    with _opencode_cli_models_lock:
+        cached = _opencode_cli_models_cache
+        if cached is not None:
+            _opencode_cli_models_cache = (0.0, cached[1])
+
+
 def list_opencode_cli_models() -> list[str]:
     global _opencode_cli_models_cache
     now = time.monotonic()
@@ -1085,28 +1104,34 @@ def list_opencode_cli_models() -> list[str]:
         cached = _opencode_cli_models_cache
         if cached is not None and now - cached[0] < _OPENCODE_CLI_MODELS_CACHE_TTL_SEC:
             return list(cached[1])
+        stale = list(cached[1]) if cached is not None else None
 
-        binary = shutil.which("opencode")
-        if not binary:
+    binary = shutil.which("opencode")
+    if not binary:
+        if stale is not None:
+            return stale
+        with _opencode_cli_models_lock:
             _opencode_cli_models_cache = (time.monotonic(), [])
-            return []
-        try:
-            result = subprocess.run(
-                [binary, "models"],
-                capture_output=True,
-                text=True,
-                timeout=60,
-                check=False,
-            )
-        except (OSError, subprocess.TimeoutExpired):
-            # Do not cache hard failures forever — allow a quick retry next call.
-            return []
-        output = result.stdout or ""
-        if result.returncode != 0:
-            output = f"{result.stdout}\n{result.stderr}"
-        lines = [line.strip() for line in output.splitlines() if line.strip()]
+        return []
+    try:
+        result = subprocess.run(
+            [binary, "models"],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return stale if stale is not None else []
+    output = result.stdout or ""
+    if result.returncode != 0:
+        output = f"{result.stdout}\n{result.stderr}"
+    lines = [line.strip() for line in output.splitlines() if line.strip()]
+    if not lines and stale is not None:
+        return stale
+    with _opencode_cli_models_lock:
         _opencode_cli_models_cache = (time.monotonic(), lines)
-        return list(lines)
+    return list(lines)
 
 
 def discover_opencode_cli_ids(prefix: str) -> list[str]:

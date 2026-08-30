@@ -144,6 +144,7 @@ from .settings import (
     CHATGPT_MODEL_SLUG,
     DEFAULT_CHATGPT_CONVERSATIONS_DIR,
     DEFAULT_CODEX_AUTH,
+    DEFAULT_CODEX_MODELS_CACHE,
     DEFAULT_SETTINGS,
     DEFAULT_HOST,
     DEFAULT_PORT,
@@ -192,6 +193,10 @@ PICKER_TOKEN_HEADER = "X-Codex-Shim-Picker-Token"
 CHATGPT_ACCEPT_ENCODING = "zstd, gzip, deflate"
 # Align with opencode CLI discover cache: automatic in-process refresh is rare.
 _MODELS_CACHE_TTL_SEC = 3 * 60 * 60
+# First persist after bind so ExecStartPre sync-desktop can miss a live ChatGPT
+# /models fetch (token race). None disables the loop (pytest).
+_CATALOG_REFRESH_INITIAL_DELAY_DEFAULT_SEC = 15.0
+_CATALOG_REFRESH_INITIAL_DELAY_SEC: float | None = _CATALOG_REFRESH_INITIAL_DELAY_DEFAULT_SEC
 _STARTUP_REFRESH_TIMEOUT_SEC = 8.0
 
 
@@ -224,6 +229,7 @@ class ShimServer:
         self.timeout = ClientTimeout(total=None, sock_connect=120, sock_read=None)
         self._models_cache: tuple[float, list[ShimModel]] | None = None
         self._models_load_lock = asyncio.Lock()
+        self._catalog_refresh_task: asyncio.Task[None] | None = None
         self._health_snapshot: dict[str, Any] = {
             "ok": True,
             "models": 0,
@@ -770,6 +776,7 @@ class ShimServer:
             middlewares=[host_guard_middleware(allowed_hosts)],
         )
         app.on_startup.append(self._on_startup)
+        app.on_cleanup.append(self._on_cleanup)
         app.router.add_get("/health", self.health)
         app.router.add_get("/v1/models", self.models)
         app.router.add_post("/v1/chat/completions", self.chat_completions)
@@ -797,6 +804,62 @@ class ShimServer:
                 "chatgpt_passthrough": chatgpt_passthrough_available(),
                 "cursor_passthrough": cursor_passthrough_available(),
             }
+        if _CATALOG_REFRESH_INITIAL_DELAY_SEC is not None:
+            self._catalog_refresh_task = asyncio.create_task(self._catalog_refresh_loop())
+
+    async def _on_cleanup(self, _app: web.Application) -> None:
+        task = self._catalog_refresh_task
+        self._catalog_refresh_task = None
+        if task is None:
+            return
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    async def _catalog_refresh_loop(self) -> None:
+        delay = _CATALOG_REFRESH_INITIAL_DELAY_SEC
+        if delay is None:
+            return
+        await asyncio.sleep(max(0.0, float(delay)))
+        while True:
+            try:
+                await self._refresh_models_and_publish()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                print(f"[catalog-refresh] failed: {exc}", flush=True)
+            await asyncio.sleep(_MODELS_CACHE_TTL_SEC)
+
+    async def _refresh_models_and_publish(self) -> None:
+        from .discover import expire_models_dev_catalog_cache, expire_opencode_cli_models_cache
+
+        expire_models_dev_catalog_cache()
+        expire_opencode_cli_models_cache()
+        models = await asyncio.to_thread(self.settings.load)
+        self._models_cache = (time.monotonic(), models)
+        self._health_snapshot = self._compute_health_snapshot_from_models(models)
+        await asyncio.to_thread(self._persist_refreshed_catalogs, models)
+
+    def _persist_refreshed_catalogs(self, models: list[ShimModel]) -> None:
+        from . import cli
+
+        try:
+            desktop = cli._publish_catalog(models, self.settings.load_router(), self.settings.path)
+        except Exception as exc:
+            print(f"[catalog-refresh] publish failed: {exc}", flush=True)
+            return
+        catalog_models = 0
+        try:
+            catalog_models = len(json.loads(desktop.read_text()).get("models", []))
+        except (OSError, json.JSONDecodeError, TypeError, AttributeError):
+            pass
+        print(
+            f"[catalog-refresh] published {catalog_models} Desktop catalog entries "
+            f"chatgpt_cache={DEFAULT_CODEX_MODELS_CACHE} desktop={desktop}",
+            flush=True,
+        )
 
     def _startup_health_snapshot(self) -> dict[str, Any]:
         return self._compute_health_snapshot_from_models(self.settings.load_explicit())

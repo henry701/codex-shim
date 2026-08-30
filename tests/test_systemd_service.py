@@ -34,6 +34,7 @@ def test_systemd_unit_runs_sync_desktop_then_foreground(monkeypatch, tmp_path):
 
 def test_startup_refresh_timeout_is_bounded_so_serve_can_bind():
     assert shim_server._STARTUP_REFRESH_TIMEOUT_SEC <= 15
+    assert shim_server._CATALOG_REFRESH_INITIAL_DELAY_DEFAULT_SEC == 15.0
 
 
 def _completed(returncode=0, stdout="", stderr=""):

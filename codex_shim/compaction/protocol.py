@@ -90,8 +90,27 @@ def decode_shim_compaction_summary(encrypted_content: Any) -> str | None:
     return text or None
 
 
+def _reasoning_summary_texts(item: dict[str, Any]) -> list[str]:
+    summary = item.get("summary")
+    texts: list[str] = []
+    if isinstance(summary, list):
+        for part in summary:
+            if isinstance(part, dict) and part.get("text"):
+                texts.append(str(part["text"]))
+    elif isinstance(summary, str) and summary.strip():
+        texts.append(summary)
+    return texts
+
+
 def compaction_summary_from_output(output: Any) -> str:
-    parts: list[str] = []
+    """Visible compact text. Reasoning is used only when message/compaction text is empty.
+
+    NVIDIA NIM Muse Glimmer returns a reasoning-only chat completion (empty
+    ``content``). DeepSeek and similar still send thinking in ``reasoning_content``
+    alongside a real summary in ``content`` — that thinking must not be stored.
+    """
+    visible: list[str] = []
+    reasoning: list[str] = []
     if isinstance(output, list):
         for item in output:
             if not isinstance(item, dict):
@@ -101,14 +120,19 @@ def compaction_summary_from_output(output: Any) -> str:
                 if isinstance(content, list):
                     for part in content:
                         if isinstance(part, dict) and part.get("text"):
-                            parts.append(str(part["text"]))
+                            visible.append(str(part["text"]))
+            elif item.get("type") == "reasoning":
+                reasoning.extend(_reasoning_summary_texts(item))
             elif item.get("type") == "output_text" and item.get("text"):
-                parts.append(str(item["text"]))
+                visible.append(str(item["text"]))
             elif item.get("type") in {"compaction", "compaction_summary"}:
                 decoded = decode_shim_compaction_summary(item.get("encrypted_content"))
                 if decoded:
-                    parts.append(decoded)
-    return "\n".join(part for part in parts if part).strip()
+                    visible.append(decoded)
+    primary = "\n".join(part for part in visible if part).strip()
+    if primary:
+        return primary
+    return "\n".join(part for part in reasoning if part).strip()
 
 
 def compaction_output_item(summary: str, *, item_id: str | None = None) -> dict[str, Any]:

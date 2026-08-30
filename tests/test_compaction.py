@@ -218,6 +218,55 @@ def test_compaction_summary_from_output_reads_message_and_compaction_items():
     assert compaction_summary_from_output(output) == "Visible summary\nStored summary"
 
 
+def test_compaction_summary_from_output_reads_reasoning_when_message_empty():
+    output = [
+        {
+            "type": "reasoning",
+            "status": "completed",
+            "summary": [{"type": "summary_text", "text": "Prior work: switched to NIM Glimmer."}],
+        }
+    ]
+    assert compaction_summary_from_output(output) == "Prior work: switched to NIM Glimmer."
+
+
+def test_compaction_summary_from_output_ignores_reasoning_when_message_present():
+    output = [
+        {
+            "type": "reasoning",
+            "status": "completed",
+            "summary": [{"type": "summary_text", "text": "thinking that must not become output items"}],
+        },
+        {
+            "type": "message",
+            "content": [{"type": "output_text", "text": "Compacted task state for DeepSeek."}],
+        },
+    ]
+    assert compaction_summary_from_output(output) == "Compacted task state for DeepSeek."
+
+
+def test_byok_compact_summary_uses_reasoning_content_when_chat_content_empty():
+    from codex_shim.server import ShimServer
+    from codex_shim.translate import chat_completion_to_response
+
+    payload = chat_completion_to_response(
+        {
+            "id": "resp_glimmer",
+            "choices": [
+                {
+                    "message": {
+                        "role": "assistant",
+                        "content": "",
+                        "reasoning_content": "Prior work: patched the catalog refresh.",
+                    }
+                }
+            ],
+        },
+        "nvidia-meta-muse-glimmer-30b",
+    )
+    shim = ShimServer.__new__(ShimServer)
+    assert "patched the catalog refresh" in shim._summary_from_compact_upstream_payload(payload)
+
+
 def test_responses_to_chat_maps_compaction_item_to_user_context():
     from codex_shim.translate import responses_to_chat
 
