@@ -109,3 +109,49 @@ def test_sync_desktop_keeps_existing_catalog_when_load_exceeds_budget(monkeypatc
     assert cli.sync_desktop(settings, 8765) == 0
     payload = json.loads(desktop_catalog.read_text())
     assert payload["models"][0]["slug"] == "codex-gpt-5-6-luna"
+
+
+def _explicit_llama_settings(path: Path) -> None:
+    path.write_text(
+        json.dumps(
+            {
+                "models": [
+                    {
+                        "model": "llama3.2",
+                        "display_name": "Llama",
+                        "provider": "generic-chat-completion-api",
+                        "base_url": "http://127.0.0.1:11434/v1",
+                        "api_key": "local",
+                    }
+                ]
+            }
+        )
+    )
+
+
+def test_generate_does_not_overwrite_desktop_catalog(monkeypatch, tmp_path):
+    """`generate` is runtime-only. Copying to ~/.codex wiped the live BYOK catalog."""
+    settings = tmp_path / "models.json"
+    _explicit_llama_settings(settings)
+    runtime_dir = tmp_path / "runtime"
+    desktop_catalog = tmp_path / "codex-home" / "custom_model_catalog.json"
+    desktop_catalog.parent.mkdir(parents=True)
+    desktop_catalog.write_text('{"models": [{"slug": "keep-me"}]}')
+
+    monkeypatch.setattr(cli, "RUNTIME_DIR", runtime_dir)
+    monkeypatch.setattr(cli, "CATALOG_PATH", runtime_dir / "custom_model_catalog.json")
+    monkeypatch.setattr(cli, "CONFIG_PATH", runtime_dir / "config.toml")
+    monkeypatch.setattr(cli, "CODEX_CONFIG_PATH", tmp_path / "codex-home" / "config.toml")
+    monkeypatch.setattr(cli, "DESKTOP_CATALOG_PATH", desktop_catalog)
+    monkeypatch.setattr(cli, "CODEX_CONFIG_BACKUP_PATH", runtime_dir / "config.toml.before-codex-shim")
+
+    cli.generate(settings, 8765)
+
+    runtime = json.loads((runtime_dir / "custom_model_catalog.json").read_text())
+    assert any(entry.get("slug") == "llama3-2" for entry in runtime["models"])
+    assert json.loads(desktop_catalog.read_text())["models"][0]["slug"] == "keep-me"
+
+
+def test_conftest_does_not_point_desktop_catalog_at_live_home():
+    live = Path.home() / ".codex" / "custom_model_catalog.json"
+    assert cli.DESKTOP_CATALOG_PATH.resolve() != live.resolve()

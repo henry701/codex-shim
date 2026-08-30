@@ -14,6 +14,12 @@ and this project does not yet follow semantic versioning (pre-1.0).
   `content`). Thinking is ignored when `content` already has a summary.
   Empty-summary 502 still falls through to summarization.
 
+- `codex-shim generate` writes only the runtime catalog. It no longer copies
+  onto `~/.codex/custom_model_catalog.json` (pytest `generate` with live
+  discovery had replaced a 200+ BYOK catalog with seven oc-free rows). Use
+  `sync-desktop` to publish. Tests isolate `DESKTOP_CATALOG_PATH` so a leak
+  cannot touch the live file.
+
 - In-process catalog refresh (15s after `serve` binds, then every 3h) rewrites
   `~/.codex/custom_model_catalog.json` and persists a live ChatGPT
   `~/.codex/models_cache.json`. Boot `sync-desktop` often misses `/models`

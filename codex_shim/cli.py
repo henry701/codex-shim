@@ -349,9 +349,14 @@ def _active_router(models, settings_path: Path):
     return None
 
 
-def _publish_catalog(models, router_config, settings_path: Path) -> Path:
+def _write_runtime_catalog(models, router_config, settings_path: Path) -> Path:
     settings_data = _load_settings_data(settings_path)
     write_catalog(models, CATALOG_PATH, router_config=router_config, settings_data=settings_data)
+    return CATALOG_PATH
+
+
+def _publish_catalog(models, router_config, settings_path: Path) -> Path:
+    _write_runtime_catalog(models, router_config, settings_path)
     DESKTOP_CATALOG_PATH.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(CATALOG_PATH, DESKTOP_CATALOG_PATH)
     return DESKTOP_CATALOG_PATH
@@ -377,14 +382,13 @@ def generate(settings_path: Path, port: int) -> None:
     except ValueError as exc:
         raise SystemExit(str(exc)) from exc
     router_config = router_module.load_router_config(Path(settings_path).expanduser())
-    _publish_catalog(models, router_config, settings_path)
+    _write_runtime_catalog(models, router_config, settings_path)
     write_config(models, CONFIG_PATH, CATALOG_PATH, port)
     discovered_count = sum(1 for model in models if model.raw.get("discovered"))
     print(f"Generated {len(models)} model entries ({discovered_count} auto-discovered):")
     if _active_router(models, settings_path) is not None:
         print(f"  auto router: {router_config.slug} ({router_config.display_name})")
     print(f"  catalog: {CATALOG_PATH}")
-    print(f"  desktop catalog: {DESKTOP_CATALOG_PATH}")
     print(f"  config:  {CONFIG_PATH}")
     print("No files under ~/.codex were modified.")
 

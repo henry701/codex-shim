@@ -60,8 +60,8 @@ On Linux, pair with [CodexDesktop-Rebuild](https://github.com/henry701/CodexDesk
 ### Catalog context headroom (`catalog_context`)
 
 Tune Codex's advertised context window when the shim refreshes
-`~/.codex/custom_model_catalog.json` (`generate`, `sync-desktop`, or service
-startup). Codex reads these limits from `model_catalog_json`, not from a
+`~/.codex/custom_model_catalog.json` (`sync-desktop` or in-process `serve`
+refresh). Codex reads these limits from `model_catalog_json`, not from a
 separate field in `~/.codex/config.toml`.
 
 ```json

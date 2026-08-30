@@ -90,6 +90,7 @@ def test_cli_generate_writes_catalog_with_discovered_slugs(
     monkeypatch.setattr(cli, "RUNTIME_DIR", runtime)
     monkeypatch.setattr(cli, "CATALOG_PATH", runtime / "custom_model_catalog.json")
     monkeypatch.setattr(cli, "CONFIG_PATH", runtime / "config.toml")
+    monkeypatch.setattr(cli, "DESKTOP_CATALOG_PATH", tmp_path / "desktop-catalog.json")
     if shutil.which("opencode") is None:
         monkeypatch.setattr(
             "codex_shim.discover.fetch_zen_public_model_ids",

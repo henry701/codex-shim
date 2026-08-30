@@ -84,11 +84,10 @@ def _clear_opencode_cli_models_cache():
 
 @pytest.fixture(autouse=True)
 def _isolate_published_desktop_catalog(monkeypatch, tmp_path_factory):
-    # Keep catalog sync tests from reading the developer's live Desktop catalog.
-    monkeypatch.setattr(
-        "codex_shim.settings.DEFAULT_DESKTOP_MODEL_CATALOG",
-        tmp_path_factory.mktemp("published-catalog") / "missing-custom_model_catalog.json",
-    )
+    # Keep catalog sync/generate tests from reading or writing the live Desktop catalog.
+    isolated = tmp_path_factory.mktemp("published-catalog") / "custom_model_catalog.json"
+    monkeypatch.setattr("codex_shim.settings.DEFAULT_DESKTOP_MODEL_CATALOG", isolated)
+    monkeypatch.setattr("codex_shim.cli.DESKTOP_CATALOG_PATH", isolated)
 
 
 @pytest.fixture(autouse=True)
