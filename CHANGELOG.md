@@ -32,6 +32,12 @@ and this project does not yet follow semantic versioning (pre-1.0).
   npm is `@ai-sdk/openai`. Copying the template's chat provider made Zen
   Responses models 500.
 
+- BYOK `/v1/responses` HTTP streams now persist the conversation cache and
+  treat `response.completed` / `failed` / `incomplete` as upstream done even
+  when the host omits SSE `[DONE]` (OpenCode Console). Without that, Desktop
+  `function_call_output` turns synthesized `unknown_tool` and re-sent the
+  prefix every turn.
+
 - BYOK native compact now accepts a reasoning-only chat completion as the
   summary (NVIDIA NIM Muse Glimmer returns `reasoning_content` with empty
   `content`). Thinking is ignored when `content` already has a summary.

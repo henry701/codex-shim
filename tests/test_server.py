@@ -4515,6 +4515,140 @@ async def test_responses_routes_openai_responses_provider_to_upstream_responses(
     await upstream_client.close()
 
 
+async def test_byok_openai_responses_http_stream_persists_cache_without_done_chunk(
+    monkeypatch, tmp_path, chatgpt_cache_dir, capsys
+):
+    captured: list[dict[str, Any]] = []
+    session_headers = {"session-id": "muse-http-cache"}
+    first_input = [{"type": "message", "role": "user", "content": "patch a file"}]
+    apply_patch_tool = {
+        "type": "custom",
+        "name": "apply_patch",
+        "description": "FREEFORM",
+        "format": {"type": "grammar", "syntax": "lark", "definition": "start: x"},
+    }
+    function_call = {
+        "type": "function_call",
+        "id": "fc_patch",
+        "call_id": "call_patch",
+        "name": "apply_patch",
+        "arguments": json.dumps({"input": "*** Begin Patch\n*** End Patch\n"}),
+    }
+
+    class FakeUpstream:
+        status = 200
+        content_type = "text/event-stream"
+        headers = {"Content-Type": "text/event-stream"}
+
+        def __init__(self, chunks: list[bytes]):
+            self.content = _FakeSseContent(chunks)
+
+        def release(self):
+            pass
+
+    async def fake_post(self, url, json=None, headers=None):
+        captured.append(json)
+        if len(captured) == 1:
+            return FakeUpstream(
+                [
+                    _sse_chunk(
+                        {
+                            "type": "response.created",
+                            "response": {"id": "resp_muse_1", "status": "in_progress", "output": []},
+                        }
+                    ),
+                    _sse_chunk({"type": "response.output_item.done", "item": function_call}),
+                    _sse_chunk(
+                        {
+                            "type": "response.completed",
+                            "response": {
+                                "id": "resp_muse_1",
+                                "status": "completed",
+                                "output": [function_call],
+                            },
+                        }
+                    ),
+                ]
+            )
+        return FakeUpstream(
+            [
+                _sse_chunk(
+                    {
+                        "type": "response.completed",
+                        "response": {"id": "resp_muse_2", "status": "completed", "output": []},
+                    }
+                )
+            ]
+        )
+
+    monkeypatch.setattr("codex_shim.server.ClientSession.post", fake_post)
+    settings = tmp_path / "settings.json"
+    settings.write_text(
+        json.dumps(
+            {
+                "customModels": [
+                    {
+                        "model": "console-responses-model",
+                        "displayName": "Console Responses",
+                        "provider": "openai-responses",
+                        "baseUrl": "https://example.test/v1",
+                        "apiKey": "secret",
+                    }
+                ]
+            }
+        )
+    )
+    shim = ShimServer(settings)
+    shim_client = TestClient(TestServer(shim.app()))
+    await shim_client.start_server()
+    try:
+        first = await shim_client.post(
+            "/v1/responses",
+            json={
+                "model": "console-responses-model",
+                "stream": True,
+                "tools": [apply_patch_tool],
+                "input": first_input,
+            },
+            headers=session_headers,
+        )
+        assert first.status == 200
+        first_text = await first.text()
+        assert "custom_tool_call" in first_text
+        logs = capsys.readouterr().out
+        assert "saw_done=True" in logs
+
+        second = await shim_client.post(
+            "/v1/responses",
+            json={
+                "model": "console-responses-model",
+                "stream": True,
+                "previous_response_id": "resp_muse_1",
+                "tools": [apply_patch_tool],
+                "input": [
+                    {
+                        "type": "function_call_output",
+                        "call_id": "call_patch",
+                        "output": "Success",
+                    }
+                ],
+            },
+            headers=session_headers,
+        )
+        assert second.status == 200
+        assert len(captured) == 2
+        names = [
+            item.get("name")
+            for item in captured[1]["input"]
+            if isinstance(item, dict) and item.get("type") in {"function_call", "custom_tool_call"}
+        ]
+        assert "apply_patch" in names
+        assert UNKNOWN_FUNCTION_TOOL_NAME not in names
+        assert "previous_response_id" not in captured[1]
+    finally:
+        await shim_client.close()
+
+
 async def test_responses_compact_chatgpt_passthrough_uses_compact_endpoint(monkeypatch, tmp_path, auth_present):
     captured = {}
 

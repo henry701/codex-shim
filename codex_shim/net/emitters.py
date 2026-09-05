@@ -6,6 +6,7 @@ from typing import Any
 from .sse import write_anthropic_sse, write_bytes, write_sse
 
 _RESPONSES_TERMINAL = frozenset({"response.completed", "response.failed", "response.incomplete"})
+RESPONSES_TERMINAL_EVENTS = _RESPONSES_TERMINAL
 _ANTHROPIC_TERMINAL = frozenset({"message_stop", "error"})
 
 

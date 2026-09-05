@@ -23,6 +23,7 @@ from .net.emitters import (
     AnthropicMessagesEmitter,
     AnthropicRelayEmitter,
     ChatgptRelayEmitter,
+    RESPONSES_TERMINAL_EVENTS,
     RawChatEmitter,
     ResponsesEmitter,
     WsRelayEmitter,
@@ -3585,6 +3586,16 @@ class ShimServer:
                     upstream,
                     usage=usage if isinstance(usage, dict) else None,
                 )
+                if isinstance(payload, dict):
+                    response_id = payload.get("id")
+                    output = payload.get("output") if isinstance(payload.get("output"), list) else []
+                    if isinstance(response_id, str) and response_id:
+                        self._store_responses_turn_conversation(
+                            request,
+                            body,
+                            response_id,
+                            output,
+                        )
                 response = web.json_response(payload)
                 apply_upstream_headers_to_response(response, upstream_headers_from_response(upstream))
                 log_upstream_response(
@@ -3607,6 +3618,7 @@ class ShimServer:
             response = prepare_downstream_sse_response(upstream)
             await response.prepare(request)
             emitter = ChatgptRelayEmitter(model=route.slug)
+            collector = ChatgptPassthroughResponseCollector(forwarded)
             async with StreamGuard(
                 response,
                 emitter,
@@ -3629,12 +3641,22 @@ class ShimServer:
                                 tool_types,
                                 custom_call_ids=custom_call_ids,
                             )
+                            collector.record(payload)
                             emitter.observe(payload)
+                            if payload.get("type") in RESPONSES_TERMINAL_EVENTS:
+                                guard.mark_upstream_done()
                             await _write_sse(response, payload)
                         else:
                             await _safe_write(response, f"data: {line}\n\n".encode())
                 except ClientError as exc:
                     await guard.note_upstream_disconnect(exc)
+            if emitter.saw_terminal:
+                self._store_responses_turn_conversation(
+                    request,
+                    body,
+                    collector.response_id,
+                    collector.output_items(),
+                )
             return response
 
     async def _post_openai_chat_completions(
