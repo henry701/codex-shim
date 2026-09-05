@@ -283,6 +283,28 @@ def _efforts_from_models_dev_row(row: dict[str, Any]) -> list[str]:
     return _unique_strings([item for item in efforts if item])
 
 
+_ZEN_DISCOVER_KINDS = frozenset({"zen", "zen_public"})
+_OPENAI_RESPONSES_SDK_NPM = "@ai-sdk/openai"
+
+
+def _sdk_npm_from_models_dev_row(row: dict[str, Any]) -> str:
+    for container_key in ("provider", "api"):
+        container = row.get(container_key)
+        if isinstance(container, dict):
+            npm = str(container.get("npm") or "").strip()
+            if npm:
+                return npm
+    return str(row.get("npm") or "").strip()
+
+
+def provider_for_discovered_model(template: DiscoverTemplate, meta: dict[str, Any]) -> str:
+    """Zen `@ai-sdk/openai` models speak Responses natively; chat-completions 500s."""
+    npm = str(meta.get("sdk_npm") or "").strip().lower()
+    if template.kind in _ZEN_DISCOVER_KINDS and npm == _OPENAI_RESPONSES_SDK_NPM:
+        return "openai-responses"
+    return template.provider
+
+
 def metadata_from_models_dev_row(row: dict[str, Any] | None) -> dict[str, Any]:
     """Map a models.dev model row onto catalog-facing metadata."""
     if not isinstance(row, dict) or not row:
@@ -323,6 +345,9 @@ def metadata_from_models_dev_row(row: dict[str, Any] | None) -> dict[str, Any]:
     field = str(interleaved.get("field") or "").strip()
     if field:
         meta["interleaved_reasoning_field"] = field
+    npm = _sdk_npm_from_models_dev_row(row)
+    if npm:
+        meta["sdk_npm"] = npm
     meta["no_image_support"] = no_image
     return meta
 
@@ -1226,7 +1251,7 @@ def _rows_to_shim_models(model_ids: list[str], template: DiscoverTemplate) -> li
                 slug=slug,
                 model=model_id,
                 display_name=display_name,
-                provider=template.provider,
+                provider=provider_for_discovered_model(template, meta),
                 base_url=template.base_url,
                 api_key=_resolved_api_key(_api_key_for_discovered_model(model_id, template)),
                 index=DISCOVER_INDEX_BASE + offset,

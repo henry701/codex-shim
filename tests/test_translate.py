@@ -1012,3 +1012,228 @@ def test_responses_to_chat_orphan_output_uses_advertised_tool_name():
     tool_calls = out["messages"][0]["tool_calls"]
     assert tool_calls[0]["function"]["name"] == "exec_command"
     assert out["messages"][1]["content"] == "report-validation=PASS"
+
+
+def test_openai_responses_tool_schemas_require_every_property_key():
+    from copy import deepcopy
+
+    from codex_shim.translate import prepare_openai_responses_tool_schemas
+
+    body = {
+        "model": "muse-spark-1.3-contributor-free",
+        "tools": [
+            {
+                "type": "function",
+                "name": "list_threads",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "limit": {
+                            "type": "integer",
+                            "description": "Maximum number of non-pinned thread summaries to return.",
+                        }
+                    },
+                    "additionalProperties": False,
+                },
+            },
+            {
+                "type": "tool_search",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "limit": {"type": "number", "description": "Maximum number of tools to return."},
+                        "query": {"type": "string", "description": "Search query for deferred tools."},
+                    },
+                    "required": ["query"],
+                    "additionalProperties": False,
+                },
+            },
+            {
+                "type": "namespace",
+                "name": "codex",
+                "tools": [
+                    {
+                        "type": "function",
+                        "name": "list_archived_threads",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "cursor": {"type": "string"},
+                                "hostId": {"type": "string"},
+                                "limit": {"type": "integer"},
+                            },
+                            "additionalProperties": False,
+                        },
+                    }
+                ],
+            },
+            {
+                "type": "function",
+                "name": "list_projects",
+                "parameters": {
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": False,
+                },
+            },
+        ],
+    }
+    original = deepcopy(body)
+
+    out = prepare_openai_responses_tool_schemas(body)
+
+    assert body == original
+    tools = {tool.get("name") or tool.get("type"): tool for tool in out["tools"]}
+    assert tools["list_threads"]["parameters"]["required"] == ["limit"]
+    assert tools["tool_search"]["parameters"]["required"] == ["query", "limit"]
+    archived = tools["codex"]["tools"][0]["parameters"]
+    assert archived["required"] == ["cursor", "hostId", "limit"]
+    assert tools["list_projects"]["parameters"]["required"] == []
+
+
+def test_openai_responses_tool_schemas_tighten_nested_object_properties():
+    from codex_shim.translate import prepare_openai_responses_tool_schemas
+
+    out = prepare_openai_responses_tool_schemas(
+        {
+            "tools": [
+                {
+                    "type": "function",
+                    "name": "search",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "filter": {
+                                "type": "object",
+                                "properties": {
+                                    "query": {"type": "string"},
+                                    "limit": {"type": "integer"},
+                                },
+                                "required": ["query"],
+                            }
+                        },
+                        "required": ["filter"],
+                    },
+                }
+            ]
+        }
+    )
+    params = out["tools"][0]["parameters"]
+    assert params["required"] == ["filter"]
+    assert params["properties"]["filter"]["required"] == ["query", "limit"]
+
+
+def test_openai_responses_converts_custom_apply_patch_to_function():
+    from copy import deepcopy
+
+    from codex_shim.translate import prepare_openai_responses_upstream_body
+
+    body = {
+        "model": "muse-spark-1.3-contributor-free",
+        "tools": [
+            {
+                "type": "custom",
+                "name": "apply_patch",
+                "description": "The `apply_patch` tool can be used to edit files. This is a FREEFORM tool.",
+                "format": {
+                    "type": "grammar",
+                    "syntax": "lark",
+                    "definition": "start: begin_patch hunk+ end_patch",
+                },
+            },
+            {
+                "type": "function",
+                "name": "exec_command",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"command": {"type": "string"}},
+                    "required": ["command"],
+                },
+            },
+        ],
+        "input": [
+            {
+                "type": "custom_tool_call",
+                "id": "ctc_1",
+                "call_id": "call_patch",
+                "name": "apply_patch",
+                "input": "*** Begin Patch\n*** Add File: a.txt\n+hi\n*** End Patch\n",
+                "status": "completed",
+            },
+            {
+                "type": "custom_tool_call_output",
+                "call_id": "call_patch",
+                "output": "Success",
+            },
+        ],
+    }
+    original = deepcopy(body)
+
+    out = prepare_openai_responses_upstream_body(body)
+
+    assert body == original
+    patch_tool = next(tool for tool in out["tools"] if tool.get("name") == "apply_patch")
+    assert patch_tool["type"] == "function"
+    assert "format" not in patch_tool
+    assert patch_tool["parameters"]["required"] == ["input"]
+    assert patch_tool["parameters"]["properties"]["input"]["type"] == "string"
+    exec_tool = next(tool for tool in out["tools"] if tool.get("name") == "exec_command")
+    assert exec_tool["type"] == "function"
+    call = out["input"][0]
+    assert call["type"] == "function_call"
+    assert call["name"] == "apply_patch"
+    assert json.loads(call["arguments"])["input"].startswith("*** Begin Patch")
+    assert out["input"][1]["type"] == "function_call_output"
+    assert out["input"][1]["output"] == "Success"
+
+
+def test_rewrite_openai_responses_function_call_back_to_custom():
+    from codex_shim.translate import rewrite_openai_responses_custom_payload
+
+    tool_types = {"apply_patch": "custom"}
+    added = rewrite_openai_responses_custom_payload(
+        {
+            "type": "response.output_item.added",
+            "item": {
+                "type": "function_call",
+                "id": "fc_1",
+                "call_id": "call_patch",
+                "name": "apply_patch",
+                "arguments": json.dumps({"input": "*** Begin Patch\n"}),
+                "status": "in_progress",
+            },
+        },
+        tool_types,
+    )
+    assert added["item"]["type"] == "custom_tool_call"
+    assert added["item"]["name"] == "apply_patch"
+    assert added["item"]["input"] == ""
+
+    delta = rewrite_openai_responses_custom_payload(
+        {
+            "type": "response.function_call_arguments.delta",
+            "delta": "*** Begin Patch\n",
+            "item_id": "fc_1",
+        },
+        tool_types,
+        custom_call_ids={"fc_1", "call_patch"},
+    )
+    assert delta["type"] == "response.custom_tool_call_input.delta"
+
+    done = rewrite_openai_responses_custom_payload(
+        {
+            "type": "response.output_item.done",
+            "item": {
+                "type": "function_call",
+                "id": "fc_1",
+                "call_id": "call_patch",
+                "name": "apply_patch",
+                "arguments": json.dumps({"input": "*** Begin Patch\n*** End Patch\n"}),
+                "status": "completed",
+            },
+        },
+        tool_types,
+    )
+    assert done["item"]["type"] == "custom_tool_call"
+    assert done["item"]["input"].startswith("*** Begin Patch")
+    assert "arguments" not in done["item"]

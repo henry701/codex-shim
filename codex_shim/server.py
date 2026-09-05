@@ -169,6 +169,8 @@ from .translate import (
     chat_to_anthropic,
     normalize_responses_usage,
     prepare_codex_byok_responses_body,
+    prepare_openai_responses_upstream_body,
+    rewrite_openai_responses_custom_payload,
     responses_to_anthropic,
     responses_to_chat,
     responses_tool_type_map,
@@ -1216,6 +1218,8 @@ class ShimServer:
             surface=ContinuationSurface.WS,
             route=ContinuationRoute.BYOK,
         )
+        tool_types = responses_tool_type_map(forwarded.get("tools"))
+        forwarded = prepare_openai_responses_upstream_body(forwarded)
         forwarded["model"] = route.model
         forwarded["stream"] = True
         headers = openai_responses_ws_upstream_headers(
@@ -1227,9 +1231,17 @@ class ShimServer:
         source = f"byok-openai-responses-ws:{route.slug}"
         session_key = self._session_key(request)
         collector = ChatgptPassthroughResponseCollector(forwarded)
+        custom_call_ids: set[str] = set()
+
+        def rewrite_event(event: dict[str, Any]) -> dict[str, Any]:
+            return rewrite_openai_responses_custom_payload(
+                event,
+                tool_types,
+                custom_call_ids=custom_call_ids,
+            )
 
         def on_event(event: dict[str, Any]) -> None:
-            collector.record(event)
+            collector.record(rewrite_event(event) if isinstance(event, dict) else event)
 
         try:
             await passthrough.connect_upstream(upstream_url, headers)
@@ -1240,6 +1252,8 @@ class ShimServer:
         client_ws = passthrough.client_ws
 
         async def write_event(event: dict[str, Any]) -> None:
+            if isinstance(event, dict):
+                event = rewrite_event(event)
             await _write_ws_json(client_ws, event)
 
         try:
@@ -3515,7 +3529,9 @@ class ShimServer:
     ) -> web.StreamResponse:
         """Forward a Responses API request directly to the upstream /responses endpoint."""
         url = _join_url(route.base_url, "/responses")
-        forwarded = dict(body)
+        tool_types = responses_tool_type_map(body.get("tools"))
+        custom_call_ids: set[str] = set()
+        forwarded = prepare_openai_responses_upstream_body(dict(body))
         forwarded["model"] = route.model
         extra_headers = dict(route.extra_headers)
         extra_headers.setdefault("OpenAI-Beta", "responses=2026-02-06")
@@ -3557,6 +3573,12 @@ class ShimServer:
                 return error
             if not forwarded.get("stream"):
                 payload = await upstream.json(content_type=None)
+                if isinstance(payload, dict):
+                    payload = rewrite_openai_responses_custom_payload(
+                        payload,
+                        tool_types,
+                        custom_call_ids=custom_call_ids,
+                    )
                 usage = payload.get("usage") if isinstance(payload, dict) else None
                 observe_upstream_response(
                     f"byok-openai-responses:{route.slug}",
@@ -3602,6 +3624,11 @@ class ShimServer:
                             await _safe_write(response, f"data: {line}\n\n".encode())
                             continue
                         if isinstance(payload, dict):
+                            payload = rewrite_openai_responses_custom_payload(
+                                payload,
+                                tool_types,
+                                custom_call_ids=custom_call_ids,
+                            )
                             emitter.observe(payload)
                             await _write_sse(response, payload)
                         else:

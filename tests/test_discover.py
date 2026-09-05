@@ -9,6 +9,7 @@ from codex_shim.discover import (
     NOUS_PORTAL_TEMPLATE,
     NVIDIA_INTEGRATE_TEMPLATE,
     OPENROUTER_FREE_TEMPLATE,
+    ZEN_PAID_TEMPLATE,
     ZEN_PUBLIC_TEMPLATE,
     _catalog_slug_for_model,
     _parse_models_dev_opencode_free_ids,
@@ -433,7 +434,30 @@ def _models_dev_catalog() -> dict:
                     "limit": {"context": 1_000_000, "output": 131_072},
                     "modalities": {"input": ["text", "image", "video"], "output": ["text"]},
                     "interleaved": {"field": "reasoning_content"},
-                }
+                },
+                "muse-spark-1.3-contributor-free": {
+                    "id": "muse-spark-1.3-contributor-free",
+                    "name": "Muse Spark 1.3 Free",
+                    "provider": {"npm": "@ai-sdk/openai"},
+                    "reasoning": True,
+                    "limit": {"context": 262_144, "output": 65_536},
+                    "modalities": {"input": ["text"], "output": ["text"]},
+                },
+                "muse-spark-1.2": {
+                    "id": "muse-spark-1.2",
+                    "name": "Muse Spark 1.2",
+                    "api": {"npm": "@ai-sdk/openai"},
+                    "reasoning": True,
+                    "limit": {"context": 262_144, "output": 65_536},
+                    "modalities": {"input": ["text"], "output": ["text"]},
+                },
+                "big-pickle": {
+                    "id": "big-pickle",
+                    "name": "Big Pickle",
+                    "provider": {"npm": "@ai-sdk/openai-compatible"},
+                    "limit": {"context": 131_072, "output": 8_192},
+                    "modalities": {"input": ["text"], "output": ["text"]},
+                },
             }
         },
         "openrouter": {
@@ -447,6 +471,13 @@ def _models_dev_catalog() -> dict:
                     "reasoning_options": [{"type": "effort", "values": ["low", "high", "max"]}],
                     "limit": {"context": 1_048_576, "output": 131_072},
                     "modalities": {"input": ["text", "image", "video"], "output": ["text"]},
+                },
+                "openrouter/muse-spark": {
+                    "id": "openrouter/muse-spark",
+                    "name": "OpenRouter Muse Spark",
+                    "provider": {"npm": "@ai-sdk/openai"},
+                    "limit": {"context": 131_072, "output": 8_192},
+                    "modalities": {"input": ["text"], "output": ["text"]},
                 },
                 "nvidia/nemotron-3-super-120b-a12b:free": {
                     "id": "nvidia/nemotron-3-super-120b-a12b:free",
@@ -476,6 +507,65 @@ def _models_dev_catalog() -> dict:
             }
         },
     }
+
+
+def test_metadata_from_models_dev_row_captures_openai_sdk_npm():
+    from codex_shim.discover import metadata_from_models_dev_row
+
+    meta = metadata_from_models_dev_row(
+        _models_dev_catalog()["opencode"]["models"]["muse-spark-1.3-contributor-free"]
+    )
+    assert meta["sdk_npm"] == "@ai-sdk/openai"
+
+
+def test_metadata_from_models_dev_row_captures_api_npm():
+    from codex_shim.discover import metadata_from_models_dev_row
+
+    meta = metadata_from_models_dev_row(
+        _models_dev_catalog()["opencode"]["models"]["muse-spark-1.2"]
+    )
+    assert meta["sdk_npm"] == "@ai-sdk/openai"
+
+
+def test_discovered_zen_openai_sdk_models_use_responses_api(monkeypatch):
+    monkeypatch.setattr(
+        "codex_shim.discover.fetch_models_dev_catalog",
+        lambda: _models_dev_catalog(),
+        raising=False,
+    )
+    models = _rows_to_shim_models(
+        ["big-pickle", "muse-spark-1.3-contributor-free"],
+        ZEN_PUBLIC_TEMPLATE,
+    )
+    by_id = {model.model: model for model in models}
+    muse = by_id["muse-spark-1.3-contributor-free"]
+    pickle = by_id["big-pickle"]
+    assert muse.provider == "openai-responses"
+    assert muse.is_openai_responses
+    assert pickle.provider == "generic-chat-completion-api"
+    assert pickle.is_openai_chat
+
+
+def test_discovered_zen_paid_openai_sdk_models_use_responses_api(monkeypatch):
+    monkeypatch.setattr(
+        "codex_shim.discover.fetch_models_dev_catalog",
+        lambda: _models_dev_catalog(),
+        raising=False,
+    )
+    route = _rows_to_shim_models(["muse-spark-1.2"], ZEN_PAID_TEMPLATE)[0]
+    assert route.provider == "openai-responses"
+    assert route.is_openai_responses
+
+
+def test_discovered_openrouter_openai_sdk_stays_chat_completions(monkeypatch):
+    monkeypatch.setattr(
+        "codex_shim.discover.fetch_models_dev_catalog",
+        lambda: _models_dev_catalog(),
+        raising=False,
+    )
+    route = _rows_to_shim_models(["openrouter/muse-spark"], OPENROUTER_FREE_TEMPLATE)[0]
+    assert route.provider == "generic-chat-completion-api"
+    assert route.is_openai_chat
 
 
 def test_metadata_from_models_dev_row_maps_ox_alpha_efforts_and_limits():

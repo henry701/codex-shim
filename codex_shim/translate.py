@@ -460,6 +460,257 @@ def prepare_codex_byok_responses_body(
     return prepared
 
 
+def tighten_json_schema_required(schema: Any) -> Any:
+    """Make object `required` list every `properties` key (Gemini/OpenAI strict)."""
+    if isinstance(schema, list):
+        return [tighten_json_schema_required(item) for item in schema]
+    if not isinstance(schema, dict):
+        return schema
+    out = dict(schema)
+    for key in ("anyOf", "oneOf", "allOf"):
+        value = out.get(key)
+        if isinstance(value, list):
+            out[key] = [tighten_json_schema_required(item) for item in value]
+    items = out.get("items")
+    if isinstance(items, (dict, list)):
+        out["items"] = tighten_json_schema_required(items)
+    additional = out.get("additionalProperties")
+    if isinstance(additional, dict):
+        out["additionalProperties"] = tighten_json_schema_required(additional)
+    for defs_key in ("$defs", "definitions"):
+        defs = out.get(defs_key)
+        if isinstance(defs, dict):
+            out[defs_key] = {
+                name: tighten_json_schema_required(defn) for name, defn in defs.items()
+            }
+    properties = out.get("properties")
+    if isinstance(properties, dict):
+        tightened = {
+            name: tighten_json_schema_required(prop) for name, prop in properties.items()
+        }
+        out["properties"] = tightened
+        seen: list[str] = []
+        existing = out.get("required")
+        if isinstance(existing, list):
+            for item in existing:
+                key = item if isinstance(item, str) else str(item)
+                if key in tightened and key not in seen:
+                    seen.append(key)
+        for key in tightened:
+            if key not in seen:
+                seen.append(key)
+        out["required"] = seen
+    elif str(out.get("type") or "").strip().lower() == "object" and not isinstance(
+        out.get("required"), list
+    ):
+        out["required"] = []
+    return out
+
+
+def tighten_responses_tool_schemas(tools: list[Any]) -> list[Any]:
+    return [_tighten_responses_tool(tool) for tool in tools]
+
+
+def _tighten_responses_tool(tool: Any) -> Any:
+    if not isinstance(tool, dict):
+        return tool
+    out = dict(tool)
+    for key in ("parameters", "input_schema"):
+        value = out.get(key)
+        if isinstance(value, dict):
+            out[key] = tighten_json_schema_required(value)
+    nested = out.get("tools")
+    if isinstance(nested, list):
+        out["tools"] = tighten_responses_tool_schemas(nested)
+    function = out.get("function")
+    if isinstance(function, dict):
+        out["function"] = _tighten_responses_tool(function)
+    return out
+
+
+def prepare_openai_responses_tool_schemas(body: dict[str, Any]) -> dict[str, Any]:
+    """Copy Responses tools so every object schema lists all property keys in `required`."""
+    tools = body.get("tools")
+    if not isinstance(tools, list):
+        return body
+    prepared = dict(body)
+    prepared["tools"] = tighten_responses_tool_schemas(tools)
+    return prepared
+
+
+_CUSTOM_RESPONSES_TOOL_TYPES = frozenset({"custom", "freeform"})
+
+
+def _custom_tool_to_function(tool: dict[str, Any]) -> dict[str, Any]:
+    name = str(tool.get("name") or "apply_patch").strip() or "apply_patch"
+    description = str(tool.get("description") or "")
+    parameters = tool.get("parameters")
+    if not isinstance(parameters, dict):
+        parameters = {
+            "type": "object",
+            "properties": {
+                "input": {
+                    "type": "string",
+                    "description": "Freeform tool input as a string. Do not wrap it in JSON.",
+                }
+            },
+            "required": ["input"],
+            "additionalProperties": False,
+        }
+    return {
+        "type": "function",
+        "name": name,
+        "description": description,
+        "strict": False,
+        "parameters": parameters,
+    }
+
+
+def coerce_custom_responses_tools(tools: list[Any]) -> list[Any]:
+    converted: list[Any] = []
+    for tool in tools:
+        if not isinstance(tool, dict):
+            converted.append(tool)
+            continue
+        out = dict(tool)
+        nested = out.get("tools")
+        if isinstance(nested, list):
+            out["tools"] = coerce_custom_responses_tools(nested)
+        tool_type = str(out.get("type") or "").strip().lower()
+        if tool_type in _CUSTOM_RESPONSES_TOOL_TYPES:
+            converted.append(_custom_tool_to_function(out))
+            continue
+        converted.append(out)
+    return converted
+
+
+def coerce_custom_responses_input(value: Any) -> Any:
+    if not isinstance(value, list):
+        return value
+    return [_coerce_custom_input_item(item) for item in value]
+
+
+def _coerce_custom_input_item(item: Any) -> Any:
+    if not isinstance(item, dict):
+        return item
+    item_type = str(item.get("type") or "")
+    if item_type == "custom_tool_call":
+        out = dict(item)
+        out["type"] = "function_call"
+        out["arguments"] = wrap_custom_tool_input(item.get("input"))
+        out.pop("input", None)
+        if not out.get("name"):
+            out["name"] = "apply_patch"
+        return out
+    if item_type == "custom_tool_call_output":
+        out = dict(item)
+        out["type"] = "function_call_output"
+        return out
+    return item
+
+
+def prepare_openai_responses_upstream_body(body: dict[str, Any]) -> dict[str, Any]:
+    """Zen/Muse reject Codex `custom` grammar tools; send functions + strict schemas."""
+    prepared = dict(body)
+    tools = prepared.get("tools")
+    if isinstance(tools, list):
+        prepared["tools"] = coerce_custom_responses_tools(tools)
+    if "input" in prepared:
+        prepared["input"] = coerce_custom_responses_input(prepared.get("input"))
+    return prepare_openai_responses_tool_schemas(prepared)
+
+
+def _is_custom_responses_tool_name(name: str, tool_types: dict[str, str] | None) -> bool:
+    return original_responses_tool_type(name, tool_types) in {"apply_patch", "custom", "freeform"}
+
+
+def _function_call_to_custom_item(item: dict[str, Any], *, in_progress: bool) -> dict[str, Any]:
+    out = {key: value for key, value in item.items() if key != "arguments"}
+    out["type"] = "custom_tool_call"
+    if not out.get("name"):
+        out["name"] = "apply_patch"
+    if in_progress:
+        out["input"] = ""
+    else:
+        out["input"] = unwrap_custom_tool_input(item.get("arguments", ""))
+    return out
+
+
+def _remember_custom_call_ids(custom_call_ids: set[str] | None, item: Mapping[str, Any]) -> None:
+    if custom_call_ids is None:
+        return
+    for key in ("id", "call_id"):
+        value = str(item.get(key) or "")
+        if value:
+            custom_call_ids.add(value)
+
+
+def _rewrite_function_call_item(
+    item: Any,
+    tool_types: dict[str, str] | None,
+    custom_call_ids: set[str] | None,
+    *,
+    in_progress: bool,
+) -> Any:
+    if not isinstance(item, dict) or item.get("type") != "function_call":
+        return item
+    name = str(item.get("name") or "")
+    if not _is_custom_responses_tool_name(name, tool_types):
+        return item
+    rewritten = _function_call_to_custom_item(item, in_progress=in_progress)
+    _remember_custom_call_ids(custom_call_ids, rewritten)
+    _remember_custom_call_ids(custom_call_ids, item)
+    return rewritten
+
+
+def rewrite_openai_responses_custom_payload(
+    payload: dict[str, Any],
+    tool_types: dict[str, str] | None,
+    *,
+    custom_call_ids: set[str] | None = None,
+) -> dict[str, Any]:
+    """Map Muse function_call apply_patch events back to Codex custom_tool_call."""
+    out = dict(payload)
+    event_type = str(out.get("type") or "")
+    item = out.get("item")
+    if isinstance(item, dict):
+        in_progress = event_type.endswith("output_item.added")
+        if event_type.endswith("output_item.done"):
+            in_progress = False
+        out["item"] = _rewrite_function_call_item(
+            item,
+            tool_types,
+            custom_call_ids,
+            in_progress=in_progress,
+        )
+    if event_type in {
+        "response.function_call_arguments.delta",
+        "response.function_call_arguments.done",
+    }:
+        ids = {str(out.get("item_id") or ""), str(out.get("call_id") or "")}
+        if custom_call_ids and ids & custom_call_ids:
+            out["type"] = event_type.replace(
+                "response.function_call_arguments.",
+                "response.custom_tool_call_input.",
+            )
+            if event_type.endswith(".done") and "arguments" in out:
+                out["input"] = unwrap_custom_tool_input(out.get("arguments"))
+    response = out.get("response")
+    if isinstance(response, dict) and isinstance(response.get("output"), list):
+        rewritten_response = dict(response)
+        rewritten_response["output"] = [
+            _rewrite_function_call_item(entry, tool_types, custom_call_ids, in_progress=False)
+            for entry in response["output"]
+        ]
+        out["response"] = rewritten_response
+    elif isinstance(out.get("output"), list) and not event_type.startswith("response.function_call"):
+        out["output"] = [
+            _rewrite_function_call_item(entry, tool_types, custom_call_ids, in_progress=False)
+            for entry in out["output"]
+        ]
+    return out
+
+
 def _decode_thinking_blob(encoded: Any) -> dict[str, Any] | None:
     import base64
 
