@@ -21,16 +21,19 @@ and this project does not yet follow semantic versioning (pre-1.0).
 
 - The same hosts reject tool schemas that list keys in `properties` but omit
   them from `required` (reproduced as Missing 'limit' on `tool_search` /
-  `list_threads`). openai-responses passthrough fills `required` with every
-  property key, including nested objects and namespace tools, before
-  `/responses`.
+  `list_threads`). If `required` is missing, every property is required. If
+  `required` is already set, optional properties are dropped from the schema
+  instead of being promoted into `required`. Promoting optional integers made
+  models emit `max_output_tokens: 8000.0`, which Desktop rejects (`expected
+  usize`). Function-call arguments also coerce whole-number JSON floats to ints
+  before Desktop sees them.
 
-- Discovery routes a model to `/v1/responses` when the host honors models.dev
-  SDK npm (`honors_models_dev_sdk`, OpenCode Zen today) and the row is
-  `@ai-sdk/openai`. `@ai-sdk/openai-compatible` stays on chat completions.
-  Chat-only aggregators (OpenRouter, NVIDIA NIM, Nous) keep chat even when
-  npm is `@ai-sdk/openai`. Copying the template's chat provider made Zen
-  Responses models 500.
+- Discovery routes a model to `/v1/responses` when the host implements that
+  endpoint and honors models.dev SDK npm (`honors_models_dev_sdk`) and the
+  row is `@ai-sdk/openai`. OpenCode Zen and OpenRouter do. Hosted NVIDIA
+  Integrate (`integrate.api.nvidia.com`) 404s `/v1/responses`; Nous Portal
+  does not expose it. Those stay on chat even if npm is `@ai-sdk/openai`.
+  `@ai-sdk/openai-compatible` stays on chat completions.
 
 - BYOK `/v1/responses` HTTP streams now persist the conversation cache and
   treat `response.completed` / `failed` / `incomplete` as upstream done even

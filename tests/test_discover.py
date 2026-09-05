@@ -565,7 +565,7 @@ def test_provider_follows_models_dev_sdk_not_model_id():
     assert provider_for_discovered_model(ZEN_PUBLIC_TEMPLATE, responses) == "openai-responses"
     assert provider_for_discovered_model(ZEN_PAID_TEMPLATE, responses) == "openai-responses"
     assert provider_for_discovered_model(ZEN_PUBLIC_TEMPLATE, compatible) == "generic-chat-completion-api"
-    assert provider_for_discovered_model(OPENROUTER_FREE_TEMPLATE, responses) == "generic-chat-completion-api"
+    assert provider_for_discovered_model(OPENROUTER_FREE_TEMPLATE, responses) == "openai-responses"
     assert provider_for_discovered_model(NVIDIA_INTEGRATE_TEMPLATE, responses) == "generic-chat-completion-api"
     assert provider_for_discovered_model(NOUS_PORTAL_TEMPLATE, responses) == "generic-chat-completion-api"
 
@@ -619,15 +619,15 @@ def test_discovered_paid_openai_sdk_models_use_responses_api(monkeypatch):
         assert route.is_openai_responses
 
 
-def test_discovered_openrouter_openai_sdk_stays_chat_completions(monkeypatch):
+def test_discovered_openrouter_openai_sdk_uses_responses_api(monkeypatch):
     monkeypatch.setattr(
         "codex_shim.discover.fetch_models_dev_catalog",
         lambda: _models_dev_catalog(),
         raising=False,
     )
     route = _rows_to_shim_models(["openrouter/muse-spark"], OPENROUTER_FREE_TEMPLATE)[0]
-    assert route.provider == "generic-chat-completion-api"
-    assert route.is_openai_chat
+    assert route.provider == "openai-responses"
+    assert route.is_openai_responses
 
 
 def test_discovered_nvidia_openai_sdk_stays_chat_completions(monkeypatch):

@@ -1085,7 +1085,8 @@ def test_openai_responses_tool_schemas_require_every_property_key():
     assert body == original
     tools = {tool.get("name") or tool.get("type"): tool for tool in out["tools"]}
     assert tools["list_threads"]["parameters"]["required"] == ["limit"]
-    assert tools["tool_search"]["parameters"]["required"] == ["query", "limit"]
+    assert tools["tool_search"]["parameters"]["required"] == ["query"]
+    assert "limit" not in tools["tool_search"]["parameters"]["properties"]
     archived = tools["codex"]["tools"][0]["parameters"]
     assert archived["required"] == ["cursor", "hostId", "limit"]
     assert tools["list_projects"]["parameters"]["required"] == []
@@ -1144,7 +1145,8 @@ def test_openai_responses_tool_schemas_tighten_nested_object_properties():
     )
     params = out["tools"][0]["parameters"]
     assert params["required"] == ["filter"]
-    assert params["properties"]["filter"]["required"] == ["query", "limit"]
+    assert params["properties"]["filter"]["required"] == ["query"]
+    assert "limit" not in params["properties"]["filter"]["properties"]
 
 
 def test_openai_responses_converts_custom_apply_patch_to_function():
@@ -1203,6 +1205,8 @@ def test_openai_responses_converts_custom_apply_patch_to_function():
     assert patch_tool["parameters"]["properties"]["input"]["type"] == "string"
     exec_tool = next(tool for tool in out["tools"] if tool.get("name") == "exec_command")
     assert exec_tool["type"] == "function"
+    assert exec_tool["parameters"]["required"] == ["command"]
+    assert list(exec_tool["parameters"]["properties"]) == ["command"]
     call = out["input"][0]
     assert call["type"] == "function_call"
     assert call["name"] == "apply_patch"
@@ -1261,3 +1265,79 @@ def test_rewrite_openai_responses_function_call_back_to_custom():
     assert done["item"]["type"] == "custom_tool_call"
     assert done["item"]["input"].startswith("*** Begin Patch")
     assert "arguments" not in done["item"]
+
+
+def test_openai_responses_does_not_require_optional_exec_command_ints():
+    from copy import deepcopy
+
+    from codex_shim.translate import prepare_openai_responses_upstream_body
+
+    body = {
+        "model": "any-responses-model",
+        "tools": [
+            {
+                "type": "function",
+                "name": "exec_command",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "cmd": {"type": "string"},
+                        "justification": {"type": "string"},
+                        "max_output_tokens": {"type": "integer"},
+                        "yield_time_ms": {"type": "integer"},
+                        "login": {"type": "boolean"},
+                    },
+                    "required": ["cmd"],
+                    "additionalProperties": False,
+                },
+            }
+        ],
+    }
+    out = prepare_openai_responses_upstream_body(deepcopy(body))
+    params = out["tools"][0]["parameters"]
+    assert params["required"] == ["cmd"]
+    assert list(params["properties"]) == ["cmd"]
+
+
+def test_rewrite_integerizes_whole_float_function_call_arguments():
+    from codex_shim.translate import rewrite_openai_responses_custom_payload
+
+    done = rewrite_openai_responses_custom_payload(
+        {
+            "type": "response.output_item.done",
+            "item": {
+                "type": "function_call",
+                "id": "fc_exec",
+                "call_id": "call_exec",
+                "name": "exec_command",
+                "arguments": json.dumps(
+                    {
+                        "cmd": "ls",
+                        "max_output_tokens": 8000.0,
+                        "yield_time_ms": 1000.0,
+                        "login": True,
+                    }
+                ),
+                "status": "completed",
+            },
+        },
+        {"exec_command": "function"},
+    )
+    args = json.loads(done["item"]["arguments"])
+    assert args["cmd"] == "ls"
+    assert args["max_output_tokens"] == 8000
+    assert isinstance(args["max_output_tokens"], int)
+    assert args["yield_time_ms"] == 1000
+    assert isinstance(args["yield_time_ms"], int)
+    assert args["login"] is True
+
+    streamed = rewrite_openai_responses_custom_payload(
+        {
+            "type": "response.function_call_arguments.done",
+            "item_id": "fc_exec",
+            "call_id": "call_exec",
+            "arguments": '{"max_output_tokens": 8000.0}',
+        },
+        {"exec_command": "function"},
+    )
+    assert json.loads(streamed["arguments"])["max_output_tokens"] == 8000

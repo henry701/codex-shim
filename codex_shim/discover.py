@@ -105,6 +105,7 @@ OPENROUTER_FREE_TEMPLATE = DiscoverTemplate(
         "X-Title": "codex-shim",
     },
     label_prefix="or",
+    honors_models_dev_sdk=True,
 )
 
 NVIDIA_INTEGRATE_TEMPLATE = DiscoverTemplate(

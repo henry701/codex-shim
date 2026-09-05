@@ -92,7 +92,7 @@ def function_call_item_from_chat_tool(
         "type": "function_call",
         "status": "completed",
         "call_id": call_id,
-        "arguments": fn.get("arguments", ""),
+        "arguments": sanitize_function_call_arguments(fn.get("arguments", "")),
     }
     mcp_parsed = mcp_search.parse_mcp_tool_reference(raw_name)
     if mcp_parsed:
@@ -133,6 +133,35 @@ def responses_tool_type_map(tools: Any) -> dict[str, str]:
 
 
 _CUSTOM_TOOL_INPUT_KEYS = ("input", "patch")
+_JSON_SAFE_INT_ABS_MAX = 2**53
+
+
+def integerize_json_whole_floats(value: Any) -> Any:
+    """Turn `8000.0` into `8000` so Desktop's usize serde does not reject the call."""
+    if isinstance(value, bool) or value is None:
+        return value
+    if isinstance(value, float) and value.is_integer() and abs(value) <= _JSON_SAFE_INT_ABS_MAX:
+        return int(value)
+    if isinstance(value, list):
+        return [integerize_json_whole_floats(item) for item in value]
+    if isinstance(value, dict):
+        return {key: integerize_json_whole_floats(item) for key, item in value.items()}
+    return value
+
+
+def sanitize_function_call_arguments(raw: Any) -> Any:
+    if isinstance(raw, (dict, list)):
+        return json.dumps(integerize_json_whole_floats(raw), ensure_ascii=False)
+    if not isinstance(raw, str):
+        return raw
+    stripped = raw.strip()
+    if not stripped.startswith("{") and not stripped.startswith("["):
+        return raw
+    try:
+        parsed = json.loads(stripped)
+    except json.JSONDecodeError:
+        return raw
+    return json.dumps(integerize_json_whole_floats(parsed), ensure_ascii=False)
 
 
 def unwrap_custom_tool_input(raw: Any) -> str:
@@ -461,7 +490,14 @@ def prepare_codex_byok_responses_body(
 
 
 def tighten_json_schema_required(schema: Any) -> Any:
-    """Make object `required` list every `properties` key (Gemini/OpenAI strict)."""
+    """Align object `required` with `properties` for strict `/v1/responses` hosts.
+
+    Console 400s when a property is listed but omitted from `required`. Promoting
+    optional keys into `required` forced models to emit them, and JSON numbers
+    like `8000.0` then failed Desktop's usize parsers. If `required` is already
+    set, drop properties it did not name. If it is missing, require every
+    remaining property key.
+    """
     if isinstance(schema, list):
         return [tighten_json_schema_required(item) for item in schema]
     if not isinstance(schema, dict):
@@ -488,18 +524,18 @@ def tighten_json_schema_required(schema: Any) -> Any:
         tightened = {
             name: tighten_json_schema_required(prop) for name, prop in properties.items()
         }
-        out["properties"] = tightened
-        seen: list[str] = []
         existing = out.get("required")
-        if isinstance(existing, list):
+        if isinstance(existing, list) and existing:
+            required_keys: list[str] = []
             for item in existing:
                 key = item if isinstance(item, str) else str(item)
-                if key in tightened and key not in seen:
-                    seen.append(key)
-        for key in tightened:
-            if key not in seen:
-                seen.append(key)
-        out["required"] = seen
+                if key in tightened and key not in required_keys:
+                    required_keys.append(key)
+            out["properties"] = {key: tightened[key] for key in required_keys}
+            out["required"] = required_keys
+        else:
+            out["properties"] = tightened
+            out["required"] = list(tightened)
     elif str(out.get("type") or "").strip().lower() == "object" and not isinstance(
         out.get("required"), list
     ):
@@ -659,10 +695,13 @@ def _rewrite_function_call_item(
 ) -> Any:
     if not isinstance(item, dict) or item.get("type") != "function_call":
         return item
-    name = str(item.get("name") or "")
+    out = dict(item)
+    if "arguments" in out:
+        out["arguments"] = sanitize_function_call_arguments(out.get("arguments"))
+    name = str(out.get("name") or "")
     if not _is_custom_responses_tool_name(name, tool_types):
-        return item
-    rewritten = _function_call_to_custom_item(item, in_progress=in_progress)
+        return out
+    rewritten = _function_call_to_custom_item(out, in_progress=in_progress)
     _remember_custom_call_ids(custom_call_ids, rewritten)
     _remember_custom_call_ids(custom_call_ids, item)
     return rewritten
@@ -700,6 +739,8 @@ def rewrite_openai_responses_custom_payload(
             )
             if event_type.endswith(".done") and "arguments" in out:
                 out["input"] = unwrap_custom_tool_input(out.get("arguments"))
+        elif event_type.endswith(".done") and "arguments" in out:
+            out["arguments"] = sanitize_function_call_arguments(out.get("arguments"))
     response = out.get("response")
     if isinstance(response, dict) and isinstance(response.get("output"), list):
         rewritten_response = dict(response)
