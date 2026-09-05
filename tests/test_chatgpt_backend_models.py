@@ -8,21 +8,144 @@ from urllib.error import HTTPError, URLError
 
 import pytest
 
-from codex_shim.catalog_slugs import upstream_from_codex_catalog_slug
+from codex_shim.catalog_slugs import codex_catalog_slug, upstream_from_codex_catalog_slug
 from codex_shim.discover import (
     CHATGPT_CODEX_MODELS_URL,
+    DEFAULT_CHATGPT_CODEX_CLIENT_VERSION,
+    chatgpt_codex_client_version,
+    clear_detected_codex_cli_version,
     fetch_chatgpt_codex_backend_models,
     fetch_http_json,
+    parse_codex_cli_version,
     persist_chatgpt_models_cache,
     refresh_codex_auth_tokens,
 )
-from codex_shim.settings import load_chatgpt_passthrough_catalog_models
+from codex_shim.settings import (
+    FALLBACK_CHATGPT_DISPLAY_NAMES,
+    FALLBACK_CHATGPT_PASSTHROUGH_SLUGS,
+    load_chatgpt_passthrough_catalog_models,
+)
+
+
+def _client_version_parts(version: str) -> tuple[int, ...]:
+    return tuple(int(part) for part in version.split("."))
 
 
 def test_upstream_from_codex_catalog_slug_recovers_dotted_versions():
     assert upstream_from_codex_catalog_slug("codex-gpt-5-6-terra") == "gpt-5.6-terra"
     assert upstream_from_codex_catalog_slug("codex-gpt-5-4-mini") == "gpt-5.4-mini"
     assert upstream_from_codex_catalog_slug("codex-auto-review") == "codex-auto-review"
+
+
+def test_upstream_from_codex_catalog_slug_keeps_gpt_6_astra():
+    assert codex_catalog_slug("gpt-6-astra") == "codex-gpt-6-astra"
+    assert upstream_from_codex_catalog_slug("codex-gpt-6-astra") == "gpt-6-astra"
+
+
+def test_default_chatgpt_codex_client_version_meets_gpt_6_astra_minimum():
+    # Codex /models omits gpt-6-astra below client_version 0.153.0 (row.minimal_client_version).
+    assert _client_version_parts(DEFAULT_CHATGPT_CODEX_CLIENT_VERSION) >= (0, 153, 0)
+
+
+def test_fallback_chatgpt_passthrough_includes_gpt_6_astra():
+    assert "gpt-6-astra" in FALLBACK_CHATGPT_PASSTHROUGH_SLUGS
+    assert FALLBACK_CHATGPT_DISPLAY_NAMES["gpt-6-astra"] == "GPT-6-Astra"
+
+
+@pytest.mark.parametrize(
+    "output, expected",
+    [
+        ("codex-cli 0.153.0", "0.153.0"),
+        ("codex-cli 0.153.0\n", "0.153.0"),
+        ("0.144.1", "0.144.1"),
+        ("codex-cli 0.160.0-alpha.1", "0.160.0-alpha.1"),
+        ("codex 0.200.0 (hash abc)", "0.200.0"),
+        ("not a version", None),
+        ("", None),
+    ],
+)
+def test_parse_codex_cli_version(output, expected):
+    assert parse_codex_cli_version(output) == expected
+
+
+def _stub_codex_cli(monkeypatch, *, path: str | None, stdout: str = "", stderr: str = "", returncode: int = 0):
+    monkeypatch.delenv("CODEX_SHIM_CHATGPT_MODELS_CLIENT_VERSION", raising=False)
+    monkeypatch.setattr(
+        "codex_shim.discover.shutil.which",
+        lambda name: path if name == "codex" else None,
+    )
+    if path is None:
+        def boom(*_args, **_kwargs):
+            raise AssertionError("must not spawn codex when it is missing from PATH")
+
+        monkeypatch.setattr("codex_shim.discover.subprocess.run", boom)
+        return
+
+    class _Result:
+        def __init__(self):
+            self.returncode = returncode
+            self.stdout = stdout
+            self.stderr = stderr
+
+    monkeypatch.setattr("codex_shim.discover.subprocess.run", lambda *_args, **_kwargs: _Result())
+
+
+def test_chatgpt_codex_client_version_uses_installed_cli(monkeypatch):
+    _stub_codex_cli(monkeypatch, path="/usr/bin/codex", stdout="codex-cli 0.160.0\n")
+    clear_detected_codex_cli_version()
+    assert chatgpt_codex_client_version() == "0.160.0"
+
+
+def test_chatgpt_codex_client_version_falls_back_when_codex_missing(monkeypatch):
+    _stub_codex_cli(monkeypatch, path=None)
+    clear_detected_codex_cli_version()
+    assert chatgpt_codex_client_version() == DEFAULT_CHATGPT_CODEX_CLIENT_VERSION
+
+
+def test_chatgpt_codex_client_version_falls_back_when_version_unreadable(monkeypatch):
+    _stub_codex_cli(monkeypatch, path="/usr/bin/codex", stdout="unknown", returncode=1)
+    clear_detected_codex_cli_version()
+    assert chatgpt_codex_client_version() == DEFAULT_CHATGPT_CODEX_CLIENT_VERSION
+
+
+def test_chatgpt_codex_client_version_env_overrides_cli(monkeypatch):
+    monkeypatch.setenv("CODEX_SHIM_CHATGPT_MODELS_CLIENT_VERSION", "0.200.0")
+    monkeypatch.setattr("codex_shim.discover.shutil.which", lambda name: "/usr/bin/codex")
+
+    def boom(*_args, **_kwargs):
+        raise AssertionError("must not spawn codex when CODEX_SHIM_CHATGPT_MODELS_CLIENT_VERSION is set")
+
+    monkeypatch.setattr("codex_shim.discover.subprocess.run", boom)
+    clear_detected_codex_cli_version()
+    assert chatgpt_codex_client_version() == "0.200.0"
+
+
+def test_chatgpt_codex_client_version_explicit_arg_overrides_cli(monkeypatch):
+    _stub_codex_cli(monkeypatch, path="/usr/bin/codex", stdout="codex-cli 0.160.0\n")
+    clear_detected_codex_cli_version()
+    assert chatgpt_codex_client_version(client_version="0.144.1") == "0.144.1"
+
+
+def test_load_chatgpt_maps_gpt_6_astra_catalog_slug(monkeypatch, tmp_path):
+    cache = tmp_path / "models_cache.json"
+    monkeypatch.setattr(
+        "codex_shim.discover.fetch_chatgpt_codex_backend_models",
+        lambda: [
+            {
+                "slug": "gpt-6-astra",
+                "display_name": "GPT-6-Astra",
+                "visibility": "list",
+                "minimal_client_version": "0.153.0",
+                "context_window": 272000,
+            }
+        ],
+    )
+    monkeypatch.setattr("codex_shim.discover.persist_chatgpt_models_cache", lambda *a, **k: None)
+    entries = load_chatgpt_passthrough_catalog_models(cache)
+    by_slug = {entry["slug"]: entry for entry in entries}
+    assert by_slug["codex-gpt-6-astra"]["_upstream_model"] == "gpt-6-astra"
+    assert by_slug["codex-gpt-6-astra"]["display_name"] == "GPT-6-Astra"
+    assert by_slug["codex-gpt-6-astra"]["context_window"] == 272000
 
 
 def test_load_chatgpt_prefers_backend_models_over_cache(monkeypatch, tmp_path):
@@ -301,6 +424,70 @@ def test_fetch_chatgpt_codex_backend_models_builds_url_and_auth(monkeypatch, tmp
     assert headers["ChatGPT-Account-Id"] == "acct-1"
     assert captured["retries"] == 3
     assert [m["slug"] for m in models] == ["gpt-5.6-luna"]
+
+
+def test_fetch_chatgpt_codex_backend_models_defaults_to_astra_capable_client(monkeypatch, tmp_path):
+    auth = tmp_path / "auth.json"
+    auth.write_text(
+        json.dumps(
+            {
+                "tokens": {
+                    "access_token": "tok-abc",
+                    "account_id": "acct-1",
+                }
+            }
+        )
+    )
+    monkeypatch.setattr("codex_shim.settings.DEFAULT_CODEX_AUTH", auth)
+    captured: dict[str, object] = {}
+
+    def fake_fetch(url, *, headers=None, timeout=20.0, retries=3, backoff_base=0.5, backoff_factor=2.0):
+        captured["url"] = url
+        captured["user_agent"] = (headers or {}).get("User-Agent")
+        return {
+            "models": [
+                {"slug": "gpt-6-astra", "display_name": "GPT-6-Astra", "visibility": "list"},
+            ]
+        }
+
+    monkeypatch.setattr("codex_shim.discover.fetch_http_json", fake_fetch)
+    monkeypatch.delenv("CODEX_SHIM_CHATGPT_MODELS_CLIENT_VERSION", raising=False)
+    _stub_codex_cli(monkeypatch, path=None)
+    clear_detected_codex_cli_version()
+    models = fetch_chatgpt_codex_backend_models()
+    assert captured["url"] == f"{CHATGPT_CODEX_MODELS_URL}?client_version={DEFAULT_CHATGPT_CODEX_CLIENT_VERSION}"
+    assert captured["user_agent"] == f"codex_cli_rs/{DEFAULT_CHATGPT_CODEX_CLIENT_VERSION}"
+    assert [m["slug"] for m in models] == ["gpt-6-astra"]
+    assert _client_version_parts(DEFAULT_CHATGPT_CODEX_CLIENT_VERSION) >= (0, 153, 0)
+
+
+def test_fetch_chatgpt_codex_backend_models_uses_installed_cli_version(monkeypatch, tmp_path):
+    auth = tmp_path / "auth.json"
+    auth.write_text(
+        json.dumps(
+            {
+                "tokens": {
+                    "access_token": "tok-abc",
+                    "account_id": "acct-1",
+                }
+            }
+        )
+    )
+    monkeypatch.setattr("codex_shim.settings.DEFAULT_CODEX_AUTH", auth)
+    captured: dict[str, object] = {}
+
+    def fake_fetch(url, *, headers=None, timeout=20.0, retries=3, backoff_base=0.5, backoff_factor=2.0):
+        captured["url"] = url
+        captured["user_agent"] = (headers or {}).get("User-Agent")
+        return {"models": [{"slug": "gpt-6-astra", "display_name": "GPT-6-Astra", "visibility": "list"}]}
+
+    monkeypatch.setattr("codex_shim.discover.fetch_http_json", fake_fetch)
+    _stub_codex_cli(monkeypatch, path="/usr/bin/codex", stdout="codex-cli 0.160.0\n")
+    clear_detected_codex_cli_version()
+    models = fetch_chatgpt_codex_backend_models()
+    assert captured["url"] == f"{CHATGPT_CODEX_MODELS_URL}?client_version=0.160.0"
+    assert captured["user_agent"] == "codex_cli_rs/0.160.0"
+    assert [m["slug"] for m in models] == ["gpt-6-astra"]
 
 
 def test_fetch_chatgpt_codex_backend_models_returns_empty_without_auth(monkeypatch, tmp_path):

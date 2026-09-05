@@ -9,6 +9,11 @@ and this project does not yet follow semantic versioning (pre-1.0).
 
 ### Fixed
 
+- ChatGPT passthrough now lists GPT-6 Astra. Codex `/models` hides it below
+  `client_version` 0.153.0 (`minimal_client_version` on the row). The shim
+  uses `codex --version` from PATH when that binary exists, otherwise the
+  hardcoded 0.153.0 fallback. Fallback slugs include `gpt-6-astra`.
+
 - BYOK native compact now accepts a reasoning-only chat completion as the
   summary (NVIDIA NIM Muse Glimmer returns `reasoning_content` with empty
   `content`). Thinking is ignored when `content` already has a summary.

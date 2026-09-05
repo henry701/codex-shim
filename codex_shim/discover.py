@@ -32,7 +32,10 @@ MODELS_DEV_API_URL = "https://models.dev/api.json"
 MODELS_DEV_OPENCODE_PROVIDER = "opencode"
 OPENAI_MODELS_URL = "https://api.openai.com/v1/models"
 CHATGPT_CODEX_MODELS_URL = "https://chatgpt.com/backend-api/codex/models"
-DEFAULT_CHATGPT_CODEX_CLIENT_VERSION = "0.144.1"
+DEFAULT_CHATGPT_CODEX_CLIENT_VERSION = "0.153.0"
+_CODEX_CLI_VERSION_RE = re.compile(r"(\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.]+)?)")
+_UNSET = object()
+_detected_codex_cli_version: str | None | object = _UNSET
 CODEX_OAUTH_TOKEN_URL = "https://auth.openai.com/oauth/token"
 CODEX_OAUTH_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
 DISCOVER_INDEX_BASE = 10_000
@@ -685,6 +688,62 @@ def refresh_codex_auth_tokens(auth_path: Any | None = None, *, timeout: float = 
     return True
 
 
+def parse_codex_cli_version(output: str) -> str | None:
+    """Extract ``major.minor.patch`` (optional pre-release) from ``codex --version`` text."""
+    text = str(output or "").strip()
+    if not text:
+        return None
+    first = text.splitlines()[0]
+    match = _CODEX_CLI_VERSION_RE.search(first) or _CODEX_CLI_VERSION_RE.search(text)
+    return match.group(1) if match else None
+
+
+def clear_detected_codex_cli_version() -> None:
+    global _detected_codex_cli_version
+    _detected_codex_cli_version = _UNSET
+
+
+def detect_codex_cli_version(*, timeout: float = 5.0) -> str | None:
+    """Return the Codex CLI version from ``codex`` on PATH, or ``None`` if unavailable."""
+    global _detected_codex_cli_version
+    cached = _detected_codex_cli_version
+    if cached is not _UNSET:
+        return cached if isinstance(cached, str) else None
+    binary = shutil.which("codex")
+    if not binary:
+        _detected_codex_cli_version = None
+        return None
+    try:
+        result = subprocess.run(
+            [binary, "--version"],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        _detected_codex_cli_version = None
+        return None
+    parsed = parse_codex_cli_version(f"{result.stdout or ''}\n{result.stderr or ''}")
+    _detected_codex_cli_version = parsed
+    return parsed
+
+
+def chatgpt_codex_client_version(*, client_version: str | None = None) -> str:
+    """``client_version`` for ChatGPT Codex ``/models``.
+
+    Preference: explicit argument, ``CODEX_SHIM_CHATGPT_MODELS_CLIENT_VERSION``,
+    ``codex --version`` on PATH, then ``DEFAULT_CHATGPT_CODEX_CLIENT_VERSION``.
+    """
+    explicit = (client_version or os.environ.get("CODEX_SHIM_CHATGPT_MODELS_CLIENT_VERSION") or "").strip()
+    if explicit:
+        return explicit
+    detected = detect_codex_cli_version()
+    if detected:
+        return detected
+    return DEFAULT_CHATGPT_CODEX_CLIENT_VERSION
+
+
 def persist_chatgpt_models_cache(
     models: list[dict[str, Any]],
     cache_path: Any | None = None,
@@ -697,11 +756,7 @@ def persist_chatgpt_models_cache(
     if not models:
         return None
     path = Path(cache_path if cache_path is not None else DEFAULT_CODEX_MODELS_CACHE).expanduser()
-    version = (
-        client_version
-        or os.environ.get("CODEX_SHIM_CHATGPT_MODELS_CLIENT_VERSION")
-        or DEFAULT_CHATGPT_CODEX_CLIENT_VERSION
-    ).strip()
+    version = chatgpt_codex_client_version(client_version=client_version)
     existing: dict[str, Any] = {}
     if path.exists():
         try:
@@ -780,7 +835,7 @@ def fetch_chatgpt_codex_backend_models(
     if auth is None:
         return []
     access_token, account_id = auth
-    version = (client_version or os.environ.get("CODEX_SHIM_CHATGPT_MODELS_CLIENT_VERSION") or DEFAULT_CHATGPT_CODEX_CLIENT_VERSION).strip()
+    version = chatgpt_codex_client_version(client_version=client_version)
     url = f"{CHATGPT_CODEX_MODELS_URL}?client_version={version}"
     headers = _chatgpt_codex_models_headers(access_token, account_id, version)
     try:

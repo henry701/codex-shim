@@ -73,13 +73,19 @@ def _reset_nous_oauth_startup_state():
 
 @pytest.fixture(autouse=True)
 def _clear_opencode_cli_models_cache():
-    from codex_shim.discover import clear_models_dev_catalog_cache, clear_opencode_cli_models_cache
+    from codex_shim.discover import (
+        clear_detected_codex_cli_version,
+        clear_models_dev_catalog_cache,
+        clear_opencode_cli_models_cache,
+    )
 
     clear_opencode_cli_models_cache()
     clear_models_dev_catalog_cache()
+    clear_detected_codex_cli_version()
     yield
     clear_opencode_cli_models_cache()
     clear_models_dev_catalog_cache()
+    clear_detected_codex_cli_version()
 
 
 @pytest.fixture(autouse=True)

@@ -24,6 +24,7 @@ PROVIDER_NAME = "codex_shim"
 OPENAI_PROVIDER_ID = "openai"
 CHATGPT_MODEL_SLUG = CHATGPT_UPSTREAM_DEFAULT
 FALLBACK_CHATGPT_PASSTHROUGH_SLUGS = (
+    "gpt-6-astra",
     "gpt-5.6-terra",
     "gpt-5.6-sol",
     "gpt-5.6-luna",
@@ -36,6 +37,7 @@ FALLBACK_CHATGPT_PASSTHROUGH_SLUGS = (
     "codex-auto-review",
 )
 FALLBACK_CHATGPT_DISPLAY_NAMES = {
+    "gpt-6-astra": "GPT-6-Astra",
     "gpt-5.6-terra": "GPT-5.6-Terra",
     "gpt-5.6-sol": "GPT-5.6-Sol",
     "gpt-5.6-luna": "GPT-5.6-Luna",
