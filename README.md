@@ -510,6 +510,13 @@ Supported `provider` values:
 | `generic-chat-completion-api` | OpenAI-shaped chat completions |
 | `anthropic` | Anthropic `/v1/messages` |
 
+Discovery sets `openai-responses` when a host honors models.dev SDK npm
+(`honors_models_dev_sdk`; OpenCode Zen does) and the row is `@ai-sdk/openai`.
+`@ai-sdk/openai-compatible` stays on chat completions. OpenRouter / NVIDIA /
+Nous stay on chat even if npm says `@ai-sdk/openai`. BYOK openai-responses
+passthrough coerces Codex `custom` grammar tools to functions and fills JSON
+Schema `required` — that is host behavior, not a single model id.
+
 Namespace tools (`type: "namespace"` in Responses requests, including
 `multi_agent_v1` / multi-agent V2) are expanded to dotted chat names
 (`namespace.tool`) on BYOK chat/anthropic routes and split back into

@@ -16,8 +16,10 @@ from codex_shim.discover import (
     fetch_openrouter_free_model_ids,
     is_local_base_url,
     merge_discovered_models,
+    provider_for_discovered_model,
     refresh_local_explicit_models,
     OPENROUTER_FREE_TEMPLATE,
+    ZEN_PAID_TEMPLATE,
 )
 from codex_shim.settings import ModelSettings, ShimModel, load_chatgpt_passthrough_catalog_models
 
@@ -207,6 +209,25 @@ def test_enrich_builtin_template_uses_explicit_openrouter_credentials():
     assert enriched.api_key == "or-key-from-config"
     assert enriched.extra_headers["X-Custom"] == "1"
     assert enriched.extra_headers["HTTP-Referer"] == "https://opencode.ai/"
+
+
+def test_enrich_zen_template_keeps_models_dev_sdk_routing():
+    explicit = [
+        ShimModel(
+            slug="zen-gpt-5-4",
+            model="gpt-5.4",
+            display_name="Zen GPT",
+            provider="generic-chat-completion-api",
+            base_url="https://opencode.ai/zen/v1",
+            api_key="zen-live-key",
+        )
+    ]
+    enriched = _enrich_builtin_template(ZEN_PAID_TEMPLATE, explicit)
+    assert enriched.api_key == "zen-live-key"
+    assert (
+        provider_for_discovered_model(enriched, {"sdk_npm": "@ai-sdk/openai"})
+        == "openai-responses"
+    )
 
 
 def test_resolved_api_key_expands_env_placeholder(monkeypatch):

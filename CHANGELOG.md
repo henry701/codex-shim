@@ -14,24 +14,23 @@ and this project does not yet follow semantic versioning (pre-1.0).
   uses `codex --version` from PATH when that binary exists, otherwise the
   hardcoded 0.153.0 fallback. Fallback slugs include `gpt-6-astra`.
 
-- OpenCode Console rejects Codex `type: custom` grammar tools (`apply_patch`
-  Lark). Muse Spark on Zen is Responses + function tools, the same as
-  OpenCode itself. openai-responses passthrough now advertises those as
-  functions and maps `function_call` apply_patch events back to
-  `custom_tool_call` for Desktop.
+- OpenCode Console and other non-Codex `/v1/responses` hosts reject Codex
+  `type: custom` grammar tools (`apply_patch` Lark). BYOK openai-responses
+  passthrough advertises those as functions and maps `function_call`
+  apply_patch events back to `custom_tool_call` for Desktop.
 
-- OpenCode Console rejects Codex tool schemas that list optional keys in
-  `properties` but omit them from `required` (Muse Spark: Missing 'limit' on
-  `tool_search` / `list_threads`). openai-responses passthrough now fills
-  `required` with every property key, including nested objects and namespace
-  tools, before `/responses`.
+- The same hosts reject tool schemas that list keys in `properties` but omit
+  them from `required` (reproduced as Missing 'limit' on `tool_search` /
+  `list_threads`). openai-responses passthrough fills `required` with every
+  property key, including nested objects and namespace tools, before
+  `/responses`.
 
-- OpenCode Zen models whose models.dev SDK is `@ai-sdk/openai` (Muse Spark
-  free/paid) now route through `/v1/responses`. Discovery was copying the Zen
-  template's `generic-chat-completion-api` provider, so Desktop turned Muse
-  into `/chat/completions` and Zen returned 500 Internal server error.
-  `@ai-sdk/openai-compatible` rows such as `big-pickle` stay on chat
-  completions. OpenRouter is unchanged even when npm is `@ai-sdk/openai`.
+- Discovery routes a model to `/v1/responses` when the host honors models.dev
+  SDK npm (`honors_models_dev_sdk`, OpenCode Zen today) and the row is
+  `@ai-sdk/openai`. `@ai-sdk/openai-compatible` stays on chat completions.
+  Chat-only aggregators (OpenRouter, NVIDIA NIM, Nous) keep chat even when
+  npm is `@ai-sdk/openai`. Copying the template's chat provider made Zen
+  Responses models 500.
 
 - BYOK native compact now accepts a reasoning-only chat completion as the
   summary (NVIDIA NIM Muse Glimmer returns `reasoning_content` with empty

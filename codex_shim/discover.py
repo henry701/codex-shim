@@ -59,6 +59,8 @@ class DiscoverTemplate:
     api_key: str
     extra_headers: dict[str, str]
     label_prefix: str | None = None
+    # Host exposes /chat/completions vs /responses according to models.dev npm.
+    honors_models_dev_sdk: bool = False
 
 
 @dataclass(frozen=True)
@@ -78,6 +80,7 @@ ZEN_PUBLIC_TEMPLATE = DiscoverTemplate(
         "X-Title": "Hermes Agent",
     },
     label_prefix="oc-free",
+    honors_models_dev_sdk=True,
 )
 
 ZEN_PAID_TEMPLATE = DiscoverTemplate(
@@ -88,6 +91,7 @@ ZEN_PAID_TEMPLATE = DiscoverTemplate(
     api_key="${OPENCODE_API_KEY}",
     extra_headers={},
     label_prefix="zen",
+    honors_models_dev_sdk=True,
 )
 
 OPENROUTER_FREE_TEMPLATE = DiscoverTemplate(
@@ -283,8 +287,12 @@ def _efforts_from_models_dev_row(row: dict[str, Any]) -> list[str]:
     return _unique_strings([item for item in efforts if item])
 
 
-_ZEN_DISCOVER_KINDS = frozenset({"zen", "zen_public"})
 _OPENAI_RESPONSES_SDK_NPM = "@ai-sdk/openai"
+
+
+def sdk_npm_implies_openai_responses(npm: str | None) -> bool:
+    """`@ai-sdk/openai` speaks /v1/responses; `@ai-sdk/openai-compatible` is chat."""
+    return str(npm or "").strip().lower() == _OPENAI_RESPONSES_SDK_NPM
 
 
 def _sdk_npm_from_models_dev_row(row: dict[str, Any]) -> str:
@@ -298,9 +306,8 @@ def _sdk_npm_from_models_dev_row(row: dict[str, Any]) -> str:
 
 
 def provider_for_discovered_model(template: DiscoverTemplate, meta: dict[str, Any]) -> str:
-    """Zen `@ai-sdk/openai` models speak Responses natively; chat-completions 500s."""
-    npm = str(meta.get("sdk_npm") or "").strip().lower()
-    if template.kind in _ZEN_DISCOVER_KINDS and npm == _OPENAI_RESPONSES_SDK_NPM:
+    """Route by models.dev SDK when the host honors that npm mapping."""
+    if template.honors_models_dev_sdk and sdk_npm_implies_openai_responses(meta.get("sdk_npm")):
         return "openai-responses"
     return template.provider
 
@@ -1318,14 +1325,10 @@ def _enrich_builtin_template(template: DiscoverTemplate, explicit_models: list[S
             continue
         if template.kind == "zen" and _resolved_api_key(model.api_key) in {"", KEYLESS_API_KEY}:
             continue
-        return DiscoverTemplate(
-            kind=template.kind,
-            base_url=template.base_url,
-            provider=template.provider,
-            slug_prefix=template.slug_prefix,
+        return replace(
+            template,
             api_key=model.api_key or template.api_key,
             extra_headers={**template.extra_headers, **model.extra_headers},
-            label_prefix=template.label_prefix,
         )
     return template
 

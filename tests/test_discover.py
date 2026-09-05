@@ -4,6 +4,8 @@ import json
 
 import pytest
 
+from dataclasses import replace
+
 from codex_shim.discover import (
     LocalModelRecord,
     NOUS_PORTAL_TEMPLATE,
@@ -11,6 +13,7 @@ from codex_shim.discover import (
     OPENROUTER_FREE_TEMPLATE,
     ZEN_PAID_TEMPLATE,
     ZEN_PUBLIC_TEMPLATE,
+    provider_for_discovered_model,
     _catalog_slug_for_model,
     _parse_models_dev_opencode_free_ids,
     _parse_models_dev_opencode_paid_ids,
@@ -458,6 +461,28 @@ def _models_dev_catalog() -> dict:
                     "limit": {"context": 131_072, "output": 8_192},
                     "modalities": {"input": ["text"], "output": ["text"]},
                 },
+                "grok-4.6": {
+                    "id": "grok-4.6",
+                    "name": "Grok 4.6",
+                    "provider": {"npm": "@ai-sdk/openai"},
+                    "reasoning": True,
+                    "limit": {"context": 200_000, "output": 32_000},
+                    "modalities": {"input": ["text"], "output": ["text"]},
+                },
+                "gpt-5.4": {
+                    "id": "gpt-5.4",
+                    "name": "GPT 5.4",
+                    "provider": {"npm": "@ai-sdk/openai"},
+                    "limit": {"context": 272_000, "output": 128_000},
+                    "modalities": {"input": ["text"], "output": ["text"]},
+                },
+                "new-console-model": {
+                    "id": "new-console-model",
+                    "name": "New Console Model",
+                    "api": {"npm": "@ai-sdk/openai"},
+                    "limit": {"context": 128_000, "output": 16_000},
+                    "modalities": {"input": ["text"], "output": ["text"]},
+                },
             }
         },
         "openrouter": {
@@ -503,7 +528,14 @@ def _models_dev_catalog() -> dict:
                     "limit": {"context": 131_072, "output": 65_536},
                     "modalities": {"input": ["text"], "output": ["text"]},
                     "attachment": False,
-                }
+                },
+                "nvidia/responses-looking-chat-only": {
+                    "id": "nvidia/responses-looking-chat-only",
+                    "name": "NIM row that advertises the OpenAI SDK",
+                    "provider": {"npm": "@ai-sdk/openai"},
+                    "limit": {"context": 131_072, "output": 8_192},
+                    "modalities": {"input": ["text"], "output": ["text"]},
+                },
             }
         },
     }
@@ -513,7 +545,7 @@ def test_metadata_from_models_dev_row_captures_openai_sdk_npm():
     from codex_shim.discover import metadata_from_models_dev_row
 
     meta = metadata_from_models_dev_row(
-        _models_dev_catalog()["opencode"]["models"]["muse-spark-1.3-contributor-free"]
+        _models_dev_catalog()["opencode"]["models"]["grok-4.6"]
     )
     assert meta["sdk_npm"] == "@ai-sdk/openai"
 
@@ -522,39 +554,69 @@ def test_metadata_from_models_dev_row_captures_api_npm():
     from codex_shim.discover import metadata_from_models_dev_row
 
     meta = metadata_from_models_dev_row(
-        _models_dev_catalog()["opencode"]["models"]["muse-spark-1.2"]
+        _models_dev_catalog()["opencode"]["models"]["new-console-model"]
     )
     assert meta["sdk_npm"] == "@ai-sdk/openai"
 
 
-def test_discovered_zen_openai_sdk_models_use_responses_api(monkeypatch):
+def test_provider_follows_models_dev_sdk_not_model_id():
+    responses = {"sdk_npm": "@ai-sdk/openai"}
+    compatible = {"sdk_npm": "@ai-sdk/openai-compatible"}
+    assert provider_for_discovered_model(ZEN_PUBLIC_TEMPLATE, responses) == "openai-responses"
+    assert provider_for_discovered_model(ZEN_PAID_TEMPLATE, responses) == "openai-responses"
+    assert provider_for_discovered_model(ZEN_PUBLIC_TEMPLATE, compatible) == "generic-chat-completion-api"
+    assert provider_for_discovered_model(OPENROUTER_FREE_TEMPLATE, responses) == "generic-chat-completion-api"
+    assert provider_for_discovered_model(NVIDIA_INTEGRATE_TEMPLATE, responses) == "generic-chat-completion-api"
+    assert provider_for_discovered_model(NOUS_PORTAL_TEMPLATE, responses) == "generic-chat-completion-api"
+
+
+def test_host_that_honors_models_dev_sdk_is_not_tied_to_zen_kind():
+    """Same SDK characteristic on any host that opts in, not only kind=zen."""
+    acme = replace(ZEN_PUBLIC_TEMPLATE, kind="acme_console", base_url="https://acme.test/v1")
+    assert provider_for_discovered_model(acme, {"sdk_npm": "@ai-sdk/openai"}) == "openai-responses"
+    assert (
+        provider_for_discovered_model(acme, {"sdk_npm": "@ai-sdk/openai-compatible"})
+        == "generic-chat-completion-api"
+    )
+
+
+def test_discovered_openai_sdk_models_use_responses_api(monkeypatch):
     monkeypatch.setattr(
         "codex_shim.discover.fetch_models_dev_catalog",
         lambda: _models_dev_catalog(),
         raising=False,
     )
     models = _rows_to_shim_models(
-        ["big-pickle", "muse-spark-1.3-contributor-free"],
+        [
+            "big-pickle",
+            "muse-spark-1.3-contributor-free",
+            "grok-4.6",
+            "new-console-model",
+        ],
         ZEN_PUBLIC_TEMPLATE,
     )
     by_id = {model.model: model for model in models}
-    muse = by_id["muse-spark-1.3-contributor-free"]
+    for model_id in ("muse-spark-1.3-contributor-free", "grok-4.6", "new-console-model"):
+        route = by_id[model_id]
+        assert route.provider == "openai-responses", model_id
+        assert route.is_openai_responses
     pickle = by_id["big-pickle"]
-    assert muse.provider == "openai-responses"
-    assert muse.is_openai_responses
     assert pickle.provider == "generic-chat-completion-api"
     assert pickle.is_openai_chat
 
 
-def test_discovered_zen_paid_openai_sdk_models_use_responses_api(monkeypatch):
+def test_discovered_paid_openai_sdk_models_use_responses_api(monkeypatch):
     monkeypatch.setattr(
         "codex_shim.discover.fetch_models_dev_catalog",
         lambda: _models_dev_catalog(),
         raising=False,
     )
-    route = _rows_to_shim_models(["muse-spark-1.2"], ZEN_PAID_TEMPLATE)[0]
-    assert route.provider == "openai-responses"
-    assert route.is_openai_responses
+    models = _rows_to_shim_models(["muse-spark-1.2", "gpt-5.4"], ZEN_PAID_TEMPLATE)
+    by_id = {model.model: model for model in models}
+    for model_id in ("muse-spark-1.2", "gpt-5.4"):
+        route = by_id[model_id]
+        assert route.provider == "openai-responses", model_id
+        assert route.is_openai_responses
 
 
 def test_discovered_openrouter_openai_sdk_stays_chat_completions(monkeypatch):
@@ -564,6 +626,20 @@ def test_discovered_openrouter_openai_sdk_stays_chat_completions(monkeypatch):
         raising=False,
     )
     route = _rows_to_shim_models(["openrouter/muse-spark"], OPENROUTER_FREE_TEMPLATE)[0]
+    assert route.provider == "generic-chat-completion-api"
+    assert route.is_openai_chat
+
+
+def test_discovered_nvidia_openai_sdk_stays_chat_completions(monkeypatch):
+    monkeypatch.setattr(
+        "codex_shim.discover.fetch_models_dev_catalog",
+        lambda: _models_dev_catalog(),
+        raising=False,
+    )
+    route = _rows_to_shim_models(
+        ["nvidia/responses-looking-chat-only"],
+        NVIDIA_INTEGRATE_TEMPLATE,
+    )[0]
     assert route.provider == "generic-chat-completion-api"
     assert route.is_openai_chat
 

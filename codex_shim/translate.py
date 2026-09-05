@@ -610,7 +610,12 @@ def _coerce_custom_input_item(item: Any) -> Any:
 
 
 def prepare_openai_responses_upstream_body(body: dict[str, Any]) -> dict[str, Any]:
-    """Zen/Muse reject Codex `custom` grammar tools; send functions + strict schemas."""
+    """Adapt Codex Desktop payloads for non-Codex `/v1/responses` hosts.
+
+    Those hosts reject `type: custom` grammar tools and object schemas that
+    list keys in `properties` but omit them from `required`. Applies to every
+    BYOK openai-responses route; ChatGPT Codex passthrough does not use this.
+    """
     prepared = dict(body)
     tools = prepared.get("tools")
     if isinstance(tools, list):
@@ -669,7 +674,7 @@ def rewrite_openai_responses_custom_payload(
     *,
     custom_call_ids: set[str] | None = None,
 ) -> dict[str, Any]:
-    """Map Muse function_call apply_patch events back to Codex custom_tool_call."""
+    """Map function_call apply_patch events back to Codex custom_tool_call."""
     out = dict(payload)
     event_type = str(out.get("type") or "")
     item = out.get("item")

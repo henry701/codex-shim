@@ -1020,7 +1020,7 @@ def test_openai_responses_tool_schemas_require_every_property_key():
     from codex_shim.translate import prepare_openai_responses_tool_schemas
 
     body = {
-        "model": "muse-spark-1.3-contributor-free",
+        "model": "any-responses-model",
         "tools": [
             {
                 "type": "function",
@@ -1091,6 +1091,30 @@ def test_openai_responses_tool_schemas_require_every_property_key():
     assert tools["list_projects"]["parameters"]["required"] == []
 
 
+def test_openai_responses_coercion_ignores_upstream_model_id():
+    from copy import deepcopy
+
+    from codex_shim.translate import prepare_openai_responses_upstream_body
+
+    tools = [
+        {
+            "type": "custom",
+            "name": "apply_patch",
+            "description": "FREEFORM",
+            "format": {"type": "grammar", "syntax": "lark", "definition": "start: x"},
+        }
+    ]
+    first = prepare_openai_responses_upstream_body({"model": "grok-4.6", "tools": deepcopy(tools)})
+    second = prepare_openai_responses_upstream_body(
+        {"model": "brand-new-console-model", "tools": deepcopy(tools)}
+    )
+    for out in (first, second):
+        patch = out["tools"][0]
+        assert patch["type"] == "function"
+        assert patch["name"] == "apply_patch"
+        assert patch["parameters"]["required"] == ["input"]
+
+
 def test_openai_responses_tool_schemas_tighten_nested_object_properties():
     from codex_shim.translate import prepare_openai_responses_tool_schemas
 
@@ -1129,7 +1153,7 @@ def test_openai_responses_converts_custom_apply_patch_to_function():
     from codex_shim.translate import prepare_openai_responses_upstream_body
 
     body = {
-        "model": "muse-spark-1.3-contributor-free",
+        "model": "any-responses-model",
         "tools": [
             {
                 "type": "custom",
