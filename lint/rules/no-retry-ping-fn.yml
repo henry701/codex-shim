@@ -1,0 +1,14 @@
+id: no-retry-ping-fn
+language: python
+severity: error
+message: Keepalives belong on DownstreamPinger, not retry/throttle (no ping_fn=).
+rule:
+  any:
+    - pattern: |
+        async def $FUNC($$$ARGS, ping_fn=$X, $$$REST):
+          $$$BODY
+    - pattern: |
+        def $FUNC($$$ARGS, ping_fn=$X, $$$REST):
+          $$$BODY
+files:
+  - "codex_shim/**/*.py"

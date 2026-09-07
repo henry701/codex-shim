@@ -21,6 +21,7 @@ from codex_shim.server import ShimServer
         ("attacker.example", "attacker.example"),
         ("", ""),
         ("  127.0.0.1:8765  ", "127.0.0.1"),
+        ("[::1", "[::1"),
     ],
 )
 def test_host_only_strips_port(header, expected):

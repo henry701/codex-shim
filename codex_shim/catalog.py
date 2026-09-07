@@ -285,14 +285,6 @@ def chatgpt_passthrough_entries(*, context_settings: CatalogContextSettings | No
     return entries
 
 
-def chatgpt_passthrough_entry() -> dict:
-    """Catalog entry for the default GPT-5.5 ChatGPT passthrough model."""
-    for entry in chatgpt_passthrough_entries():
-        if entry.get("slug") == CHATGPT_CATALOG_SLUG:
-            return entry
-    return chatgpt_passthrough_entries()[0]
-
-
 def write_catalog(
     models: list[ShimModel],
     path: Path,

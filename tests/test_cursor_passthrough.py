@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 
 from codex_shim.cursor_passthrough import (
     CursorCatalogModel,
     CursorResponseCollector,
     CursorStreamParser,
+    _extract_cursor_thinking_text,
+    _message_content,
     _parse_cursor_list_models_output,
     build_cursor_prompt,
     cursor_catalog_entry,
@@ -442,3 +445,80 @@ def test_cursor_prompt_carries_spawned_sub_agent_task():
     assert "smoke-fix-v2.md" in prompt
     assert "agent message from /root to /root/smoke_timeline_fix" in prompt
     assert prompt != "Continue."
+
+
+def test_message_content_flattens_text_and_omits_images():
+    assert _message_content({"content": "plain <think>hidden</think> visible"}) == "plain  visible"
+    assert _message_content({"content": 12}) == ""
+    text = _message_content(
+        {
+            "content": [
+                "hello",
+                {"type": "text", "text": " world"},
+                {"type": "input_image", "image_url": "https://example.invalid/x.png"},
+                {"type": "output_text", "text": ""},
+            ]
+        }
+    )
+    assert "hello" in text
+    assert "world" in text
+    assert "[image omitted for cursor-agent bridge]" in text
+
+
+def test_extract_cursor_thinking_text_from_message_and_keys():
+    assert _extract_cursor_thinking_text({"message": "nope"}) == ""
+    assert (
+        _extract_cursor_thinking_text(
+            {"message": {"content": [{"type": "text", "text": "plan A"}]}}
+        )
+        == "plan A"
+    )
+    assert _extract_cursor_thinking_text({"thinking": "plan B"}) == "plan B"
+    assert _extract_cursor_thinking_text({"text": ""}) == ""
+
+
+def test_probe_cursor_auth_env_and_status(monkeypatch):
+    from subprocess import TimeoutExpired
+
+    from codex_shim.cursor_passthrough import _probe_cursor_auth
+
+    monkeypatch.setenv("CODEX_SHIM_DISABLE_CURSOR", "1")
+    assert _probe_cursor_auth() is False
+    monkeypatch.delenv("CODEX_SHIM_DISABLE_CURSOR")
+    monkeypatch.delenv("CURSOR_AGENT_BIN", raising=False)
+    monkeypatch.setattr("codex_shim.cursor_passthrough.shutil.which", lambda name: None)
+    assert _probe_cursor_auth() is False
+
+    monkeypatch.setenv("CURSOR_AGENT_BIN", "/tmp/cursor-agent")
+
+    def boom(*args, **kwargs):
+        raise TimeoutExpired(cmd="cursor-agent", timeout=15)
+
+    monkeypatch.setattr("codex_shim.cursor_passthrough.subprocess.run", boom)
+    assert _probe_cursor_auth() is False
+
+    monkeypatch.setattr(
+        "codex_shim.cursor_passthrough.subprocess.run",
+        lambda *args, **kwargs: SimpleNamespace(stdout="not authenticated", stderr=""),
+    )
+    assert _probe_cursor_auth() is False
+
+    monkeypatch.setattr(
+        "codex_shim.cursor_passthrough.subprocess.run",
+        lambda *args, **kwargs: SimpleNamespace(stdout="Logged in as henry", stderr=""),
+    )
+    assert _probe_cursor_auth() is True
+
+
+def test_cursor_tool_result_text_walks_nested_keys():
+    from codex_shim.cursor_passthrough import _cursor_tool_result_text
+
+    empty = _cursor_tool_result_text({"weirdToolCall": {"result": {}}})
+    assert empty == ""
+    nested = _cursor_tool_result_text(
+        {
+            "weirdToolCall": {"result": {}},
+            "other": {"result": {"text": "from-other-key"}},
+        }
+    )
+    assert "from-other-key" in nested

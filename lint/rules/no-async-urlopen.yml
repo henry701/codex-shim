@@ -1,0 +1,13 @@
+id: no-async-urlopen
+language: python
+severity: error
+message: urlopen in async def blocks the aiohttp loop; use asyncio.to_thread.
+rule:
+  pattern: |
+    async def $FUNC($$$ARGS):
+      $$$BODY
+  has:
+    pattern: urllib.request.urlopen($$$A)
+    stopBy: end
+files:
+  - "codex_shim/**/*.py"

@@ -55,6 +55,29 @@ def compaction_input_item_ref(index: int, raw: dict[str, Any]) -> CompactionInpu
     )
 
 
+def summarize_compaction_input_item_types(input_items: Any) -> list[str]:
+    """Compact type labels for IO traces (full list, not a tail window)."""
+    if not isinstance(input_items, list):
+        return []
+    summary: list[str] = []
+    for item in input_items:
+        if not isinstance(item, dict):
+            summary.append("?")
+            continue
+        item_type = str(item.get("type") or item.get("role") or "?")
+        extra = ""
+        if item_type == "function_call":
+            extra = f" name={item.get('name', '?')!r}"
+        elif item_type == "function_call_output":
+            extra = f" call_id={str(item.get('call_id', ''))[:24]!r}"
+        elif item_type == "message":
+            role = item.get("role")
+            if role:
+                extra = f" role={role!r}"
+        summary.append(f"{item_type}{extra}")
+    return summary
+
+
 def summarize_compaction_input_items(
     input_items: list[Any],
     *,

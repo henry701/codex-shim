@@ -1364,13 +1364,6 @@ def _context_from_model_row(row: dict[str, Any]) -> int | None:
     return None
 
 
-def _infer_slug_prefix(slug: str, *, default: str) -> str:
-    if "-" not in slug:
-        return default
-    prefix = slug.split("-", 1)[0]
-    return prefix or default
-
-
 def discover_summary(
     explicit_models: list[ShimModel],
     *,

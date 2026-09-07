@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import inspect
 import json
 import os
 import random
@@ -24,8 +23,9 @@ from .errors import (
     is_retryable_exception,
     is_retryable_status,
     parse_resets_in_seconds,
+    throttle_match_cause,
 )
-from .sse import ClientDisconnected, keepalive_interval
+from .sse import ClientDisconnected
 
 DEFAULT_ATTEMPTS = 3
 DEFAULT_BACKOFF_BASE = 0.5
@@ -42,7 +42,6 @@ _MAX_ORIGIN_EXPONENT = 16
 
 ClassifyFn = Callable[..., bool]
 DisconnectFn = Callable[[], bool]
-PingFn = Callable[[], Any]
 
 
 def _env_int(name: str, default: int) -> int:
@@ -181,14 +180,12 @@ class _RetryState:
 
 
 @dataclass
-class OriginBackoff:
+class RequestThrottle:
+    """Backoff clock for one HTTP request or one WS connection. Never shared."""
+
     exponent: int = 0
     last_delay: float = 0.0
-    not_before: float = 0.0
     kind: str = THROTTLE_NONE
-
-
-_ORIGIN_BACKOFF: dict[str, OriginBackoff] = {}
 
 
 def origin_key(url: str) -> str:
@@ -202,14 +199,6 @@ def origin_key(url: str) -> str:
     return f"{scheme}://{netloc}"
 
 
-def reset_origin_backoff() -> None:
-    _ORIGIN_BACKOFF.clear()
-
-
-def get_origin_backoff(url: str) -> OriginBackoff | None:
-    return _ORIGIN_BACKOFF.get(origin_key(url))
-
-
 def _cap_exponent(policy: RetryPolicy) -> int:
     floor = max(policy.rate_limit_min, 1e-9)
     ceiling = max(policy.rate_limit_max, floor)
@@ -221,38 +210,14 @@ def _cap_exponent(policy: RetryPolicy) -> int:
     return exponent
 
 
-def configure_origin_backoff(
-    url: str,
-    *,
-    delay: float,
-    kind: str = THROTTLE_RATE_LIMIT,
-    exponent: int | None = None,
-) -> None:
-    key = origin_key(url)
-    if exponent is None:
-        exponent = 1 if kind == THROTTLE_RATE_LIMIT else _cap_exponent(RetryPolicy())
-    _ORIGIN_BACKOFF[key] = OriginBackoff(
-        exponent=max(0, int(exponent)),
-        last_delay=float(delay),
-        not_before=time.monotonic() + float(delay),
-        kind=kind,
-    )
-
-
-def mark_origin_success(url: str) -> None:
-    _ORIGIN_BACKOFF[origin_key(url)] = OriginBackoff()
-
-
-def note_origin_failure(
-    url: str,
+def next_throttle_delay(
+    state: RequestThrottle,
     kind: str,
     policy: RetryPolicy,
     *,
     retry_after: float | None = None,
     resets_in_seconds: float | None = None,
 ) -> float:
-    key = origin_key(url)
-    state = _ORIGIN_BACKOFF.get(key) or OriginBackoff()
     if kind == THROTTLE_QUOTA:
         raw = policy.rate_limit_max if resets_in_seconds is None else float(resets_in_seconds)
         delay = _clamp(raw, policy.rate_limit_min, policy.rate_limit_max)
@@ -262,12 +227,14 @@ def note_origin_failure(
         exponential = policy.rate_limit_min * (2 ** max(0, state.exponent))
         raw = max(exponential, retry_after or 0.0)
         delay = _clamp(raw, policy.rate_limit_min, policy.rate_limit_max)
-        delay = _apply_jitter(delay, policy.rate_limit_jitter)
+        delay = _clamp(
+            _apply_jitter(delay, policy.rate_limit_jitter),
+            policy.rate_limit_min,
+            policy.rate_limit_max,
+        )
         state.kind = THROTTLE_RATE_LIMIT
         state.exponent = min(state.exponent + 1, _MAX_ORIGIN_EXPONENT)
     state.last_delay = delay
-    state.not_before = time.monotonic() + delay
-    _ORIGIN_BACKOFF[key] = state
     return delay
 
 
@@ -277,13 +244,19 @@ def log_throttle(
     kind: str,
     wait: float,
     exponent: int,
-    http_gate: bool,
+    scope: str,
+    request: Any = None,
     ws_session: Any = None,
+    cause: str | None = None,
 ) -> None:
-    extra = f" ws_session={ws_session}" if ws_session is not None else ""
+    extra = f" request={request}" if request is not None else ""
+    if ws_session is not None:
+        extra += f" ws_session={ws_session}"
+    if cause:
+        extra += f" cause={cause}"
     print(
         f"[throttle] origin={origin} class={kind} wait={wait:.1f}s "
-        f"exponent={exponent} http_gate={int(http_gate)}{extra}",
+        f"exponent={exponent} scope={scope}{extra}",
         flush=True,
     )
 
@@ -315,12 +288,12 @@ def _endless_kind(kind: str, policy: RetryPolicy) -> bool:
     return policy.attempts > 1 and kind in {THROTTLE_RATE_LIMIT, THROTTLE_QUOTA}
 
 
-async def _maybe_ping(ping_fn: PingFn | None) -> None:
-    if ping_fn is None:
-        return
-    result = ping_fn()
-    if inspect.isawaitable(result):
-        await result
+def _on_running_event_loop() -> bool:
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return False
+    return True
 
 
 async def throttle_sleep(
@@ -328,114 +301,44 @@ async def throttle_sleep(
     *,
     origin: str = "",
     disconnect_fn: DisconnectFn | None = None,
-    ping_fn: PingFn | None = None,
-    keepalive: float | None = None,
 ) -> None:
     if disconnect_fn is not None and disconnect_fn():
         _give_up(origin)
         raise ClientDisconnected()
     if delay <= 0:
         return
-    chunked = ping_fn is not None or disconnect_fn is not None
-    if not chunked:
+    if disconnect_fn is None:
         await asyncio.sleep(delay)
-        if disconnect_fn is not None and disconnect_fn():
-            _give_up(origin)
-            raise ClientDisconnected()
         return
-    interval = keepalive_interval(keepalive)
     remaining = delay
     while remaining > 0:
-        if disconnect_fn is not None and disconnect_fn():
+        if disconnect_fn():
             _give_up(origin)
             raise ClientDisconnected()
-        chunk = min(remaining, interval)
+        chunk = min(remaining, 1.0)
         try:
             await asyncio.sleep(chunk)
         except asyncio.CancelledError:
             _give_up(origin, "cancelled")
             raise
         remaining -= chunk
-        if remaining > 0:
-            try:
-                await _maybe_ping(ping_fn)
-            except ClientDisconnected:
-                _give_up(origin)
-                raise
-            except asyncio.CancelledError:
-                _give_up(origin, "cancelled")
-                raise
 
 
 def throttle_sleep_sync(
     delay: float,
     sleep_fn: Callable[[float], None] | None = None,
 ) -> None:
-    if delay > 0:
-        (sleep_fn or time.sleep)(delay)
-
-
-async def wait_http_origin_gate(
-    url: str,
-    policy: RetryPolicy,
-    *,
-    disconnect_fn: DisconnectFn | None = None,
-    ping_fn: PingFn | None = None,
-    keepalive: float | None = None,
-    label: str = "",
-) -> None:
-    del label
-    if policy.attempts <= 1:
+    if delay <= 0:
         return
-    key = origin_key(url)
-    state = _ORIGIN_BACKOFF.get(key)
-    if state is None or state.not_before <= 0:
+    if sleep_fn is not None:
+        sleep_fn(delay)
         return
-    remaining = state.not_before - time.monotonic()
-    if remaining <= 0:
-        return
-    log_throttle(
-        origin=key,
-        kind=state.kind or THROTTLE_RATE_LIMIT,
-        wait=remaining,
-        exponent=state.exponent,
-        http_gate=True,
-    )
-    await throttle_sleep(
-        remaining,
-        origin=key,
-        disconnect_fn=disconnect_fn,
-        ping_fn=ping_fn,
-        keepalive=keepalive,
-    )
-    if state.not_before > time.monotonic():
-        state.not_before = time.monotonic()
-
-
-def wait_http_origin_gate_sync(
-    url: str,
-    policy: RetryPolicy,
-    sleep_fn: Callable[[float], None] | None = None,
-) -> None:
-    if policy.attempts <= 1:
-        return
-    key = origin_key(url)
-    state = _ORIGIN_BACKOFF.get(key)
-    if state is None or state.not_before <= 0:
-        return
-    remaining = state.not_before - time.monotonic()
-    if remaining <= 0:
-        return
-    log_throttle(
-        origin=key,
-        kind=state.kind or THROTTLE_RATE_LIMIT,
-        wait=remaining,
-        exponent=state.exponent,
-        http_gate=True,
-    )
-    throttle_sleep_sync(remaining, sleep_fn)
-    if state.not_before > time.monotonic():
-        state.not_before = time.monotonic()
+    if _on_running_event_loop():
+        raise RuntimeError(
+            "sync throttle wait on the aiohttp event loop; "
+            "use throttle_sleep or run request_urllib in a worker thread"
+        )
+    time.sleep(delay)
 
 
 async def backoff_ws_origin(
@@ -443,35 +346,35 @@ async def backoff_ws_origin(
     kind: str,
     policy: RetryPolicy,
     *,
+    throttle: RequestThrottle | None = None,
     retry_after: float | None = None,
     resets_in_seconds: float | None = None,
     disconnect_fn: DisconnectFn | None = None,
-    ping_fn: PingFn | None = None,
-    keepalive: float | None = None,
     ws_session: Any = None,
+    cause: str | None = None,
 ) -> float:
-    delay = note_origin_failure(
-        url,
+    state = throttle if throttle is not None else RequestThrottle()
+    delay = next_throttle_delay(
+        state,
         kind,
         policy,
         retry_after=retry_after,
         resets_in_seconds=resets_in_seconds,
     )
-    state = get_origin_backoff(url) or OriginBackoff()
     log_throttle(
         origin=origin_key(url),
         kind=kind,
         wait=delay,
         exponent=max(0, state.exponent - 1) if kind == THROTTLE_RATE_LIMIT else state.exponent,
-        http_gate=False,
+        scope="ws",
+        request=id(state),
         ws_session=ws_session,
+        cause=cause,
     )
     await throttle_sleep(
         delay,
         origin=origin_key(url),
         disconnect_fn=disconnect_fn,
-        ping_fn=ping_fn,
-        keepalive=keepalive,
     )
     return delay
 
@@ -622,37 +525,34 @@ async def _handle_endless_throttle(
     retry_after: float | None,
     body: str | None,
     disconnect_fn: DisconnectFn | None,
-    ping_fn: PingFn | None,
-    keepalive: float | None,
-    http_gate: bool,
+    throttle: RequestThrottle,
+    scope: str,
     ws_session: Any = None,
+    status: int | None = None,
 ) -> None:
     resets = parse_resets_in_seconds(body) if kind == THROTTLE_QUOTA else None
-    delay = note_origin_failure(
-        url,
+    delay = next_throttle_delay(
+        throttle,
         kind,
         policy,
         retry_after=retry_after,
         resets_in_seconds=resets,
     )
-    state = get_origin_backoff(url) or OriginBackoff()
-    logged_exponent = state.exponent - 1 if kind == THROTTLE_RATE_LIMIT else state.exponent
+    logged_exponent = throttle.exponent - 1 if kind == THROTTLE_RATE_LIMIT else throttle.exponent
     log_throttle(
         origin=origin_key(url),
         kind=kind,
         wait=delay,
         exponent=max(0, logged_exponent),
-        http_gate=http_gate,
+        scope=scope,
+        request=id(throttle),
         ws_session=ws_session,
+        cause=throttle_match_cause(status=status, body=body),
     )
-    if http_gate:
-        return
     await throttle_sleep(
         delay,
         origin=origin_key(url),
         disconnect_fn=disconnect_fn,
-        ping_fn=ping_fn,
-        keepalive=keepalive,
     )
 
 
@@ -665,23 +565,14 @@ async def retry_aiohttp_post(
     policy: RetryPolicy | None = None,
     label: str = "",
     disconnect_fn: DisconnectFn | None = None,
-    ping_fn: PingFn | None = None,
-    keepalive: float | None = None,
 ) -> HttpPostResult:
     """POST via aiohttp, retrying transport / gateway failures on a fresh connection."""
     policy = policy or retry_policy_from_env()
     total = max(1, int(policy.attempts))
     tag = label or url
     state = _RetryState()
+    throttle = RequestThrottle()
     while True:
-        await wait_http_origin_gate(
-            url,
-            policy,
-            disconnect_fn=disconnect_fn,
-            ping_fn=ping_fn,
-            keepalive=keepalive,
-            label=tag,
-        )
         try:
             response = await session.post(url, json=json, headers=headers)
         except Exception as exc:
@@ -694,9 +585,9 @@ async def retry_aiohttp_post(
                     retry_after=None,
                     body=str(exc),
                     disconnect_fn=disconnect_fn,
-                    ping_fn=ping_fn,
-                    keepalive=keepalive,
-                    http_gate=True,
+                    throttle=throttle,
+                    scope="http",
+                    status=getattr(exc, "status", None) if isinstance(getattr(exc, "status", None), int) else None,
                 )
                 continue
             wait = state.next_wait(policy, retryable=kind == THROTTLE_TRANSPORT, retry_after=None)
@@ -708,15 +599,12 @@ async def retry_aiohttp_post(
                     wait,
                     origin=origin_key(url),
                     disconnect_fn=disconnect_fn,
-                    ping_fn=ping_fn,
-                    keepalive=keepalive,
                 )
             state.record(wait, extension=state.in_extension(policy))
             continue
         status = int(getattr(response, "status", 0) or 0)
         content_type = str(getattr(response, "content_type", None) or "text/plain")
         if status < 400:
-            mark_origin_success(url)
             return HttpPostResult(response=response, status=status, content_type=content_type)
         error_text = ""
         body_error: BaseException | None = None
@@ -746,9 +634,9 @@ async def retry_aiohttp_post(
                 retry_after=retry_after,
                 body=error_text,
                 disconnect_fn=disconnect_fn,
-                ping_fn=ping_fn,
-                keepalive=keepalive,
-                http_gate=True,
+                throttle=throttle,
+                scope="http",
+                status=status,
             )
             if body_error is not None and kind == THROTTLE_TRANSPORT:
                 raise body_error
@@ -767,8 +655,6 @@ async def retry_aiohttp_post(
                     wait,
                     origin=origin_key(url),
                     disconnect_fn=disconnect_fn,
-                    ping_fn=ping_fn,
-                    keepalive=keepalive,
                 )
             state.record(wait, extension=state.in_extension(policy))
             continue
@@ -791,8 +677,6 @@ async def retry_aiohttp_post(
                 wait,
                 origin=origin_key(url),
                 disconnect_fn=disconnect_fn,
-                ping_fn=ping_fn,
-                keepalive=keepalive,
             )
         state.record(wait, extension=state.in_extension(policy))
 
@@ -806,14 +690,14 @@ async def retry_aiohttp_ws_connect(
     policy: RetryPolicy | None = None,
     label: str = "",
     disconnect_fn: DisconnectFn | None = None,
-    ping_fn: PingFn | None = None,
-    keepalive: float | None = None,
     ws_session: Any = None,
+    throttle: RequestThrottle | None = None,
 ) -> Any:
     policy = policy or retry_policy_from_env()
     total = max(1, int(policy.attempts))
     tag = label or url
     state = _RetryState()
+    throttle = throttle if throttle is not None else RequestThrottle()
     connect_kwargs: dict[str, Any] = {}
     if headers is not None:
         connect_kwargs["headers"] = headers
@@ -835,10 +719,10 @@ async def retry_aiohttp_ws_connect(
                     retry_after=inferred_retry_after(getattr(exc, "status", None), exc, str(exc)),
                     body=str(exc),
                     disconnect_fn=disconnect_fn,
-                    ping_fn=ping_fn,
-                    keepalive=keepalive,
-                    http_gate=False,
+                    throttle=throttle,
+                    scope="ws",
                     ws_session=ws_session,
+                    status=getattr(exc, "status", None) if isinstance(getattr(exc, "status", None), int) else None,
                 )
                 continue
             wait = state.next_wait(policy, retryable=kind == THROTTLE_TRANSPORT, retry_after=None)
@@ -850,12 +734,9 @@ async def retry_aiohttp_ws_connect(
                     wait,
                     origin=origin_key(url),
                     disconnect_fn=disconnect_fn,
-                    ping_fn=ping_fn,
-                    keepalive=keepalive,
                 )
             state.record(wait, extension=state.in_extension(policy))
             continue
-        mark_origin_success(url)
         return upstream
 
 
@@ -900,16 +781,14 @@ def request_urllib(
     request = Request(url, data=data, headers=dict(headers or {}), method=method)
     tag = label or f"{method} {url}"
     state = _RetryState()
+    throttle = RequestThrottle()
     while True:
-        wait_http_origin_gate_sync(url, policy, sleep_fn)
         try:
             with opener(request, timeout=timeout) as response:
                 body = response.read()
                 status = int(getattr(response, "status", 200) or 200)
                 if ensure_json:
                     json.loads(body.decode("utf-8"))
-                if status < 400:
-                    mark_origin_success(url)
                 return UrllibResult(status=status, body=body, headers=getattr(response, "headers", {}))
         except HTTPError as exc:
             body = b""
@@ -923,23 +802,25 @@ def request_urllib(
             _close_urllib_error(exc)
             if _endless_kind(kind, policy):
                 resets = parse_resets_in_seconds(decoded) if kind == THROTTLE_QUOTA else None
-                delay = note_origin_failure(
-                    url,
+                delay = next_throttle_delay(
+                    throttle,
                     kind,
                     policy,
                     retry_after=retry_after,
                     resets_in_seconds=resets,
                 )
-                state_origin = get_origin_backoff(url) or OriginBackoff()
                 log_throttle(
                     origin=origin_key(url),
                     kind=kind,
                     wait=delay,
-                    exponent=max(0, state_origin.exponent - 1)
+                    exponent=max(0, throttle.exponent - 1)
                     if kind == THROTTLE_RATE_LIMIT
-                    else state_origin.exponent,
-                    http_gate=True,
+                    else throttle.exponent,
+                    scope="http",
+                    request=id(throttle),
+                    cause=throttle_match_cause(status=int(exc.code), body=decoded),
                 )
+                throttle_sleep_sync(delay, sleep_fn)
                 continue
             wait = state.next_wait(policy, retryable=kind == THROTTLE_TRANSPORT, retry_after=retry_after)
             if wait is None:

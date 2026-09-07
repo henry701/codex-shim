@@ -1276,3 +1276,50 @@ def test_catalog_entry_keeps_only_desktop_input_modalities():
         context_settings=None,
     )
     assert passthrough["input_modalities"] == ["text", "image"]
+
+
+def test_catalog_reasoning_and_context_helpers(tmp_path):
+    from types import SimpleNamespace
+
+    from codex_shim.catalog import (
+        _catalog_file_default_reasoning_level,
+        _default_context,
+        _desktop_input_modalities,
+        _guess_reasoning_effort,
+        _reasoning_effort,
+        write_config,
+    )
+
+    assert _catalog_file_default_reasoning_level(
+        [{"effort": "low"}, {"effort": "high"}], "high"
+    ) == "high"
+    assert _catalog_file_default_reasoning_level([{"effort": "low"}], None) == "low"
+    assert _catalog_file_default_reasoning_level([], None) == "medium"
+    assert _desktop_input_modalities(["video", "AUDIO", "text"]) == ["audio", "text"]
+    modalities = _desktop_input_modalities(["audio"])
+    assert modalities[0] == "text"
+    assert "audio" in modalities
+
+    claude = SimpleNamespace(model="claude-sonnet", slug="claude", display_name="Claude")
+    gpt = SimpleNamespace(model="gpt-5.6", slug="gpt", display_name="GPT-5")
+    gemini = SimpleNamespace(model="gemini-3", slug="gemini", display_name="Gemini")
+    other = SimpleNamespace(model="llama", slug="llama", display_name="Local")
+    assert _default_context(claude) == 200_000
+    assert _default_context(gpt) == 400_000
+    assert _default_context(gemini) == 1_000_000
+    assert _default_context(other) == 128_000
+
+    assert _guess_reasoning_effort(SimpleNamespace(display_name="Composer xhigh")) == "xhigh"
+    assert _guess_reasoning_effort(SimpleNamespace(display_name="High effort")) == "high"
+    assert _guess_reasoning_effort(SimpleNamespace(display_name="medium")) == "medium"
+    assert _guess_reasoning_effort(SimpleNamespace(display_name="low latency")) == "low"
+    assert _guess_reasoning_effort(SimpleNamespace(display_name="plain")) == "medium"
+    assert _reasoning_effort(SimpleNamespace(display_name="High"), ["low", "medium"]) == "medium"
+    assert _reasoning_effort(SimpleNamespace(display_name="High"), ["low", "high"]) == "high"
+    assert _reasoning_effort(SimpleNamespace(display_name="High"), ["low"]) == "low"
+
+    with pytest.raises(SystemExit):
+        from unittest.mock import patch
+
+        with patch("codex_shim.catalog.default_model_slug", side_effect=ValueError("no models")):
+            write_config([], tmp_path / "unused.toml", tmp_path / "catalog.json", 8765)

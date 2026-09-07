@@ -1,18 +1,23 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import os
+import random
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from contextvars import ContextVar
 from typing import Any
 
 SSE_KEEPALIVE_INTERVAL = 15.0
+KEEPALIVE_MIN = 4.0
+KEEPALIVE_MAX = 6.0
 # Codex idle-timeouts `stream.next()` / `ws_stream.next()`. SSE comments and
 # WebSocket protocol pings never complete those waits, so keepalives must be a
 # real ignored event. `content=False` so they do not block pre-content retry.
 PING_BYTES = b'data: {"type":"ping"}\n\n'
+WS_PING_JSON = '{"type":"ping"}'
 MAX_UNTERMINATED_SSE_LINE = 1_048_576
 _DISCONNECT_NAMES = frozenset(
     {
@@ -38,7 +43,26 @@ def keepalive_interval(override: float | None = None) -> float:
             return max(0.05, float(raw))
         except ValueError:
             pass
-    return SSE_KEEPALIVE_INTERVAL
+    # Tests patch SSE_KEEPALIVE_INTERVAL to a short fixed value.
+    if SSE_KEEPALIVE_INTERVAL != 15.0:
+        return max(0.05, float(SSE_KEEPALIVE_INTERVAL))
+    lo = max(0.05, _env_float("CODEX_SHIM_KEEPALIVE_MIN", KEEPALIVE_MIN))
+    hi = max(0.05, _env_float("CODEX_SHIM_KEEPALIVE_MAX", KEEPALIVE_MAX))
+    if hi < lo:
+        hi = lo
+    if hi <= lo:
+        return lo
+    return random.uniform(lo, hi)
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        return default
 
 
 def request_disconnected(request: Any | None) -> bool:
@@ -198,16 +222,23 @@ class DownstreamWriter:
 
 
 class DownstreamPinger:
-    """Ping the downstream SSE whenever it has been idle, independent of upstream."""
+    """Ping the downstream client whenever it has been idle, independent of upstream."""
 
     def __init__(
         self,
-        writer: DownstreamWriter,
+        target: DownstreamWriter | Callable[..., Any],
         interval: float | None = None,
         *,
         owner_task: asyncio.Task[Any] | None = None,
     ):
-        self.writer = writer
+        if hasattr(target, "ping") and hasattr(target, "last_write_at"):
+            writer = target
+            self._ping = writer.ping
+            self._last_activity: Callable[[], float] | None = lambda: writer.last_write_at
+        else:
+            self._ping = target
+            self._last_activity = None
+        self._interval_override = interval
         self.interval = keepalive_interval(interval)
         self.owner_task = owner_task
         self._task: asyncio.Task[None] | None = None
@@ -236,21 +267,35 @@ class DownstreamPinger:
             return
         task.cancel()
 
+    async def _emit(self) -> None:
+        result = self._ping()
+        if inspect.isawaitable(result):
+            await result
+
     async def _run(self) -> None:
         try:
             while True:
-                await asyncio.sleep(self.interval)
-                idle = time.monotonic() - self.writer.last_write_at
-                if idle >= self.interval:
-                    try:
-                        await self.writer.ping()
-                    except ClientDisconnected:
-                        self._cancel_owner()
-                        return
-                    except asyncio.CancelledError:
-                        raise
-                    except Exception:
-                        self._cancel_owner()
-                        raise
+                interval = keepalive_interval(self._interval_override)
+                await asyncio.sleep(interval)
+                if self._last_activity is not None:
+                    idle = time.monotonic() - self._last_activity()
+                    if idle < interval:
+                        continue
+                try:
+                    await self._emit()
+                except ClientDisconnected:
+                    self._cancel_owner()
+                    return
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    self._cancel_owner()
+                    raise
         except asyncio.CancelledError:
             return
+
+
+async def ping_websocket(ws: Any) -> None:
+    if ws is None or bool(getattr(ws, "closed", False)):
+        raise ClientDisconnected()
+    await ws.send_str(WS_PING_JSON)

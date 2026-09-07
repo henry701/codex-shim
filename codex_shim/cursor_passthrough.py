@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from .catalog_slugs import cursor_catalog_slug
-from .naming import description_for_route, display_name_from_slug, format_cursor_display_name
+from .naming import description_for_route, format_cursor_display_name
 from .settings import slugify
 from .translate import responses_to_chat, strip_think
 
@@ -617,7 +617,6 @@ def _format_grep_started(payload: dict[str, Any]) -> str:
 
 
 def _format_function_started(payload: dict[str, Any]) -> str:
-    name = str(payload.get("name") or "tool")
     args = str(payload.get("arguments") or "")
     return f"`{_preview_text(args)}`"
 

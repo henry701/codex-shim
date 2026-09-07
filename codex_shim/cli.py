@@ -31,8 +31,7 @@ from .cursor_passthrough import (
     cursor_upstream_model,
     is_cursor_passthrough_slug,
 )
-from .discover import discover_byok_models, discover_summary
-from .catalog_slugs import CHATGPT_CATALOG_SLUG
+from .discover import discover_summary
 from .settings import (
     DEFAULT_CHATGPT_CONVERSATIONS_DIR,
     DEFAULT_CODEX_AUTH,
@@ -53,7 +52,6 @@ from .settings import (
     byok_model_has_credentials,
 )
 from .compaction.config import (
-    CompactionSettings,
     effective_compaction_output_token_reserve,
     load_compaction_settings,
 )
@@ -1873,23 +1871,6 @@ end tell
         subprocess.run(["osascript", "-e", script], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except OSError:
         pass
-
-
-def _provider_display_name(models, slug: str, router_config=None) -> str:
-    if router_config is not None and slug == router_config.slug:
-        return router_config.display_name
-    if chatgpt_passthrough_available():
-        display_name = chatgpt_passthrough_display_names().get(slug)
-        if display_name:
-            return display_name
-    if cursor_passthrough_available():
-        display_name = cursor_passthrough_display_names().get(slug)
-        if display_name:
-            return display_name
-    for model in models:
-        if model.slug == slug:
-            return model.display_name
-    return "Codex Shim"
 
 
 def migrate_threads_command(*, dry_run: bool = False) -> int:

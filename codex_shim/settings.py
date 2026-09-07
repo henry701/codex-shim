@@ -394,14 +394,6 @@ class ModelSettings:
     def __init__(self, path: Path | None = None):
         self.path = Path(path or DEFAULT_SETTINGS).expanduser()
 
-    def load_explicit(self) -> list[ShimModel]:
-        if not self.path.exists():
-            if self.path == DEFAULT_SETTINGS:
-                return []
-            raise FileNotFoundError(self.path)
-        data = json.loads(self.path.read_text())
-        return self._models_from_settings_data(data)
-
     def load(self) -> list[ShimModel]:
         if not self.path.exists():
             if self.path == DEFAULT_SETTINGS:

@@ -314,3 +314,52 @@ async def test_stream_guard_closes_attached_upstream():
     ):
         pass
     assert upstream.closed is True
+
+
+async def test_stream_guard_iter_sse_is_noop_without_upstream():
+    response = _RecordingResponse()
+    emitter = _Emitter()
+    async with StreamGuard(response, emitter, label="test-empty", keepalive=False) as guard:
+        lines = [line async for line in guard.iter_sse()]
+    assert lines == []
+    assert emitter.calls == [("complete", False)]
+
+
+async def test_stream_guard_note_disconnect_fails_when_not_emitted():
+    response = _RecordingResponse()
+    emitter = _Emitter()
+    async with StreamGuard(response, emitter, label="test-disc", keepalive=False) as guard:
+        await guard.note_upstream_disconnect(ConnectionError("cut"))
+        assert emitter.calls == [("fail", "Upstream stream disconnected: cut", "upstream_disconnect")]
+        await guard.note_upstream_disconnect(ConnectionError("again"))
+    assert emitter.calls[0][0] == "fail"
+
+
+async def test_stream_guard_note_disconnect_skips_when_already_emitted():
+    response = _RecordingResponse()
+    emitter = _Emitter()
+    emitter.already_emitted = True
+    async with StreamGuard(response, emitter, label="test-skip", keepalive=False) as guard:
+        await guard.note_upstream_disconnect(ConnectionError("cut"))
+    assert emitter.calls == [("complete", False)]
+
+
+async def test_stream_guard_complete_terminal_swallows_non_disconnect_errors():
+    class BoomEmitter(_Emitter):
+        async def complete(self, response, *, upstream_saw_done: bool) -> str:
+            del response, upstream_saw_done
+            raise RuntimeError("complete exploded")
+
+    response = _RecordingResponse()
+    emitter = BoomEmitter()
+    async with StreamGuard(response, emitter, label="test-complete-boom", keepalive=False):
+        pass
+    assert b"EOF" in response.chunks
+
+
+async def test_stream_guard_write_is_noop_without_response():
+    emitter = _Emitter()
+    async with StreamGuard(None, emitter, label="test-no-response", keepalive=False) as guard:
+        await guard.write(b"ignored")
+        await guard.note_upstream_disconnect(RuntimeError("x"))
+    assert emitter.calls == []

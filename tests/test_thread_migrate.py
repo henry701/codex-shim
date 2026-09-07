@@ -5,6 +5,10 @@ import sqlite3
 from codex_shim.thread_migrate import migrate_thread_providers, state_db_paths
 
 
+def test_state_db_paths_missing_home_is_empty(tmp_path):
+    assert state_db_paths(tmp_path / "no-such-codex-home") == []
+
+
 def _make_state_db(tmp_path, name: str = "state_5.sqlite") -> sqlite3.Connection:
     db_path = tmp_path / name
     conn = sqlite3.connect(db_path)

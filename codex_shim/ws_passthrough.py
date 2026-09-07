@@ -24,8 +24,14 @@ from .net.errors import (
     classify_throttle,
     classify_ws_event_throttle,
     parse_resets_in_seconds,
+    throttle_match_cause,
 )
-from .net.retry import backoff_ws_origin, retry_aiohttp_ws_connect, retry_policy_from_env
+from .net.retry import (
+    RequestThrottle,
+    backoff_ws_origin,
+    retry_aiohttp_ws_connect,
+    retry_policy_from_env,
+)
 from .net.sse import ClientDisconnected
 
 CHATGPT_WS_URL = "wss://chatgpt.com/backend-api/codex/responses"
@@ -105,16 +111,27 @@ async def await_ws_throttle(session: Any, url: str, exc: BaseException) -> bool:
     if kind not in {THROTTLE_RATE_LIMIT, THROTTLE_QUOTA} or policy.attempts <= 1:
         return False
     disconnect_fn = getattr(session, "client_disconnected", None)
-    ping_fn = getattr(session, "ping_client", None)
+    throttle = getattr(session, "throttle", None)
+    if not isinstance(throttle, RequestThrottle):
+        throttle = RequestThrottle()
+        try:
+            session.throttle = throttle
+        except (AttributeError, TypeError):
+            pass
     await backoff_ws_origin(
         url,
         kind,
         policy,
+        throttle=throttle,
         retry_after=None,
         resets_in_seconds=parse_resets_in_seconds(body),
         disconnect_fn=disconnect_fn if callable(disconnect_fn) else None,
-        ping_fn=ping_fn if callable(ping_fn) else None,
         ws_session=id(session),
+        cause=throttle_match_cause(
+            status=status if isinstance(status, int) else None,
+            body=body,
+            exc=exc,
+        ),
     )
     return True
 
@@ -134,6 +151,7 @@ class WsPassthroughSession:
     upstream_by_url: dict[str, ClientWebSocketResponse] = field(default_factory=dict)
     last_chained_response_id_by_url: dict[str, str] = field(default_factory=dict)
     thread_ids: set[str] = field(default_factory=set)
+    throttle: RequestThrottle = field(default_factory=RequestThrottle)
 
     @property
     def upstream_ws(self) -> ClientWebSocketResponse | None:
@@ -169,14 +187,6 @@ class WsPassthroughSession:
         ws = self.client_ws
         return ws is None or bool(getattr(ws, "closed", False))
 
-    async def ping_client(self) -> None:
-        if self.client_disconnected():
-            raise ClientDisconnected()
-        await self.client_ws.send_str('{"type":"ping"}')
-
-    async def wait_ws_throttle(self, url: str, exc: BaseException) -> bool:
-        return await await_ws_throttle(self, url, exc)
-
     async def connect_upstream(self, url: str, headers: dict[str, str]) -> tuple[dict[str, str], bool]:
         existing = self.upstream_by_url.get(url)
         if existing is not None and _upstream_lane_reusable(existing):
@@ -192,8 +202,8 @@ class WsPassthroughSession:
                 policy=retry_policy_from_env(),
                 label=f"ws-connect:{url}",
                 disconnect_fn=self.client_disconnected,
-                ping_fn=self.ping_client,
                 ws_session=id(self),
+                throttle=self.throttle,
             )
         except ClientDisconnected as exc:
             raise WsPassthroughConnectError("client disconnected") from exc
@@ -267,8 +277,23 @@ class WsPassthroughSession:
                             await self.close_upstream(upstream_url)
                             status = event.get("status")
                             if not isinstance(status, int):
-                                status = 429
-                            raise WsPassthroughConnectError(json.dumps(event), status=status)
+                                err = event.get("error")
+                                nested = err.get("status") if isinstance(err, dict) else None
+                                status = nested if isinstance(nested, int) else None
+                            cause = throttle_match_cause(
+                                status=status if isinstance(status, int) else None,
+                                body=json.dumps(event),
+                            )
+                            print(
+                                f"[ws-passthrough] upstream throttle kind={kind} "
+                                f"cause={cause} event_type={event.get('type')!r} "
+                                f"status={status!r} error={event.get('error')!r}",
+                                flush=True,
+                            )
+                            raise WsPassthroughConnectError(
+                                json.dumps(event),
+                                status=status if isinstance(status, int) else None,
+                            )
                     if on_event is not None:
                         on_event(event)
                     if rewrite_model is not None and model_override:

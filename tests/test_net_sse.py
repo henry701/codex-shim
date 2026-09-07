@@ -6,6 +6,7 @@ import pytest
 
 from codex_shim.net.sse import (
     MAX_UNTERMINATED_SSE_LINE,
+    DownstreamPinger,
     DownstreamWriter,
     PING_BYTES,
     keepalive_interval,
@@ -46,12 +47,31 @@ def test_ping_bytes_is_sse_data_event():
 
 def test_keepalive_interval_env_and_floor(monkeypatch):
     monkeypatch.delenv("CODEX_SHIM_SSE_KEEPALIVE_INTERVAL", raising=False)
-    assert keepalive_interval() == 15.0
+    monkeypatch.delenv("CODEX_SHIM_KEEPALIVE_MIN", raising=False)
+    monkeypatch.delenv("CODEX_SHIM_KEEPALIVE_MAX", raising=False)
+    assert 4.0 <= keepalive_interval() <= 6.0
     monkeypatch.setenv("CODEX_SHIM_SSE_KEEPALIVE_INTERVAL", "7.5")
     assert keepalive_interval() == 7.5
     monkeypatch.setenv("CODEX_SHIM_SSE_KEEPALIVE_INTERVAL", "0.01")
     assert keepalive_interval() == 0.05
     assert keepalive_interval(3.0) == 3.0
+
+
+async def test_downstream_pinger_pings_after_interval_not_immediately():
+    pings: list[int] = []
+
+    async def ping() -> None:
+        pings.append(1)
+
+    pinger = DownstreamPinger(ping, interval=0.05)
+    pinger.start()
+    try:
+        await asyncio.sleep(0.02)
+        assert pings == []
+        await asyncio.sleep(0.12)
+        assert pings
+    finally:
+        await pinger.stop()
 
 
 async def test_sse_lines_skips_comment_lines():

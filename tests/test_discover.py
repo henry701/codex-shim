@@ -50,7 +50,11 @@ pytestmark = pytest.mark.enable_model_discovery  # noqa: PT023
 def test_is_zen_public_model():
     assert is_zen_public_model("big-pickle")
     assert is_zen_public_model("minimax-m3-free")
+    assert is_zen_public_model("ling-3.0-flash-fin-free")
+    assert is_zen_public_model("muse-spark-1.3-contributor-free")
     assert not is_zen_public_model("kimi-k2.6")
+    assert not is_zen_public_model("glm-5.3-flash")
+    assert not is_zen_public_model("glm-5")
 
 
 def test_discover_enabled_defaults_true():
@@ -707,6 +711,67 @@ def test_discovered_openrouter_free_maps_effort_variants(monkeypatch):
     assert route.raw["reasoning_efforts"] == ["low", "medium"]
     assert route.no_image_support is True
     assert route.raw["input_modalities"] == ["text"]
+
+
+def test_context_from_model_row_and_efforts_from_models_dev_row():
+    from codex_shim.discover import _context_from_model_row, _efforts_from_models_dev_row
+
+    assert _context_from_model_row({"context_length": 8192}) == 8192
+    assert _context_from_model_row({"max_context_length": "4096"}) == 4096
+    assert _context_from_model_row({"n_ctx": "nope", "meta": {"n_ctx_train": 2048}}) == 2048
+    assert _context_from_model_row({"meta": {"context_length": "bad"}}) is None
+    assert _context_from_model_row({}) is None
+
+    efforts = _efforts_from_models_dev_row(
+        {
+            "reasoning_options": [
+                "skip",
+                {"type": "temperature", "values": ["x"]},
+                {"type": "effort", "values": ["low", "high"]},
+            ],
+            "variants": {
+                "a": {"effort": ["medium"]},
+                "b": {"reasoning_effort": "minimal"},
+                "c": "xhigh",
+            },
+            "reasoning_efforts": ["low"],
+            "supported_reasoning_efforts": ["high"],
+        }
+    )
+    assert "low" in efforts
+    assert "high" in efforts
+    assert "medium" in efforts
+
+
+def test_fetch_local_openai_models_parses_rows(monkeypatch):
+    from urllib.error import URLError
+
+    from codex_shim.discover import fetch_local_openai_models
+
+    monkeypatch.setattr(
+        "codex_shim.discover.fetch_http_json",
+        lambda url, headers=None, timeout=5.0: {
+            "data": [
+                {"id": "llama", "context_length": 8192},
+                {"id": ""},
+                "skip",
+                {"id": "phi", "meta": {"n_ctx": 2048}},
+            ]
+        },
+    )
+    records = fetch_local_openai_models("http://127.0.0.1:11434/v1", "local")
+    assert [row.model_id for row in records] == ["llama", "phi"]
+    assert records[0].max_context_limit == 8192
+    assert records[1].max_context_limit == 2048
+
+    monkeypatch.setattr("codex_shim.discover.fetch_http_json", lambda *args, **kwargs: [])
+    assert fetch_local_openai_models("http://127.0.0.1:11434/v1", "sk-test") == []
+
+    def boom(*args, **kwargs):
+        raise URLError("down")
+
+    monkeypatch.setattr("codex_shim.discover.fetch_http_json", boom)
+    assert fetch_local_openai_models("http://127.0.0.1:11434/v1", "ollama") == []
 
 
 def test_discovered_nvidia_text_only_maps_output_limit(monkeypatch):

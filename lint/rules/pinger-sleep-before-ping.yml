@@ -1,0 +1,16 @@
+id: pinger-sleep-before-ping
+language: python
+severity: error
+message: DownstreamPinger._run must sleep before the first ping (background keepalives only).
+rule:
+  pattern: |
+    class DownstreamPinger:
+      $$$HEAD
+      async def _run(self, $$$ARGS):
+        $$$PRE
+        while True:
+          await self._emit()
+          $$$REST
+      $$$TAIL
+files:
+  - "codex_shim/net/sse.py"

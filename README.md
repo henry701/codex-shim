@@ -779,7 +779,9 @@ Debug env knobs:
 | `CODEX_SHIM_RETRY_RATE_LIMIT_MIN` | Floor for upstream 429 / rate-limit waits in seconds (default: `60`). `Retry-After` below this still waits this long. |
 | `CODEX_SHIM_RETRY_RATE_LIMIT_MAX` | Cap for 429 / quota waits in seconds (default: `3600`). Rate-limit delays ramp from min to this cap, then stay there until 2xx or Desktop disconnects. Quota waits use this cap (or a shorter `resets_in_seconds`). |
 | `CODEX_SHIM_RETRY_RATE_LIMIT_JITTER` | ± fraction applied to rate-limit waits (default: `0.2`). Quota waits are not jittered. |
-| `CODEX_SHIM_SSE_KEEPALIVE_INTERVAL` | Downstream SSE `{"type":"ping"}` interval in seconds while a stream is open (default: `15`) |
+| `CODEX_SHIM_SSE_KEEPALIVE_INTERVAL` | Fixed downstream `{"type":"ping"}` interval in seconds (SSE and WebSocket). Unset uses a jittered 4–6s default. |
+| `CODEX_SHIM_KEEPALIVE_MIN` | Minimum seconds between background keepalives when the interval is jittered (default: `4`) |
+| `CODEX_SHIM_KEEPALIVE_MAX` | Maximum seconds between background keepalives when the interval is jittered (default: `6`) |
 | `CODEX_SHIM_WS_PASSTHROUGH=0` | Force legacy HTTP+SSE upstream for ChatGPT/BYOK WS routes (default: on) |
 | `CODEX_SHIM_CHATGPT_WS_FORCE_EXPAND=1` | Force cache expansion on ChatGPT Codex WS (default: native passthrough on reused upstream WS) |
 | `CODEX_SHIM_CHATGPT_CONVERSATIONS_DIR` | Root for persisted expansion cache (default: `~/.codex-shim/chatgpt-conversations`) |
@@ -791,11 +793,24 @@ reconnect on the same Codex turn using assistant prefill: a trailing truncated
 assistant message, with no user nudge, up to three times. A conclusive
 `stop` / `tool_calls` still completes even when `[DONE]` is missing.
 
-Live smoke test (alternate port, `codex exec` with tool call + cache check):
+Live smoke after retry / SSE / WebSocket / keepalive changes (alternate
+port, never `SMOKE_RESTART=1` on production **8765**). Runs Codex Luna and
+OpenCode Free:
 
 ```bash
-SMOKE_PORT=8766 bash scripts/smoke_chatgpt_passthrough.sh
+# Reuses a healthy shim on 8766-8770 (never 8765). 8766 is often taken by
+# other local servers; unset SMOKE_PORT to auto-pick.
+SMOKE_PORT=8767 bash scripts/smoke_net_surfaces.sh
+SMOKE_SURFACES=nvidia,openrouter SMOKE_PORT=8767 bash scripts/smoke_net_surfaces.sh
 ```
+
+Single-surface wrappers: `scripts/smoke_chatgpt_passthrough.sh` (default
+`codex-gpt-5-6-luna`) and `scripts/smoke_opencode_free.sh` (default
+`oc-free-ling-3-0-flash-fin-free`). Extra surfaces: `nvidia`, `openrouter`,
+`muse`, `zai`. Set `CODEX_SHIM_LIVE_SMOKE=1` to run the same execs from
+pytest (`tests/test_smoke_chatgpt_passthrough.py`).
+`uv run python lint/net_invariants.py` guards the keepalive split and
+blocks `time.sleep` on the aiohttp loop.
 
 **Two different caches:** ChatGPT **prefix cache** (`cached_tokens` in upstream usage) is
 server-side and keyed by stable session/thread headers the shim forwards. The shim

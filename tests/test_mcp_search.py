@@ -243,3 +243,76 @@ def test_responses_to_chat_does_not_inject_discovered_tools_into_tools_array():
     assert "exec_command" in names
     tool_messages = [m for m in out["messages"] if m.get("role") == "tool"]
     assert "mcp__exa__web_search_exa" in tool_messages[0]["content"]
+
+
+def test_extract_mcp_servers_and_resolve_url(tmp_path, monkeypatch):
+    mcp_search.invalidate_config_cache()
+    config = tmp_path / "config.toml"
+    config.write_text(
+        "\n".join(
+            [
+                "[mcp_servers.exa]",
+                'url = "https://exa.example/mcp"',
+                "token = 'secret'",
+                "[mcp_servers.nested.ignored]",
+                'url = "https://nope"',
+                "[other]",
+                'url = "https://other"',
+                "# comment",
+                "[mcp_servers.jina]",
+                "url = https://jina.example",
+            ]
+        )
+        + "\n"
+    )
+    monkeypatch.setenv("CODEX_CONFIG_PATH", str(config))
+    assert mcp_search.resolve_mcp_url("exa") is None
+    assert mcp_search.resolve_mcp_url("mcp__exa") == "https://exa.example/mcp"
+    assert "mcp__jina" in mcp_search.known_mcp_servers()
+    mcp_search.invalidate_config_cache()
+    monkeypatch.setenv("CODEX_CONFIG_PATH", str(tmp_path / "missing.toml"))
+    assert mcp_search.known_mcp_servers() == []
+
+
+def test_parse_mcp_references_and_full_names():
+    assert mcp_search.parse_mcp_function_name("mcp__exa__web_search") == ("exa", "web_search")
+    assert mcp_search.parse_mcp_tool_reference("mcp__exa.web_search") == ("exa", "web_search")
+    assert mcp_search.parse_mcp_tool_reference("shell") is None
+    assert mcp_search.parse_mcp_tool_reference("mcp__.web_search") is None
+    assert mcp_search.full_mcp_tool_name("", "web_search") is None
+    assert mcp_search.full_mcp_tool_name("exa", "web_search") == "mcp__exa__web_search"
+    assert mcp_search.full_mcp_tool_name("mcp__exa", "mcp__exa__web_search") == "mcp__exa__web_search"
+    assert mcp_search.format_tool_search_error("mcp__exa", "down") == json.dumps(
+        {"server": "mcp__exa", "error": "down"}, indent=2
+    )
+
+
+def test_flatten_tool_search_uses_function_name_and_namespace():
+    flattened = mcp_search.flatten_tool_search_tools(
+        [
+            "skip",
+            {
+                "type": "namespace",
+                "name": "mcp__jina",
+                "tools": [
+                    {"function": {"name": "read_url"}},
+                    "nope",
+                    {"name": ""},
+                ],
+            },
+            {"namespace": "mcp__exa", "name": "web_search"},
+            {"function": {"name": "mcp__context7__docs"}},
+        ]
+    )
+    names = [entry["name"] for entry in flattened]
+    assert "mcp__jina__read_url" in names
+    assert "mcp__exa__web_search" in names
+    assert "mcp__context7__docs" in names
+    assert mcp_search.flatten_tool_search_tools("nope") == []
+
+
+def test_responses_tools_need_tool_search_from_function_dict():
+    assert mcp_search.responses_tools_need_tool_search("nope") is False
+    assert mcp_search.responses_tools_need_tool_search([{"type": "function", "function": {"name": "mcp__exa"}}])
+    assert not mcp_search.responses_tools_need_tool_search([{"type": "function"}])
+

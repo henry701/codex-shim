@@ -13,7 +13,6 @@ from .cursor_passthrough import (
     CursorStreamParser,
     cursor_tool_display_kind,
     cursor_tool_is_known,
-    replay_cursor_ndjson,
 )
 
 _ANSI = {

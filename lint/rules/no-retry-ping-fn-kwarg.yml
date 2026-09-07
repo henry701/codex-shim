@@ -1,0 +1,11 @@
+id: no-retry-ping-fn-kwarg
+language: python
+severity: error
+message: Do not pass ping_fn= into retry/throttle; start DownstreamPinger on the client session.
+rule:
+  kind: keyword_argument
+  has:
+    field: name
+    pattern: ping_fn
+files:
+  - "codex_shim/**/*.py"

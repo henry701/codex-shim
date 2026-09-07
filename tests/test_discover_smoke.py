@@ -10,7 +10,6 @@ import pytest
 
 from codex_shim import cli
 from codex_shim.discover import (
-    discover_byok_models,
     discover_chatgpt_models_from_cursor,
     fetch_nvidia_integrate_model_ids,
     fetch_openrouter_free_model_ids,

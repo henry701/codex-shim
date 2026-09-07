@@ -13,10 +13,33 @@ uv sync --extra dev
 
 uv run pytest tests/ -q
 uv run python -m compileall codex_shim/ -q
+uv run python lint/net_invariants.py
 ```
 
 CI runs the same commands on Python 3.11 and 3.12 via
 `.github/workflows/ci.yml`. Match it locally before opening a PR.
+
+## Networking / keepalive changes
+
+Edits under `codex_shim/net/`, `ws_passthrough.py`, `chatgpt_edge.py`, or
+the WS/SSE handlers in `server.py` need more than the hermetic suite.
+
+1. Keep downstream `{"type":"ping"}` on `DownstreamPinger` only. Do not add
+   `ping_fn` to retry/throttle. Do not `time.sleep` on the aiohttp loop
+   (`throttle_sleep_sync` must raise if a loop is running).
+2. `uv run python lint/net_invariants.py` (also `lint/rules/*.yml` for
+   ast-grep).
+3. Live smoke **both** surfaces on an alternate port — never
+   `SMOKE_RESTART=1` on **8765**:
+
+```bash
+SMOKE_PORT=8767 bash scripts/smoke_net_surfaces.sh
+# or: SMOKE_SURFACES=nvidia,openrouter SMOKE_PORT=8767 bash scripts/smoke_net_surfaces.sh
+```
+
+That runs Codex Luna (`scripts/smoke_chatgpt_passthrough.sh`) and OpenCode
+Free (`scripts/smoke_opencode_free.sh`). A `[throttle]` line with a 2xx
+after the wait is a pass; a Desktop `"request timed out"` is a fail.
 
 ## What kinds of changes are useful
 

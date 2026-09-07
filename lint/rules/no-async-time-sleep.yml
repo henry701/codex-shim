@@ -1,0 +1,16 @@
+id: no-async-time-sleep
+language: python
+severity: error
+message: time.sleep inside async def blocks the aiohttp loop (Desktop WS connect timeout is 15s). Use asyncio.sleep, or throttle_sleep_sync only off the loop.
+rule:
+  pattern: |
+    async def $FUNC($$$ARGS):
+      $$$BODY
+  has:
+    pattern: time.sleep($A)
+    stopBy: end
+files:
+  - "codex_shim/net/**/*.py"
+  - "codex_shim/ws_passthrough.py"
+  - "codex_shim/chatgpt_edge.py"
+  - "codex_shim/server.py"

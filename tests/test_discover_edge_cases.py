@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-from pathlib import Path
 
 import pytest
 
@@ -12,7 +11,6 @@ from codex_shim.discover import (
     _enrich_builtin_template,
     _resolved_api_key,
     discover_byok_models,
-    discover_enabled,
     fetch_openrouter_free_model_ids,
     is_local_base_url,
     merge_discovered_models,

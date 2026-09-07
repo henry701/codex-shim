@@ -1485,3 +1485,288 @@ def test_rewrite_integerizes_whole_float_function_call_arguments():
         {"exec_command": "function"},
     )
     assert json.loads(streamed["arguments"])["max_output_tokens"] == 8000
+
+
+def test_compaction_summary_text_joins_list_entries():
+    from codex_shim.translate import _compaction_summary_text
+
+    assert _compaction_summary_text({"summary": "plain "}) == "plain"
+    assert (
+        _compaction_summary_text(
+            {
+                "summary": [
+                    "keep locale",
+                    {"text": "as pt-BR"},
+                    {"summary": "and verify"},
+                    12,
+                    {"text": "  "},
+                ]
+            }
+        )
+        == "keep locale\nas pt-BR\nand verify"
+    )
+    assert _compaction_summary_text({"summary": []}) is None
+
+
+def test_responses_to_anthropic_reattaches_thinking_and_broken_tool_json():
+    import base64
+
+    from codex_shim.translate import SHIM_ENCRYPTED_CONTENT_PREFIX, responses_to_anthropic
+
+    blob = SHIM_ENCRYPTED_CONTENT_PREFIX + base64.urlsafe_b64encode(
+        json.dumps({"type": "thinking", "thinking": "plan", "signature": "sig"}).encode()
+    ).decode()
+    out = responses_to_anthropic(
+        {
+            "model": "slug",
+            "instructions": "Be brief.",
+            "input": [
+                {"type": "reasoning", "encrypted_content": blob},
+                {
+                    "type": "function_call",
+                    "call_id": "call_1",
+                    "name": "lookup",
+                    "arguments": "{not-json",
+                },
+                {"type": "function_call_output", "call_id": "call_1", "output": "ok"},
+                {"type": "message", "role": "user", "content": "next"},
+            ],
+        },
+        "claude-real",
+        128,
+    )
+    assistant = next(msg for msg in out["messages"] if msg["role"] == "assistant")
+    assert assistant["content"][0]["thinking"] == "plan"
+    tool_use = next(block for block in assistant["content"] if block.get("type") == "tool_use")
+    assert tool_use["input"] == {"_raw": "{not-json"}
+    assert "Be brief." in (out.get("system") or "")
+
+
+def test_responses_to_anthropic_uses_summary_thinking_when_blob_is_opaque():
+    from codex_shim.translate import responses_to_anthropic
+
+    out = responses_to_anthropic(
+        {
+            "model": "slug",
+            "input": [
+                {
+                    "type": "reasoning",
+                    "encrypted_content": "not-a-blob",
+                    "summary": [{"type": "summary_text", "text": "remember the locale"}],
+                },
+                {"type": "message", "role": "assistant", "content": "Will do."},
+            ],
+        },
+        "claude-real",
+        64,
+    )
+    assistant = next(msg for msg in out["messages"] if msg["role"] == "assistant")
+    thinking = next(block for block in assistant["content"] if block.get("type") == "thinking")
+    assert thinking["thinking"] == "remember the locale"
+    assert thinking["signature"] == ""
+
+
+def test_chat_parts_from_nested_computer_output_and_content_to_text():
+    from codex_shim.translate import _chat_parts_from_content, _content_to_text, _merge_consecutive_messages
+
+    nested = {
+        "type": "computer_call_output",
+        "output": {"type": "input_image", "image_url": "data:image/png;base64,AAA"},
+    }
+    parts = _chat_parts_from_content(nested)
+    assert parts[0]["type"] == "image_url"
+    wrapped = _chat_parts_from_content({"content": [{"type": "text", "text": "inner"}]})
+    assert wrapped == [{"type": "text", "text": "inner"}]
+    visual = _chat_parts_from_content(
+        {"output": [{"type": "image_url", "image_url": "https://example.invalid/a.png"}]}
+    )
+    assert visual[0]["type"] == "image_url"
+
+    assert "[image]" in _content_to_text({"type": "input_image", "image_url": "https://x"})
+    assert _content_to_text({"output": {"text": "from-output"}}) == "from-output"
+    assert "outer" in _content_to_text([{"content": ["outer"]}])
+
+    merged = _merge_consecutive_messages(
+        [
+            {"role": "assistant", "content": "a", "tool_calls": [{"id": "1"}]},
+            {"role": "assistant", "content": "b", "reasoning_content": "think", "tool_calls": [{"id": "2"}]},
+        ]
+    )
+    assert merged == [
+        {
+            "role": "assistant",
+            "content": "a\n\nb",
+            "tool_calls": [{"id": "1"}, {"id": "2"}],
+            "reasoning_content": "think",
+        }
+    ]
+    listed = _merge_consecutive_messages(
+        [
+            {"role": "user", "content": [{"type": "text", "text": "one"}]},
+            {"role": "user", "content": [{"type": "text", "text": "two"}]},
+        ]
+    )
+    assert listed[0]["content"][0]["text"] == "one"
+    assert listed[0]["content"][-1]["text"] == "two"
+
+
+def test_mcp_tool_call_and_agent_message_reach_chat():
+    from codex_shim.translate import responses_to_chat
+
+    out = responses_to_chat(
+        {
+            "model": "slug",
+            "input": [
+                {
+                    "type": "mcp_tool_call",
+                    "server": "exa",
+                    "tool": "web_search",
+                    "result": [{"type": "output_text", "text": "hits"}],
+                },
+                {
+                    "type": "agent_message",
+                    "author": "parent",
+                    "recipient": "child",
+                    "content": "Do the locale work.",
+                },
+                {
+                    "type": "tool_search_output",
+                    "call_id": "search-1",
+                    "tools": None,
+                },
+            ],
+        },
+        "real-model",
+    )
+    joined = json.dumps(out["messages"])
+    assert "MCP tool exa/web_search result" in joined
+    assert "hits" in joined
+    assert "[agent message from parent to child]" in joined
+    assert "Do the locale work." in joined
+
+
+def test_native_and_namespaced_tool_schemas_and_anthropic_tool_choice():
+    from codex_shim.translate import (
+        _anthropic_tool_choice_to_chat,
+        _responses_tool_function_name,
+        _responses_tools_to_chat_tools,
+        responses_tool_resolve_map,
+    )
+
+    tools = _responses_tools_to_chat_tools(
+        [
+            {
+                "type": "namespace",
+                "name": "mcp__exa",
+                "tools": [
+                    {"type": "function", "name": "web_search", "description": "Search", "parameters": {"type": "object"}},
+                    {"type": "skip"},
+                    "nope",
+                ],
+            },
+            {"type": "web_search"},
+            {"type": "mcp", "name": "jina"},
+        ]
+    )
+    names = [tool["function"]["name"] for tool in tools]
+    assert any("web_search" in name for name in names)
+    assert _responses_tool_function_name({"type": "apply_patch"}) == "apply_patch"
+    assert _responses_tool_function_name({"type": "mcp_custom"}) == "mcp_custom"
+    assert _anthropic_tool_choice_to_chat("any") == "required"
+    assert _anthropic_tool_choice_to_chat({"type": "any"}) == "required"
+    assert _anthropic_tool_choice_to_chat("lookup") == {"type": "function", "function": {"name": "lookup"}}
+    resolved = responses_tool_resolve_map(
+        [
+            "skip",
+            {
+                "type": "namespace",
+                "name": "mcp__exa",
+                "tools": [{"type": "function", "name": "web_search"}, {"type": "other"}],
+            },
+        ]
+    )
+    assert resolved
+    assert responses_tool_resolve_map("nope") == {}
+
+
+def test_apply_session_title_candidate_copies_reasoning():
+    from codex_shim.translate import SessionTitleCandidate, apply_session_title_candidate, namespaced_tool_chat_name
+
+    prepared = apply_session_title_candidate(
+        {"model": "old", "reasoning": {"effort": "medium"}},
+        SessionTitleCandidate("gpt-5.6-luna", reasoning_effort="low"),
+    )
+    assert prepared["model"] == "gpt-5.6-luna"
+    assert prepared["reasoning"]["effort"] == "low"
+    assert namespaced_tool_chat_name("", "shell") == "shell"
+    assert namespaced_tool_chat_name("mcp__exa", "web_search") == "mcp__exa.web_search"
+
+
+def test_image_url_from_part_file_url_and_nested():
+    from codex_shim.translate import _image_url_from_part
+
+    assert _image_url_from_part({"image_url": "https://a.example/x.png"}) == "https://a.example/x.png"
+    assert _image_url_from_part({"image_url": {"url": "https://b.example/y.png"}}) == "https://b.example/y.png"
+    assert _image_url_from_part({"file_url": "https://c.example/z.png"}) == "https://c.example/z.png"
+    assert _image_url_from_part({"url": "https://d.example/w.png"}) == "https://d.example/w.png"
+    assert _image_url_from_part({}) == ""
+
+
+def test_responses_tool_choice_to_chat_variants():
+    from codex_shim.translate import _responses_tool_choice_to_chat
+
+    tools = [{"type": "function", "function": {"name": "shell"}}]
+    assert _responses_tool_choice_to_chat(None, tools) is None
+    assert _responses_tool_choice_to_chat("auto", tools) == "auto"
+    assert _responses_tool_choice_to_chat("shell", tools) == {"type": "function", "function": {"name": "shell"}}
+    assert _responses_tool_choice_to_chat({"type": "function", "function": {"name": "shell"}}, tools) == {
+        "type": "function",
+        "function": {"name": "shell"},
+    }
+    mapped = _responses_tool_choice_to_chat({"type": "shell", "name": "shell"}, tools)
+    assert mapped["function"]["name"] == "shell"
+    assert _responses_tool_choice_to_chat(12, tools) == 12
+
+
+def test_responses_usage_to_anthropic_usage_copies_cache_fields():
+    from codex_shim.translate import _responses_usage_to_anthropic_usage
+
+    assert _responses_usage_to_anthropic_usage(None) is None
+    usage = _responses_usage_to_anthropic_usage(
+        {
+            "input_tokens": 10,
+            "output_tokens": 4,
+            "input_tokens_details": {
+                "cached_tokens": 3,
+                "cache_creation_input_tokens": 2,
+            },
+        }
+    )
+    assert usage["input_tokens"] == 10
+    assert usage["cache_read_input_tokens"] == 3
+    assert usage["cache_creation_input_tokens"] == 2
+    explicit = _responses_usage_to_anthropic_usage(
+        {"input_tokens": 1, "output_tokens": 1, "input_tokens_details": {"cache_read_input_tokens": 9}}
+    )
+    assert explicit["cache_read_input_tokens"] == 9
+
+
+def test_anthropic_thinking_blocks_become_chat_reasoning():
+    body = {
+        "model": "claude",
+        "messages": [
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "thinking", "thinking": "plan"},
+                    {"type": "redacted_thinking", "data": "hidden"},
+                    {"type": "text", "text": "hi"},
+                ],
+            }
+        ],
+    }
+    out = anthropic_messages_to_chat(body, "real-model")
+    assistant = out["messages"][0]
+    assert assistant["content"] == "hi"
+    assert "plan" in assistant["reasoning_content"]
+    assert "hidden" in assistant["reasoning_content"]

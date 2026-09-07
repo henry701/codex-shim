@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-from pathlib import Path
 
 from codex_shim.catalog import write_catalog
 from codex_shim.catalog_context import (

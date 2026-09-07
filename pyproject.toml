@@ -29,6 +29,8 @@ dependencies = [
 dev = [
   "pytest>=8",
   "pytest-asyncio>=0.23",
+  "pytest-cov>=6",
+  "ruff>=0.12",
 ]
 
 [project.urls]
@@ -39,11 +41,30 @@ Issues = "https://github.com/0xSero/codex-shim/issues"
 [project.scripts]
 codex-shim = "codex_shim.cli:_entrypoint"
 
+[tool.setuptools.packages.find]
+include = ["codex_shim*"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+pythonpath = ["."]
 asyncio_mode = "auto"
 markers = [
   "enable_model_discovery: allow live provider discovery during tests",
   "nous_portal: exercise Nous Portal credential resolution and discovery",
   "integration: live external tool tests (cursor-agent, tmux); skipped in CI by default",
 ]
+
+[tool.ruff]
+target-version = "py311"
+src = ["codex_shim", "lint", "tests"]
+
+[tool.ruff.lint]
+select = ["ASYNC", "F401", "F841", "E9", "F63", "F7", "F82"]
+ignore = [
+  # Cooperative asyncio.sleep polls are not event-loop blocking.
+  "ASYNC110",
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Test helpers read fixtures on the event loop; not the aiohttp serve path.
+"tests/**" = ["ASYNC240"]

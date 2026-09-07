@@ -621,7 +621,6 @@ async def test_bridge_tool_output_followup_never_uses_delivery_stub():
     from pathlib import Path
 
     from codex_shim.cursor_bridge import (
-        BRIDGE_DELIVERY_STUB_MARKER,
         decide_tool_output_followup,
     )
 

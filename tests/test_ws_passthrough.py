@@ -22,6 +22,12 @@ from codex_shim.ws_passthrough import (
 )
 
 
+def test_ws_passthrough_session_has_no_ping_client():
+    """Keepalives are DownstreamPinger + ping_websocket, not a session method."""
+    assert not hasattr(WsPassthroughSession, "ping_client")
+    assert not hasattr(WsPassthroughSession, "wait_ws_throttle")
+
+
 def test_ws_passthrough_enabled_default_on():
     assert ws_passthrough_enabled() is True
 
@@ -297,6 +303,43 @@ async def test_relay_close_frame_drops_lane():
     assert url not in session.upstream_by_url
     sent = json.loads(client_ws.send_str.await_args.args[0])
     assert sent["type"] == "response.incomplete"
+
+
+@pytest.mark.asyncio
+async def test_relay_forwards_rate_limits_updated_instead_of_throttling():
+    client_ws = AsyncMock()
+    client_ws.closed = False
+    events = [
+        json.dumps(
+            {
+                "type": "rate_limits.updated",
+                "rate_limits": [{"name": "requests", "limit": 10000, "remaining": 9999}],
+            }
+        ),
+        json.dumps(
+            {
+                "type": "response.completed",
+                "response": {"id": "r1", "model": "gpt-5.5", "status": "completed"},
+            }
+        ),
+    ]
+    session = WsPassthroughSession(client_session=AsyncMock(), client_ws=client_ws)
+    url = "wss://chatgpt.com/backend-api/codex/responses"
+    session.upstream_by_url[url] = FakeUpstreamWs(events)
+    sent: list[dict] = []
+
+    async def capture(event: dict) -> None:
+        sent.append(event)
+
+    terminal = await session.relay_until_terminal(
+        source="chatgpt-passthrough-ws",
+        upstream_url=url,
+        write_event=capture,
+    )
+    assert terminal is not None
+    assert terminal["type"] == "response.completed"
+    assert [event["type"] for event in sent] == ["rate_limits.updated", "response.completed"]
+    assert url in session.upstream_by_url
 
 
 @pytest.mark.asyncio

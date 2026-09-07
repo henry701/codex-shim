@@ -7,16 +7,46 @@ and this project does not yet follow semantic versioning (pre-1.0).
 
 ## Unreleased
 
+### Added
+
+- Net invariant lint (`lint/net_invariants.py`, `lint/rules/*.yml`) so
+  retry/throttle cannot grow a `ping_fn`, `DownstreamPinger` stays
+  sleep-then-ping, `time.sleep` / `urlopen` / `request_urllib` /
+  `throttle_sleep_sync` cannot land in `async def` on the serve path, and
+  `loop.run_until_complete` is forbidden there. CI runs
+  the checker and Ruff (`ASYNC` + unused-code). Live smoke:
+  `scripts/smoke_net_surfaces.sh` (chatgpt, opencode, nvidia, openrouter,
+  muse, zai). HTTP/WS 429 backoff is per request / per connection.
+  Smoke `codex exec` overrides `mcp_servers={}` so a pong turn does not
+  spawn the operator's full MCP suite (`scripts/codex_exec_smoke.sh`).
+
+- Removed the unused DuckDuckGo `_perform_web_search` helper (it called
+  blocking `urlopen` and `run_until_complete` on a running loop, and nothing
+  invoked it). Hosted `web_search` translation in `translate.py` is unchanged.
+  Removed the shadowed `codex_shim/compaction.py` file that the
+  `compaction/` package already replaced.
+
 ### Fixed
+
+- ChatGPT Codex WebSocket `rate_limits.updated` telemetry was classified as
+  HTTP 429 because `ratelimit` is a substring of `ratelimits`, then the shim
+  synthesized `status=429` and backed off for up to an hour. Throttle
+  matching is now exact (`error.type` / `error.code` allowlist, word-boundary
+  phrases, or a real HTTP 429). Logs include `cause=` so the next false
+  positive is visible.
 
 - Upstream HTTP 429 / quota errors are absorbed in the shim instead of being
   returned to Desktop (`retry_429` stays off). Rate-limit waits ramp from 60s
-  to 1h with jitter, then stay at 1h until success or Desktop disconnects.
-  ChatGPT `usage_limit_reached` quota waits at the 1h cap (or a shorter
-  `resets_in_seconds`) and also retry until success. Concurrent HTTP to the
-  same origin shares a cooldown gate; WebSocket lanes wait on their own
-  connection. Streaming SSE/WS keepalives start before those waits so Codex
-  does not idle-timeout `stream.next()`.
+  to 1h with jitter (clamped again after jitter), then stay at 1h until
+  success or the client disconnects. ChatGPT `usage_limit_reached` quota waits
+  at the 1h cap (or a shorter `resets_in_seconds`) and also retry until
+  success. Backoff is per HTTP request and per inbound WebSocket connection,
+  not a process-wide origin gate, so a 429 on OpenCode does not stall ChatGPT
+  or an unrelated session. Downstream keepalives are a single background
+  pinger (SSE and WebSocket) that emits `{"type":"ping"}` every 4–6s while the
+  client is idle, including during those upstream waits, so Desktop's 15s
+  timers do not fire. Sync urllib 429 waits refuse to `time.sleep` on the
+  aiohttp event loop.
 
 - OpenCode Console `/v1/responses` 400s when a `function_call` in history has
   empty `arguments` (`[invalid_request_error] arguments must be valid JSON`).

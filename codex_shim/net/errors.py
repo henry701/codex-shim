@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import errno
 import json
+import re
 from typing import Any
 
 RETRYABLE_STATUS = frozenset({408, 425, 429, 500, 502, 503, 504})
@@ -54,14 +55,29 @@ THROTTLE_RATE_LIMIT = "rate_limit"
 THROTTLE_QUOTA = "quota"
 THROTTLE_TRANSPORT = "transport"
 
-_QUOTA_TYPES = frozenset(
+_RATE_LIMIT_CODES = frozenset(
     {
+        "429",
+        "rate_limit",
+        "rate_limit_error",
+        "rate_limit_exceeded",
+        "free_usage_limit_error",
+        "freeusagelimiterror",
+        "too_many_requests",
+        "too_many_requests_error",
+    }
+)
+_QUOTA_CODES = frozenset(
+    {
+        "usage_limit",
         "usage_limit_reached",
         "quota_exceeded",
         "quotaexceeded",
-        "usage_limit",
     }
 )
+_STREAM_EVENT_TYPES = frozenset({"error", "ping", "pong"})
+_RATE_LIMIT_PHRASE = re.compile(r"(?i)(?<![a-z0-9])(?:rate limit|too many requests)(?![a-z0-9])")
+_QUOTA_PHRASE = re.compile(r"(?i)(?<![a-z0-9])usage limit(?![a-z0-9])")
 
 
 def _json_object(body: str | None) -> dict[str, Any]:
@@ -79,21 +95,87 @@ def _error_object(payload: dict[str, Any]) -> dict[str, Any]:
     return err if isinstance(err, dict) else {}
 
 
-def _error_tokens(body: str | None) -> str:
-    payload = _json_object(body)
+def _norm_code(value: Any) -> str:
+    if value is None or isinstance(value, bool):
+        return ""
+    if isinstance(value, int):
+        return str(value)
+    return str(value).strip().lower().replace("-", "_")
+
+
+def _is_stream_event_type(value: Any) -> bool:
+    text = str(value or "").strip().lower()
+    if not text:
+        return False
+    return "." in text or text in _STREAM_EVENT_TYPES
+
+
+def _error_ident_fields(payload: dict[str, Any]) -> list[tuple[str, str, Any]]:
+    fields: list[tuple[str, str, Any]] = []
     err = _error_object(payload)
-    return " ".join(
-        str(item).lower()
-        for item in (
-            err.get("type"),
-            err.get("code"),
-            payload.get("type"),
-            payload.get("code"),
-            err.get("message"),
-            payload.get("message"),
-        )
-        if item is not None
-    )
+    for source, raw in (("error.type", err.get("type")), ("error.code", err.get("code"))):
+        ident = _norm_code(raw)
+        if ident:
+            fields.append((source, ident, raw))
+    top_type = payload.get("type")
+    if top_type is not None and not _is_stream_event_type(top_type):
+        ident = _norm_code(top_type)
+        if ident:
+            fields.append(("type", ident, top_type))
+    ident = _norm_code(payload.get("code"))
+    if ident:
+        fields.append(("code", ident, payload.get("code")))
+    return fields
+
+
+def _error_messages(payload: dict[str, Any]) -> list[str]:
+    err = _error_object(payload)
+    messages: list[str] = []
+    for item in (err.get("message"), payload.get("message")):
+        if isinstance(item, str) and item.strip():
+            messages.append(item)
+    return messages
+
+
+def throttle_match_cause(
+    *,
+    status: int | None = None,
+    body: str | None = None,
+    exc: BaseException | None = None,
+) -> str | None:
+    matched = match_throttle(status=status, body=body, exc=exc)
+    return None if matched is None else matched[1]
+
+
+def match_throttle(
+    *,
+    status: int | None = None,
+    body: str | None = None,
+    exc: BaseException | None = None,
+) -> tuple[str, str] | None:
+    resolved = status if status is not None else exception_http_status(exc)
+    blob = body
+    if blob is None and exc is not None:
+        blob = str(exc)
+    payload = _json_object(blob)
+    for source, ident, original in _error_ident_fields(payload):
+        if ident in _QUOTA_CODES:
+            return THROTTLE_QUOTA, f"{source}={original}"
+    for message in _error_messages(payload):
+        if _QUOTA_PHRASE.search(message) and _RATE_LIMIT_PHRASE.search(message) is None:
+            return THROTTLE_QUOTA, "error.message_phrase=usage limit"
+    err = _error_object(payload)
+    if err.get("plan_type") and parse_resets_in_seconds(blob) is not None:
+        return THROTTLE_QUOTA, "error.plan_type+resets"
+    for source, ident, original in _error_ident_fields(payload):
+        if ident in _RATE_LIMIT_CODES:
+            return THROTTLE_RATE_LIMIT, f"{source}={original}"
+    for message in _error_messages(payload):
+        if _RATE_LIMIT_PHRASE.search(message):
+            return THROTTLE_RATE_LIMIT, "error.message_phrase=rate limit"
+    if resolved == 429:
+        return THROTTLE_RATE_LIMIT, "http_status=429"
+    return None
 
 
 def parse_resets_in_seconds(body: str | None) -> float | None:
@@ -126,37 +208,13 @@ def parse_resets_in_seconds(body: str | None) -> float | None:
 
 def is_quota_limit(status: int | None, body: str | None) -> bool:
     del status
-    payload = _json_object(body)
-    err = _error_object(payload)
-    tokens = _error_tokens(body)
-    if any(marker in tokens for marker in _QUOTA_TYPES):
-        return True
-    if err.get("plan_type") and parse_resets_in_seconds(body) is not None:
-        return True
-    if "usage limit" in tokens and "rate limit" not in tokens:
-        return True
-    return False
+    matched = match_throttle(body=body)
+    return matched is not None and matched[0] == THROTTLE_QUOTA
 
 
 def is_rate_limit(status: int | None, body: str | None) -> bool:
-    if is_quota_limit(status, body):
-        return False
-    if status == 429:
-        return True
-    compact = (
-        _error_tokens(body)
-        .replace(" ", "")
-        .replace("_", "")
-        .replace("-", "")
-    )
-    return any(
-        marker in compact
-        for marker in (
-            "freeusagelimiterror",
-            "ratelimit",
-            "toomanyrequests",
-        )
-    )
+    matched = match_throttle(status=status, body=body)
+    return matched is not None and matched[0] == THROTTLE_RATE_LIMIT
 
 
 def exception_http_status(exc: BaseException | None) -> int | None:
@@ -177,16 +235,12 @@ def classify_throttle(
     exc: BaseException | None = None,
 ) -> str:
     del content_type
-    resolved_status = status if status is not None else exception_http_status(exc)
-    blob = body
-    if blob is None and exc is not None:
-        blob = str(exc)
-    if is_quota_limit(resolved_status, blob):
-        return THROTTLE_QUOTA
-    if is_rate_limit(resolved_status, blob):
-        return THROTTLE_RATE_LIMIT
+    matched = match_throttle(status=status, body=body, exc=exc)
+    if matched is not None:
+        return matched[0]
     if exc is not None and is_retryable_exception(exc):
         return THROTTLE_TRANSPORT
+    resolved_status = status if status is not None else exception_http_status(exc)
     if is_retryable_status(resolved_status):
         return THROTTLE_TRANSPORT
     return THROTTLE_NONE

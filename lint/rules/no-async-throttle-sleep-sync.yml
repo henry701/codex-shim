@@ -1,0 +1,16 @@
+id: no-async-throttle-sleep-sync
+language: python
+severity: error
+message: throttle_sleep_sync in async def blocks the aiohttp loop (or raises); use throttle_sleep.
+rule:
+  pattern: |
+    async def $FUNC($$$ARGS):
+      $$$BODY
+  has:
+    pattern: throttle_sleep_sync($$$A)
+    stopBy: end
+files:
+  - "codex_shim/net/**/*.py"
+  - "codex_shim/ws_passthrough.py"
+  - "codex_shim/chatgpt_edge.py"
+  - "codex_shim/server.py"

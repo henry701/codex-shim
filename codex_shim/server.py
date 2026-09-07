@@ -32,7 +32,9 @@ from .net.errors import chat_chunk_upstream_error, parse_upstream_error
 from .net.retry import retry_aiohttp_post, retry_policy_from_env
 from .net.sse import (
     ClientDisconnected,
+    DownstreamPinger,
     close_upstream as _close_upstream,
+    ping_websocket,
     request_disconnected as _request_disconnected,
     sse_lines as _sse_lines,
     write_anthropic_sse as _net_write_anthropic_sse,
@@ -61,13 +63,12 @@ from .compaction import (
     strip_terminal_compaction_trigger,
 )
 from .compaction.adapters import compaction_orchestrator_for, compaction_request_from_v2
+from .compaction.input_audit import summarize_compaction_input_item_types as _summarize_compaction_input_items
 from .compaction.logging import (
-    log_compaction_cache_expansion,
     log_compaction_input_snapshot,
     log_compaction_upstream_body,
 )
 from .compaction.errors import byok_upstream_context
-from .compaction.input_audit import summarize_compaction_input_items
 from .compaction.model_resolver import CompactionModelResolver
 from .compaction.orchestrator import (
     CompactionOrchestratorError,
@@ -896,9 +897,6 @@ class ShimServer:
             "auto_router": auto_router,
         }
 
-    def _compute_health_snapshot(self) -> dict[str, Any]:
-        return self._compute_health_snapshot_from_models(self.models_cached_or_load())
-
     def models_cached_or_load(self) -> list[ShimModel]:
         """Sync model list for paths that cannot await ``_load_models`` (e.g. compaction)."""
         now = time.monotonic()
@@ -969,10 +967,6 @@ class ShimServer:
                 }
             )
         return web.json_response(sort_catalog_entries(data))
-
-    def _valid_picker_token(self, request: web.Request) -> bool:
-        token = request.headers.get(PICKER_TOKEN_HEADER, "")
-        return secrets.compare_digest(token, self.picker_token)
 
     def _valid_picker_token(self, request: web.Request) -> bool:
         token = request.headers.get(PICKER_TOKEN_HEADER, "")
@@ -1090,65 +1084,70 @@ class ShimServer:
         ws = web.WebSocketResponse(compress=True, heartbeat=30)
         await ws.prepare(request)
         passthrough: WsPassthroughSession | None = None
-        async with ClientSession(timeout=self.timeout) as http_session:
-            async for msg in ws:
-                if msg.type == WSMsgType.TEXT:
-                    try:
-                        payload = json.loads(msg.data)
-                    except json.JSONDecodeError:
-                        await _write_ws_error(ws, 400, "invalid_request_error", "invalid JSON websocket frame")
-                        continue
-                    if not isinstance(payload, dict):
-                        await _write_ws_error(ws, 400, "invalid_request_error", "websocket frame must be a JSON object")
-                        continue
-                    if payload.get("type") != "response.create":
-                        await _write_ws_error(
-                            ws,
-                            400,
-                            "invalid_request_error",
-                            "only response.create websocket frames are supported",
-                        )
-                        continue
-                    body = {k: v for k, v in payload.items() if k != "type"}
-                    if _shim_io_log_enabled() or _input_has_compaction_trigger(body.get("input")):
-                        _log_client_request("/v1/responses/ws", body, transport="ws")
-                    if await self._maybe_handle_ws_compaction_v2(request, ws, payload):
-                        continue
-                    target = await self._resolve_ws_passthrough_target(payload)
-                    if target is not None and ws_passthrough_enabled():
-                        if passthrough is None:
-                            passthrough = WsPassthroughSession(client_session=http_session, client_ws=ws)
-                            self._register_ws_passthrough(passthrough)
-                        handled = await self._handle_ws_passthrough_response_create(
-                            request,
-                            passthrough,
-                            payload,
-                            target,
-                        )
-                        if handled:
+        pinger = DownstreamPinger(lambda: ping_websocket(ws), owner_task=asyncio.current_task())
+        pinger.start()
+        try:
+            async with ClientSession(timeout=self.timeout) as http_session:
+                async for msg in ws:
+                    if msg.type == WSMsgType.TEXT:
+                        try:
+                            payload = json.loads(msg.data)
+                        except json.JSONDecodeError:
+                            await _write_ws_error(ws, 400, "invalid_request_error", "invalid JSON websocket frame")
                             continue
-                    if target is not None and target.kind == "chatgpt":
-                        await self._handle_chatgpt_response_create_websocket_http(
+                        if not isinstance(payload, dict):
+                            await _write_ws_error(ws, 400, "invalid_request_error", "websocket frame must be a JSON object")
+                            continue
+                        if payload.get("type") != "response.create":
+                            await _write_ws_error(
+                                ws,
+                                400,
+                                "invalid_request_error",
+                                "only response.create websocket frames are supported",
+                            )
+                            continue
+                        body = {k: v for k, v in payload.items() if k != "type"}
+                        if _shim_io_log_enabled() or _input_has_compaction_trigger(body.get("input")):
+                            _log_client_request("/v1/responses/ws", body, transport="ws")
+                        if await self._maybe_handle_ws_compaction_v2(request, ws, payload):
+                            continue
+                        target = await self._resolve_ws_passthrough_target(payload)
+                        if target is not None and ws_passthrough_enabled():
+                            if passthrough is None:
+                                passthrough = WsPassthroughSession(client_session=http_session, client_ws=ws)
+                                self._register_ws_passthrough(passthrough)
+                            handled = await self._handle_ws_passthrough_response_create(
+                                request,
+                                passthrough,
+                                payload,
+                                target,
+                            )
+                            if handled:
+                                continue
+                        if target is not None and target.kind == "chatgpt":
+                            await self._handle_chatgpt_response_create_websocket_http(
+                                request,
+                                ws,
+                                payload,
+                                target,
+                                http_session=http_session,
+                            )
+                            continue
+                        await self._handle_local_response_create_websocket(
                             request,
                             ws,
                             payload,
-                            target,
                             http_session=http_session,
                         )
-                        continue
-                    await self._handle_local_response_create_websocket(
-                        request,
-                        ws,
-                        payload,
-                        http_session=http_session,
-                    )
-                elif msg.type == WSMsgType.BINARY:
-                    await _write_ws_error(ws, 400, "invalid_request_error", "binary websocket frames are not supported")
-                elif msg.type == WSMsgType.ERROR:
-                    break
-            if passthrough is not None:
-                await passthrough.close_upstream()
-                self._unregister_ws_passthrough(passthrough)
+                    elif msg.type == WSMsgType.BINARY:
+                        await _write_ws_error(ws, 400, "invalid_request_error", "binary websocket frames are not supported")
+                    elif msg.type == WSMsgType.ERROR:
+                        break
+                if passthrough is not None:
+                    await passthrough.close_upstream()
+                    self._unregister_ws_passthrough(passthrough)
+        finally:
+            await pinger.stop()
         return ws
 
     @dataclass(frozen=True)
@@ -1503,18 +1502,12 @@ class ShimServer:
         print(f"[ws-passthrough] http-fallback POST {url}", flush=True)
         log_upstream_request("chatgpt-passthrough-ws-http", url, forwarded)
 
-        async def ping_ws() -> None:
-            if getattr(ws, "closed", False):
-                raise ClientDisconnected()
-            await ws.send_str('{"type":"ping"}')
-
         posted = await post_chatgpt_with_retry(
             http_session,
             url,
             json=forwarded,
             headers=headers,
             disconnect_fn=lambda: _request_disconnected(request) or bool(getattr(ws, "closed", False)),
-            ping_fn=ping_ws,
         )
         upstream = posted.response
         upstream_forward_headers = observe_upstream_response("chatgpt-passthrough-ws", upstream)
@@ -1649,11 +1642,6 @@ class ShimServer:
         request: web.Request,
         ws: web.WebSocketResponse,
     ) -> None:
-        async def ping_ws() -> None:
-            if getattr(ws, "closed", False):
-                raise ClientDisconnected()
-            await ws.send_str('{"type":"ping"}')
-
         posted = await retry_aiohttp_post(
             session,
             url,
@@ -1662,7 +1650,6 @@ class ShimServer:
             policy=retry_policy_from_env(),
             label="local-response-create-http",
             disconnect_fn=lambda: _request_disconnected(request) or bool(getattr(ws, "closed", False)),
-            ping_fn=ping_ws,
         )
         if posted.status >= 400:
             text = posted.error_text or ""
@@ -2380,9 +2367,6 @@ class ShimServer:
             orphan_synthesis=orphan_synthesis,
         )
 
-    def _prepare_chatgpt_passthrough_body(self, body: dict[str, Any], *, session_key: str) -> dict[str, Any]:
-        return self._prepare_chatgpt_passthrough_body_http(body, session_key=session_key)
-
     def _build_turn_cache_items(
         self,
         request: web.Request,
@@ -2844,7 +2828,6 @@ class ShimServer:
             raise web.HTTPUnauthorized(text="~/.codex/auth.json not found")
         tokens = auth.get("tokens") or {}
         access_token = tokens.get("access_token")
-        account_id = tokens.get("account_id") or ""
         if not access_token:
             fallback = await self._maybe_passthrough_byok_fallback(
                 request,
@@ -5853,9 +5836,6 @@ class ResponsesStreamState:
             },
         )
 
-    def all_tool_calls(self) -> dict[int, dict[str, Any]]:
-        return dict(self.tool_calls)
-
     # ------------------------------------------------------------------
     # Anthropic deltas
     # ------------------------------------------------------------------
@@ -6501,214 +6481,6 @@ def _encode_thinking_payload(payload: dict[str, Any]) -> str:
     return _THINKING_MAGIC + base64.urlsafe_b64encode(raw).decode("ascii")
 
 
-def _decode_thinking_payload(encoded: str) -> dict[str, Any] | None:
-    import base64
-
-    if not isinstance(encoded, str) or not encoded.startswith(_THINKING_MAGIC):
-        return None
-    blob = encoded[len(_THINKING_MAGIC) :]
-    try:
-        raw = base64.urlsafe_b64decode(blob.encode("ascii"))
-        data = json.loads(raw.decode("utf-8"))
-    except Exception:
-        return None
-    return data if isinstance(data, dict) else None
-
-
-def _build_tool_types(body: dict[str, Any]) -> dict[str, str]:
-    """Build a map sanitized tool name -> original tool type from the request tools array.
-
-    Codex Desktop emits native tools like `{"type": "apply_patch"}` and MCP tools
-    like `{"type": "mcp__node_repl", "function": {"name": "js"}}`. When we translate
-    those into chat-completions `function` tools, the original type is lost. We
-    preserve it here so the Responses streaming translator can emit the correct
-    output item type (e.g. `custom_tool_call` for freeform apply_patch instead of
-    generic `function_call`).
-    """
-    tool_types: dict[str, str] = {}
-    for tool in body.get("tools") or []:
-        if not isinstance(tool, dict):
-            continue
-        tool_type = str(tool.get("type") or "").strip().lower()
-        fn = tool.get("function")
-        if isinstance(fn, dict) and fn.get("name"):
-            name = str(fn["name"]).strip()
-        elif tool.get("name"):
-            name = str(tool["name"]).strip()
-        else:
-            name = tool_type
-        clean = re.sub(r"[^a-zA-Z0-9_-]+", "_", name.strip())[:64].strip("_")
-        if clean:
-            tool_types[clean] = tool_type
-    return tool_types
-
-async def _perform_web_search(query: str) -> str:
-    """Execute a web search via DuckDuckGo and return text results.
-
-    This is a server-side fallback for custom models whose provider does not
-    have a native web-search capability.  Codex Desktop expects the shim to
-    return results as a `function_call_output` (or `web_search_call`) item;
-    when the model is BYOK, the Desktop app does not execute the search itself,
-    so the shim must do it and feed the results back into the conversation.
-    """
-    import urllib.parse
-    import urllib.request
-
-    if not query or not query.strip():
-        return "No search query provided."
-
-    # DuckDuckGo lite HTML endpoint (no API key required)
-    url = (
-        "https://html.duckduckgo.com/html/"
-        + "?q="
-        + urllib.parse.quote_plus(query.strip())
-    )
-    req = urllib.request.Request(
-        url,
-        headers={
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/120.0.0.0 Safari/537.36"
-        },
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            html = resp.read().decode("utf-8", errors="replace")
-    except Exception as exc:
-        return f"Web search failed: {exc}"
-
-    # Extract title + snippet from result links
-    results: list[str] = []
-    # Each result is in a `.result` div with `.result__a` (title/link) and `.result__snippet`
-    from html.parser import HTMLParser
-
-    class _ResultParser(HTMLParser):
-        def __init__(self) -> None:
-            super().__init__()
-            self.in_result = False
-            self.in_a = False
-            self.in_snippet = False
-            self.current_title = ""
-            self.current_snippet = ""
-            self.results: list[dict[str, str]] = []
-            self._tag_stack: list[str] = []
-            self._class_stack: list[str] = []
-
-        def _current_class(self) -> str:
-            return self._class_stack[-1] if self._class_stack else ""
-
-        def handle_starttag(self, tag: str, attrs_list: list[tuple[str, str | None]]) -> None:
-            attrs = dict(attrs_list)
-            cls = (attrs.get("class") or "").lower()
-            self._tag_stack.append(tag)
-            self._class_stack.append(cls)
-            if "result" in cls and tag == "div":
-                self.in_result = True
-                self.current_title = ""
-                self.current_snippet = ""
-            if self.in_result and tag == "a" and "result__a" in cls:
-                self.in_a = True
-            if self.in_result and ("result__snippet" in cls or "result__body" in cls):
-                self.in_snippet = True
-
-        def handle_endtag(self, tag: str) -> None:
-            if self._tag_stack and self._tag_stack[-1] == tag:
-                self._tag_stack.pop()
-                self._class_stack.pop()
-            if tag == "div" and self.in_result:
-                if self.current_title or self.current_snippet:
-                    self.results.append(
-                        {
-                            "title": self.current_title.strip(),
-                            "snippet": self.current_snippet.strip(),
-                        }
-                    )
-                self.in_result = False
-            if tag == "a":
-                self.in_a = False
-            if tag in {"div", "span", "p"}:
-                self.in_snippet = False
-
-        def handle_data(self, data: str) -> None:
-            if self.in_a:
-                self.current_title += data
-            if self.in_snippet:
-                self.current_snippet += data
-
-    parser = _ResultParser()
-    parser.feed(html)
-    for r in parser.results[:5]:
-        title = r["title"].replace("\n", " ")
-        snippet = r["snippet"].replace("\n", " ")
-        if title and snippet:
-            results.append(f"{title}\n{snippet}")
-        elif title:
-            results.append(title)
-        elif snippet:
-            results.append(snippet)
-
-    if not results:
-        return "No web search results found."
-    return "\n\n".join(results)
-
-def _maybe_intercept_web_search(payload: dict[str, Any]) -> dict[str, Any] | None:
-    """If the response payload contains a web_search_call, execute it server-side
-    and return a new payload with the results embedded as a function_call_output.
-
-    Returns None if no web_search_call is present (pass through unchanged).
-    """
-    output = payload.get("output") or []
-    if not isinstance(output, list):
-        return None
-    search_calls: list[tuple[int, dict[str, Any]]] = []
-    for i, item in enumerate(output):
-        if isinstance(item, dict) and item.get("type") == "web_search_call":
-            search_calls.append((i, item))
-    if not search_calls:
-        return None
-
-    # Build synthetic search results
-    results: list[dict[str, Any]] = []
-    for idx, call in search_calls:
-        try:
-            args = json.loads(call.get("arguments") or "{}")
-        except json.JSONDecodeError:
-            args = {}
-        query = args.get("query") or ""
-        # Run the search synchronously (non-streaming path only)
-        import asyncio
-        try:
-            loop = asyncio.get_running_loop()
-            result_text = loop.run_until_complete(_perform_web_search(query))
-        except RuntimeError:
-            result_text = "Web search unavailable in this context."
-        results.append({
-            "id": f"wso_{call.get('call_id', '0')}",
-            "type": "function_call_output",
-            "status": "completed",
-            "call_id": call.get("call_id"),
-            "output": result_text,
-        })
-
-    # Replace web_search_call items with their results
-    new_output: list[dict[str, Any]] = []
-    for i, item in enumerate(output):
-        if isinstance(item, dict) and item.get("type") == "web_search_call":
-            # Find matching result
-            for r in results:
-                if r.get("call_id") == item.get("call_id"):
-                    new_output.append(r)
-                    break
-            else:
-                new_output.append(item)
-        else:
-            new_output.append(item)
-
-    new_payload = dict(payload)
-    new_payload["output"] = new_output
-    return new_payload
-
-
 _VERSIONED_BASE_RE = re.compile(r"(?:^|/)v\d+$")
 
 
@@ -7147,34 +6919,6 @@ def _log_chatgpt_passthrough_trace(
     )
 
 
-def _summarize_compaction_input_items(input_items: Any) -> list[str]:
-    if not isinstance(input_items, list):
-        return []
-    summary: list[str] = []
-    for item in input_items:
-        if not isinstance(item, dict):
-            summary.append("?")
-            continue
-        item_type = str(item.get("type") or item.get("role") or "?")
-        extra = ""
-        if item_type == "function_call":
-            extra = f" name={item.get('name', '?')!r}"
-        elif item_type == "function_call_output":
-            extra = f" call_id={str(item.get('call_id', ''))[:24]!r}"
-        elif item_type == "message":
-            role = item.get("role")
-            if role:
-                extra = f" role={role!r}"
-        summary.append(f"{item_type}{extra}")
-    return summary
-
-
-def _log_compaction_sanitization_warnings(warnings: list[str]) -> None:
-    for warning in warnings:
-        if warning:
-            print(f"[warn] compaction: {warning}", flush=True)
-
-
 def _log_compaction_upstream_trace(
     *,
     phase: str,
@@ -7217,14 +6961,6 @@ def _compact_request_body(body: dict[str, Any], upstream_model: str) -> dict[str
         "input": body.get("input") or [],
         "max_output_tokens": body.get("max_output_tokens") or body.get("max_tokens") or 4096,
         "stream": False,
-    }
-
-
-def _chatgpt_compact_request_body(stripped_input: list[Any], upstream_model: str) -> dict[str, Any]:
-    return {
-        "model": upstream_model,
-        "instructions": _default_compact_instructions(),
-        "input": stripped_input,
     }
 
 
@@ -7329,32 +7065,6 @@ async def _stream_responses_error_from_body(
     except Exception:
         pass
     return response
-
-
-async def _error_response(
-    upstream,
-    *,
-    slug: str | None = None,
-    url: str | None = None,
-    request_body: dict[str, Any] | None = None,
-) -> web.Response:
-    observe_upstream_response(f"upstream-error:{slug or 'unknown'}", upstream)
-    text = await upstream.text()
-    status = upstream.status
-    content_type = upstream.content_type or "text/plain"
-    code, message = parse_upstream_error(text, status)
-    if slug:
-        print(f"[err] upstream {slug} returned {status}: {message[:500]}", flush=True)
-    log_upstream_response(
-        slug or "upstream-error",
-        url or slug or "unknown",
-        status,
-        text,
-        request_body=request_body,
-    )
-    upstream_response_headers = upstream_headers_from_response(upstream)
-    upstream.release()
-    return _upstream_text_response(status, text, content_type=content_type, upstream_headers=upstream_response_headers)
 
 
 def _upstream_text_response(

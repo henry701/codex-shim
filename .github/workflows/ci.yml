@@ -27,5 +27,15 @@ jobs:
         run: uv sync --frozen --extra dev
       - name: Compile check
         run: uv run python -m compileall codex_shim/ -q
+      - name: Net invariant lint
+        run: uv run python lint/net_invariants.py
+      - name: Smoke script syntax
+        run: |
+          bash -n scripts/smoke_chatgpt_passthrough.sh
+          bash -n scripts/smoke_opencode_free.sh
+          bash -n scripts/smoke_net_surfaces.sh
+          bash -n scripts/codex_exec_smoke.sh
+      - name: Ruff
+        run: uv run ruff check codex_shim lint tests
       - name: Run tests
-        run: uv run pytest tests/ -q
+        run: uv run pytest tests/ -q --cov=codex_shim --cov-fail-under=95

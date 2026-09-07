@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from .errors import describe_upstream_error, upstream_error_message
+from .errors import describe_upstream_error
 from .logging import log_compaction_fallback, log_compaction_phase, log_compaction_path, log_compaction_warnings
 from .model_resolver import CompactionModelResolver, ResolvedCompactionModels
 from .local import deterministic_fallback_summary, summary_is_usable

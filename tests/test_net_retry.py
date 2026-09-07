@@ -7,27 +7,22 @@ from urllib.error import HTTPError, URLError
 import pytest
 
 from codex_shim.net.errors import (
+    THROTTLE_RATE_LIMIT,
     chat_chunk_upstream_error,
     is_retryable_exception,
     parse_upstream_error,
 )
 from codex_shim.net.retry import (
+    RequestThrottle,
     RetryPolicy,
-    configure_origin_backoff,
-    get_origin_backoff,
+    next_throttle_delay,
     request_urllib,
-    reset_origin_backoff,
     retry_aiohttp_post,
     retry_aiohttp_ws_connect,
     retry_policy_from_env,
+    throttle_sleep,
+    throttle_sleep_sync,
 )
-
-
-@pytest.fixture(autouse=True)
-def _reset_origin_backoff_between_tests():
-    reset_origin_backoff()
-    yield
-    reset_origin_backoff()
 
 
 def _rate_limit_policy(**overrides):
@@ -727,17 +722,31 @@ async def test_retry_aiohttp_post_retry_after_7200_clamps_to_max(monkeypatch):
     assert sleeps == pytest.approx([3600.0], abs=0.05)
 
 
-async def test_retry_aiohttp_post_http_origin_gate_blocks_second_post(monkeypatch):
-    sleeps: list[float] = []
+def test_next_throttle_delay_jitter_cannot_exceed_rate_limit_max(monkeypatch):
+    monkeypatch.setattr("codex_shim.net.retry.random.uniform", lambda lo, hi: hi)
+    state = RequestThrottle()
+    delay = next_throttle_delay(
+        state,
+        THROTTLE_RATE_LIMIT,
+        _rate_limit_policy(rate_limit_jitter=0.2),
+        retry_after=7200.0,
+    )
+    assert delay == 3600.0
+    assert state.last_delay == 3600.0
+
+
+async def test_retry_aiohttp_post_does_not_block_unrelated_http_request(monkeypatch):
+    """A 429 on one POST must not stall a second HTTP request to the same host."""
+    sleeps: list[tuple[str, float]] = []
     post_order: list[str] = []
     a_waiting = __import__("asyncio").Event()
     b_finished = __import__("asyncio").Event()
 
     async def fake_sleep(seconds: float) -> None:
-        sleeps.append(seconds)
         task = __import__("asyncio").current_task()
         name = task.get_name() if task is not None else ""
-        if name == "gate-a" and not a_waiting.is_set():
+        sleeps.append((name, seconds))
+        if name == "req-a" and not a_waiting.is_set():
             a_waiting.set()
             await b_finished.wait()
 
@@ -774,46 +783,74 @@ async def test_retry_aiohttp_post_http_origin_gate_blocks_second_post(monkeypatc
     import asyncio
 
     posted_a, posted_b = await asyncio.gather(
-        asyncio.create_task(run_a(), name="gate-a"),
-        asyncio.create_task(run_b(), name="gate-b"),
+        asyncio.create_task(run_a(), name="req-a"),
+        asyncio.create_task(run_b(), name="req-b"),
     )
     assert posted_a.status == 200
     assert posted_b.status == 200
-    assert "gate-b" in sleeps or any(name == "gate-b" for name in post_order)
-    assert sleeps[0] == pytest.approx(60.0, abs=0.05)
-    assert any(wait >= 59.0 for wait in sleeps[1:])
-    assert post_order[0] == "gate-a"
-    assert session.calls >= 3
+    assert post_order[:2] == ["req-a", "req-b"]
+    assert session.calls == 3
+    assert all(name != "req-b" for name, _delay in sleeps)
+    assert sleeps[0] == ("req-a", pytest.approx(60.0, abs=0.05))
 
 
-async def test_retry_aiohttp_post_origin_gate_does_not_span_hosts(monkeypatch):
-    sleeps: list[float] = []
+async def test_ws_rate_limit_does_not_block_http_post_same_origin(monkeypatch):
+    """WS 429 backoff is per connection; HTTP to the same host must send immediately."""
+    import asyncio
+
+    sleeps: list[tuple[str, float]] = []
+    ws_waiting = asyncio.Event()
+    http_finished = asyncio.Event()
 
     async def fake_sleep(seconds: float) -> None:
-        sleeps.append(seconds)
+        task = asyncio.current_task()
+        name = task.get_name() if task is not None else ""
+        sleeps.append((name, seconds))
+        if name == "ws-a":
+            ws_waiting.set()
+            await http_finished.wait()
 
     monkeypatch.setattr("codex_shim.net.retry.asyncio.sleep", fake_sleep)
-    configure_origin_backoff("https://opencode.ai/zen/v1/responses", delay=90.0)
-    session = _AiohttpSession([_AiohttpResponse(200, "", "text/event-stream")])
-    posted = await retry_aiohttp_post(
-        session,
-        "https://chatgpt.com/backend-api/codex/responses",
-        json={"model": "x"},
-        policy=_rate_limit_policy(),
+    ws_session = _WsSession([_WsHandshakeError(429), object()])
+    http_session = _AiohttpSession([_AiohttpResponse(200, "", "text/event-stream")])
+
+    async def run_ws():
+        return await retry_aiohttp_ws_connect(
+            ws_session,
+            "wss://chatgpt.com/backend-api/codex/responses",
+            policy=_rate_limit_policy(),
+            ws_session="a",
+        )
+
+    async def run_http():
+        await ws_waiting.wait()
+        posted = await retry_aiohttp_post(
+            http_session,
+            "https://chatgpt.com/backend-api/codex/responses",
+            json={"model": "x"},
+            policy=_rate_limit_policy(),
+        )
+        http_finished.set()
+        return posted
+
+    ws, posted = await asyncio.gather(
+        asyncio.create_task(run_ws(), name="ws-a"),
+        asyncio.create_task(run_http(), name="http-b"),
     )
+    assert ws is not None
     assert posted.status == 200
-    assert session.calls == 1
-    assert sleeps == []
+    assert http_session.calls == 1
+    assert ws_session.calls == 2
+    assert all(name != "http-b" for name, _delay in sleeps)
 
 
-async def test_retry_aiohttp_post_seeded_origin_gate_sleeps_before_send(monkeypatch):
+async def test_retry_aiohttp_post_success_does_not_sleep(monkeypatch):
     sleeps: list[float] = []
 
     async def fake_sleep(seconds: float) -> None:
         sleeps.append(seconds)
 
     monkeypatch.setattr("codex_shim.net.retry.asyncio.sleep", fake_sleep)
-    configure_origin_backoff("https://opencode.ai/zen/v1/responses", delay=90.0)
     session = _AiohttpSession([_AiohttpResponse(200, "", "text/event-stream")])
     posted = await retry_aiohttp_post(
         session,
@@ -823,7 +860,7 @@ async def test_retry_aiohttp_post_seeded_origin_gate_sleeps_before_send(monkeypa
     )
     assert posted.status == 200
     assert session.calls == 1
-    assert sleeps == pytest.approx([90.0], abs=0.05)
+    assert sleeps == []
 
 
 async def test_retry_aiohttp_post_quota_waits_max_endlessly(monkeypatch):
@@ -873,13 +910,16 @@ async def test_retry_aiohttp_post_quota_honors_short_reset(monkeypatch):
 
 async def test_retry_aiohttp_post_gives_up_when_client_disconnects(monkeypatch):
     sleeps: list[float] = []
+    disconnected = {"v": False}
 
     async def fake_sleep(seconds: float) -> None:
         sleeps.append(seconds)
+        disconnected["v"] = True
 
     monkeypatch.setattr("codex_shim.net.retry.asyncio.sleep", fake_sleep)
-    configure_origin_backoff("https://opencode.ai/zen/v1/responses", delay=60.0)
-    session = _AiohttpSession([_AiohttpResponse(200, "", "text/event-stream")])
+    session = _AiohttpSession(
+        [_AiohttpResponse(429, _FREE_USAGE_BODY, content_type="application/json")]
+    )
     from codex_shim.net.sse import ClientDisconnected
 
     with pytest.raises(ClientDisconnected):
@@ -888,21 +928,17 @@ async def test_retry_aiohttp_post_gives_up_when_client_disconnects(monkeypatch):
             "https://opencode.ai/zen/v1/responses",
             json={"model": "x"},
             policy=_rate_limit_policy(),
-            disconnect_fn=lambda: True,
+            disconnect_fn=lambda: disconnected["v"],
         )
-    assert session.calls == 0
-    assert sleeps == []
+    assert session.calls == 1
+    assert sleeps[0] == pytest.approx(1.0, abs=0.05)
 
 
-async def test_retry_aiohttp_post_emits_pings_during_rate_limit_wait(monkeypatch):
+async def test_retry_aiohttp_post_sleeps_through_rate_limit_wait(monkeypatch):
     sleeps: list[float] = []
-    pings: list[int] = []
 
     async def fake_sleep(seconds: float) -> None:
         sleeps.append(seconds)
-
-    async def ping_fn() -> None:
-        pings.append(1)
 
     monkeypatch.setattr("codex_shim.net.retry.asyncio.sleep", fake_sleep)
     session = _AiohttpSession(
@@ -916,12 +952,53 @@ async def test_retry_aiohttp_post_emits_pings_during_rate_limit_wait(monkeypatch
         "https://opencode.ai/zen/v1/responses",
         json={"model": "x"},
         policy=_rate_limit_policy(),
-        ping_fn=ping_fn,
-        keepalive=15.0,
     )
     assert posted.status == 200
+    assert sleeps == pytest.approx([60.0], abs=0.05)
+
+
+async def test_throttle_sleep_is_a_single_wait(monkeypatch):
+    sleeps: list[float] = []
+
+    async def fake_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+
+    monkeypatch.setattr("codex_shim.net.retry.asyncio.sleep", fake_sleep)
+    await throttle_sleep(12.0)
+    assert sleeps == [12.0]
+
+
+async def test_throttle_sleep_sync_refuses_running_event_loop():
+    with pytest.raises(RuntimeError, match="event loop"):
+        throttle_sleep_sync(0.01)
+
+
+async def test_await_ws_throttle_does_not_ping_the_client(monkeypatch):
+    events: list[str] = []
+
+    async def fake_sleep(seconds: float) -> None:
+        events.append(f"sleep:{seconds}")
+
+    monkeypatch.setattr("codex_shim.net.retry.asyncio.sleep", fake_sleep)
+    monkeypatch.setenv("CODEX_SHIM_RETRY_RATE_LIMIT_JITTER", "0")
+    from codex_shim.ws_passthrough import WsPassthroughConnectError, await_ws_throttle
+
+    class _Session:
+        def client_disconnected(self) -> bool:
+            return False
+
+        async def ping_client(self) -> None:
+            events.append("ping")
+
+    waited = await await_ws_throttle(
+        _Session(),
+        "wss://chatgpt.com/backend-api/codex/responses",
+        WsPassthroughConnectError("FreeUsageLimitError", status=429),
+    )
+    assert waited is True
+    assert "ping" not in events
+    sleeps = [float(item.split(":", 1)[1]) for item in events]
     assert sum(sleeps) == pytest.approx(60.0, abs=0.05)
-    assert pings
 
 
 class _WsHandshakeError(Exception):
@@ -992,9 +1069,6 @@ async def test_retry_aiohttp_ws_connect_sleeps_per_connection_not_origin_gate(mo
     assert sleeps[0][0] == "ws-a"
     assert sleeps[0][1] == pytest.approx(60.0, abs=0.05)
     assert all(name != "ws-b" for name, _delay in sleeps)
-    origin = get_origin_backoff("wss://chatgpt.com/backend-api/codex/responses")
-    assert origin is not None
-    assert origin.kind == "none" or origin.exponent in {1, 2}
 
 
 def test_request_urllib_rate_limit_ramps_then_succeeds():
@@ -1025,9 +1099,8 @@ def test_request_urllib_rate_limit_ramps_then_succeeds():
     assert sleeps == pytest.approx([60.0, 120.0, 240.0], abs=0.05)
 
 
-def test_request_urllib_seeded_origin_gate_sleeps_before_send():
+def test_request_urllib_success_does_not_sleep():
     sleeps: list[float] = []
-    configure_origin_backoff("https://opencode.ai/zen/v1/models", delay=90.0)
 
     def fake_urlopen(request, timeout=20.0):
         return _Resp()
@@ -1040,7 +1113,7 @@ def test_request_urllib_seeded_origin_gate_sleeps_before_send():
         ensure_json=True,
     )
     assert result.status == 200
-    assert sleeps == pytest.approx([90.0], abs=0.05)
+    assert sleeps == []
 
 
 def test_request_urllib_quota_waits_max_then_succeeds():
@@ -1096,9 +1169,6 @@ def test_request_urllib_503_does_not_seed_origin_gate():
     )
     assert result.status == 200
     assert sleeps == pytest.approx([0.5], abs=0.05)
-    origin = get_origin_backoff("https://opencode.ai/zen/v1/models")
-    assert origin is None or origin.kind == "none"
-    assert origin is None or origin.not_before == 0
 
 
 async def test_retry_aiohttp_post_503_does_not_seed_origin_gate(monkeypatch):
@@ -1122,19 +1192,13 @@ async def test_retry_aiohttp_post_503_does_not_seed_origin_gate(monkeypatch):
     )
     assert posted.status == 200
     assert sleeps == pytest.approx([0.5], abs=0.05)
-    origin = get_origin_backoff("https://opencode.ai/zen/v1/responses")
-    assert origin is None or origin.kind == "none"
 
 
-async def test_retry_aiohttp_ws_connect_pings_during_rate_limit_wait(monkeypatch):
+async def test_retry_aiohttp_ws_connect_sleeps_through_rate_limit_wait(monkeypatch):
     sleeps: list[float] = []
-    pings: list[int] = []
 
     async def fake_sleep(seconds: float) -> None:
         sleeps.append(seconds)
-
-    async def ping_fn() -> None:
-        pings.append(1)
 
     monkeypatch.setattr("codex_shim.net.retry.asyncio.sleep", fake_sleep)
     session = _WsSession([_WsHandshakeError(429), object()])
@@ -1142,13 +1206,10 @@ async def test_retry_aiohttp_ws_connect_pings_during_rate_limit_wait(monkeypatch
         session,
         "wss://opencode.ai/zen",
         policy=_rate_limit_policy(),
-        ping_fn=ping_fn,
-        keepalive=15.0,
     )
     assert ws is not None
     assert session.calls == 2
-    assert sum(sleeps) == pytest.approx(60.0, abs=0.05)
-    assert pings
+    assert sleeps == pytest.approx([60.0], abs=0.05)
 
 
 async def test_retry_aiohttp_ws_connect_gives_up_when_client_disconnects(monkeypatch):
@@ -1194,6 +1255,28 @@ async def test_await_ws_throttle_sleeps_on_429_connect_error(monkeypatch):
     assert sleeps == pytest.approx([60.0], abs=0.05)
 
 
+async def test_await_ws_throttle_ramps_on_same_connection(monkeypatch):
+    sleeps: list[float] = []
+
+    async def fake_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+
+    monkeypatch.setattr("codex_shim.net.retry.asyncio.sleep", fake_sleep)
+    monkeypatch.setenv("CODEX_SHIM_RETRY_RATE_LIMIT_JITTER", "0")
+    from codex_shim.ws_passthrough import WsPassthroughConnectError, await_ws_throttle
+
+    class _Session:
+        pass
+
+    session = _Session()
+    url = "wss://chatgpt.com/backend-api/codex/responses"
+    exc = WsPassthroughConnectError("FreeUsageLimitError", status=429)
+    assert await await_ws_throttle(session, url, exc) is True
+    assert await await_ws_throttle(session, url, exc) is True
+    assert sleeps == pytest.approx([60.0, 120.0], abs=0.05)
+    assert isinstance(session.throttle, RequestThrottle)
+
+
 async def test_await_ws_throttle_ignores_non_throttle_connect_error(monkeypatch):
     sleeps: list[float] = []
 
@@ -1214,3 +1297,20 @@ async def test_await_ws_throttle_ignores_non_throttle_connect_error(monkeypatch)
     )
     assert waited is False
     assert sleeps == []
+
+
+def test_log_throttle_includes_cause(capsys):
+    from codex_shim.net.retry import log_throttle
+
+    log_throttle(
+        origin="https://chatgpt.com",
+        kind="rate_limit",
+        wait=60.0,
+        exponent=0,
+        scope="ws",
+        cause="error.type=FreeUsageLimitError",
+    )
+    out = capsys.readouterr().out
+    assert "cause=error.type=FreeUsageLimitError" in out
+    assert "class=rate_limit" in out
+    assert "origin=https://chatgpt.com" in out

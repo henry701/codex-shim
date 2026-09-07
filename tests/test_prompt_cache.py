@@ -13,6 +13,11 @@ from codex_shim.prompt_cache import (
 from codex_shim.server import ShimServer, _log_client_request, _sanitize_chatgpt_passthrough_body
 
 
+def test_prompt_cache_fields_from_non_dict_body_is_empty():
+    assert prompt_cache_fields_from_body(None) == {}
+    assert prompt_cache_fields_from_body(["not", "a", "dict"]) == {}
+
+
 def test_prompt_cache_fields_from_body_returns_known_keys_in_order():
     body = {
         "model": "codex-gpt-5-6-terra",

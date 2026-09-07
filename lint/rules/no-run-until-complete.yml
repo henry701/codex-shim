@@ -1,0 +1,8 @@
+id: no-run-until-complete
+language: python
+severity: error
+message: loop.run_until_complete on the serve path; await the coroutine instead.
+rule:
+  pattern: $LOOP.run_until_complete($CORO)
+files:
+  - "codex_shim/**/*.py"

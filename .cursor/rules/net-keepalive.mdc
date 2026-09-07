@@ -1,0 +1,17 @@
+---
+description: Keepalives vs throttle for Codex Desktop — lint and smoke both surfaces after net changes
+globs: codex_shim/net/**/*.py,codex_shim/ws_passthrough.py,codex_shim/chatgpt_edge.py,codex_shim/server.py
+alwaysApply: false
+---
+
+# Networking keepalives
+
+Downstream `{"type":"ping"}` is only `DownstreamPinger` (SSE `StreamGuard` and WS after `ws.prepare()`). Retry/throttle wait; they do not ping. `KEEPALIVE_MAX` must stay under Desktop's 15s idle timeout (default 4–6s).
+
+Do not `time.sleep`, `urlopen`, `request_urllib`, or `throttle_sleep_sync` in `async def` on the serve path. Offload with `asyncio.to_thread`. `throttle_sleep_sync` must raise if an event loop is running.
+
+After changing this code:
+
+1. `uv run python lint/net_invariants.py`
+2. `SMOKE_PORT=8767 bash scripts/smoke_net_surfaces.sh` (or unset `SMOKE_PORT` to auto-pick 8766-8770, never 8765)
+3. Never `SMOKE_RESTART=1` on port 8765

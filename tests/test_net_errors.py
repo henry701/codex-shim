@@ -40,6 +40,15 @@ def test_classify_throttle_400_is_none():
     assert classify_throttle(status=400, body=body) == THROTTLE_NONE
 
 
+def test_classify_throttle_paid_model_credits_404_is_not_quota():
+    body = (
+        '{"status":404,"message":"Model requires available credits",'
+        '"code":"insufficient_credits_for_paid_model"}'
+    )
+    assert is_quota_limit(404, body) is False
+    assert classify_throttle(status=404, body=body) == THROTTLE_NONE
+
+
 def test_classify_ws_event_throttle_free_usage_limit_error():
     event = {
         "type": "error",
@@ -74,3 +83,44 @@ def test_classify_ws_event_throttle_ignores_invalid_request():
         },
     }
     assert classify_ws_event_throttle(event) == THROTTLE_NONE
+
+
+def test_classify_ws_event_throttle_ignores_rate_limits_updated():
+    """ChatGPT Codex WS emits this as quota telemetry, not HTTP 429."""
+    event = {
+        "type": "rate_limits.updated",
+        "rate_limits": [
+            {"name": "requests", "limit": 10000, "remaining": 9999, "reset_seconds": 60},
+        ],
+    }
+    assert classify_ws_event_throttle(event) == THROTTLE_NONE
+    assert classify_throttle(body='{"type":"rate_limits.updated"}') == THROTTLE_NONE
+
+
+def test_classify_throttle_rejects_type_that_only_contains_rate_limit():
+    body = '{"error":{"type":"moderator_rate_limited_content","message":"blocked"}}'
+    assert classify_throttle(body=body) == THROTTLE_NONE
+
+
+def test_classify_throttle_rejects_rate_limiter_word_in_message():
+    body = '{"error":{"message":"Corporate rate limiter policy applied"}}'
+    assert classify_throttle(body=body) == THROTTLE_NONE
+
+
+def test_classify_throttle_exact_error_type_rate_limit_error():
+    body = '{"error":{"type":"rate_limit_error","code":"rate_limit_exceeded"}}'
+    assert classify_throttle(body=body) == THROTTLE_RATE_LIMIT
+
+
+def test_throttle_match_cause_names_exact_field():
+    from codex_shim.net.errors import throttle_match_cause
+
+    assert throttle_match_cause(status=429, body="slow down") == "http_status=429"
+    assert (
+        throttle_match_cause(
+            body='{"error":{"type":"FreeUsageLimitError","message":"Rate limit exceeded"}}'
+        )
+        == "error.type=FreeUsageLimitError"
+    )
+    assert throttle_match_cause(body='{"type":"rate_limits.updated"}') is None
+    assert throttle_match_cause(body='{"error":{"type":"moderator_rate_limited_content"}}') is None

@@ -3,15 +3,15 @@ from __future__ import annotations
 import asyncio
 import json
 import subprocess
+from pathlib import Path
 from typing import Any
 
 import pytest
 from aiohttp import ClientSession, WSMsgType, web
 from aiohttp.test_utils import TestClient, TestServer
 
-from codex_shim.compaction import decode_shim_compaction_summary, encode_shim_compaction_summary
+from codex_shim.compaction import decode_shim_compaction_summary
 from codex_shim.responses_input_pipeline import UNKNOWN_FUNCTION_TOOL_NAME
-from codex_shim import mcp_search
 from codex_shim import server as server_module
 from codex_shim.server import (
     PICKER_TOKEN_HEADER,
@@ -4967,7 +4967,7 @@ async def test_health_and_models_hide_chatgpt_passthrough_when_auth_missing(tmp_
 
 @pytest.fixture
 def cursor_present(monkeypatch):
-    from codex_shim.cursor_passthrough import CursorCatalogModel, _fallback_cursor_models
+    from codex_shim.cursor_passthrough import _fallback_cursor_models
 
     def _on(**_kwargs):
         return True
@@ -5685,7 +5685,7 @@ def _picker_settings_file(tmp_path):
     return settings
 
 
-def _stub_codex_config(monkeypatch, tmp_path, *, model: str = "kimi-k26") -> "Path":
+def _stub_codex_config(monkeypatch, tmp_path, *, model: str = "kimi-k26") -> Path:
     config = tmp_path / "config.toml"
     config.write_text(
         f'model = "{model}"\n'

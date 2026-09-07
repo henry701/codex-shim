@@ -1,0 +1,13 @@
+id: no-async-request-urllib
+language: python
+severity: error
+message: request_urllib in async def blocks the aiohttp loop; use asyncio.to_thread.
+rule:
+  pattern: |
+    async def $FUNC($$$ARGS):
+      $$$BODY
+  has:
+    pattern: request_urllib($$$A)
+    stopBy: end
+files:
+  - "codex_shim/**/*.py"

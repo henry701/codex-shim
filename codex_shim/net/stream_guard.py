@@ -138,7 +138,7 @@ class StreamGuard:
                 self._pinger.start()
         return self
 
-    async def __aexit__(self, exc_type, exc, tb) -> bool:
+    async def __aexit__(self, exc_type, exc, _tb) -> bool:
         swallowed = False
         try:
             if self.abandoned:
