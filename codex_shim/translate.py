@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 import json
 import re
 from collections.abc import Mapping
@@ -12,6 +13,39 @@ from .tool_translate import mcp_namespace, responses_function_call_ids
 
 
 THINK_RE = re.compile(r"<think>.*?</think>", re.IGNORECASE | re.DOTALL)
+
+# Desktop session-title turns. Codex historically sent these as gpt-5.4-mini
+# product calls; current Desktop uses the selected BYOK model instead.
+# Ordered ChatGPT retries; extend this tuple to add later fallbacks.
+@dataclass(frozen=True)
+class SessionTitleCandidate:
+    slug: str
+    reasoning_effort: str | None = None
+
+
+SESSION_TITLE_PASSTHROUGH_CANDIDATES: tuple[SessionTitleCandidate, ...] = (
+    SessionTitleCandidate("gpt-5.4-mini"),
+    SessionTitleCandidate("gpt-5.6-luna", reasoning_effort="low"),
+)
+SESSION_TITLE_PASSTHROUGH_SLUG = SESSION_TITLE_PASSTHROUGH_CANDIDATES[0].slug
+SESSION_TITLE_MARKERS = (
+    "Generate a concise UI title",
+    "Fill the structured title field with plain text",
+)
+
+
+def apply_session_title_candidate(
+    body: Mapping[str, Any],
+    candidate: SessionTitleCandidate,
+) -> dict[str, Any]:
+    """Copy a title request onto one ChatGPT candidate without mutating the original."""
+    prepared = dict(body)
+    prepared["model"] = candidate.slug
+    if candidate.reasoning_effort:
+        reasoning = dict(prepared["reasoning"]) if isinstance(prepared.get("reasoning"), dict) else {}
+        reasoning["effort"] = candidate.reasoning_effort
+        prepared["reasoning"] = reasoning
+    return prepared
 
 
 def namespaced_tool_chat_name(namespace: str, name: str) -> str:
@@ -155,6 +189,9 @@ def sanitize_function_call_arguments(raw: Any) -> Any:
     if not isinstance(raw, str):
         return raw
     stripped = raw.strip()
+    if not stripped:
+        # Console `/v1/responses` 400s: `arguments` must be valid JSON.
+        return "{}"
     if not stripped.startswith("{") and not stripped.startswith("["):
         return raw
     try:
@@ -642,7 +679,38 @@ def _coerce_custom_input_item(item: Any) -> Any:
         out = dict(item)
         out["type"] = "function_call_output"
         return out
+    if item_type == "function_call":
+        out = dict(item)
+        out["arguments"] = sanitize_function_call_arguments(out.get("arguments", ""))
+        return out
     return item
+
+
+def _collect_request_text(value: Any, chunks: list[str]) -> None:
+    if isinstance(value, str):
+        if value:
+            chunks.append(value)
+        return
+    if isinstance(value, Mapping):
+        for key in ("text", "content", "instructions", "input"):
+            if key in value:
+                _collect_request_text(value.get(key), chunks)
+        return
+    if isinstance(value, list):
+        for item in value:
+            _collect_request_text(item, chunks)
+
+
+def is_session_title_request(body: Mapping[str, Any]) -> bool:
+    """True when Desktop is naming the thread, not running the user task."""
+    tools = body.get("tools")
+    if isinstance(tools, list) and tools:
+        return False
+    chunks: list[str] = []
+    _collect_request_text(body.get("instructions"), chunks)
+    _collect_request_text(body.get("input"), chunks)
+    blob = "\n".join(chunks)
+    return any(marker in blob for marker in SESSION_TITLE_MARKERS)
 
 
 def prepare_openai_responses_upstream_body(body: dict[str, Any]) -> dict[str, Any]:
@@ -653,6 +721,7 @@ def prepare_openai_responses_upstream_body(body: dict[str, Any]) -> dict[str, An
     BYOK openai-responses route; ChatGPT Codex passthrough does not use this.
     """
     prepared = dict(body)
+    prepared.pop("generate", None)
     tools = prepared.get("tools")
     if isinstance(tools, list):
         prepared["tools"] = coerce_custom_responses_tools(tools)

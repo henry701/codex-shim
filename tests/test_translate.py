@@ -1215,6 +1215,150 @@ def test_openai_responses_converts_custom_apply_patch_to_function():
     assert out["input"][1]["output"] == "Success"
 
 
+def test_openai_responses_strips_codex_generate_flag():
+    from copy import deepcopy
+
+    from codex_shim.translate import prepare_openai_responses_upstream_body
+
+    body = {
+        "model": "muse-spark-1.3-contributor-free",
+        "generate": False,
+        "input": [],
+        "tools": [],
+    }
+    original = deepcopy(body)
+
+    out = prepare_openai_responses_upstream_body(body)
+
+    assert body == original
+    assert "generate" not in out
+    assert out["model"] == "muse-spark-1.3-contributor-free"
+
+
+def test_openai_responses_function_call_arguments_are_json_strings():
+    from copy import deepcopy
+
+    from codex_shim.translate import prepare_openai_responses_upstream_body
+
+    body = {
+        "model": "muse-spark-1.3-contributor-free",
+        "input": [
+            {
+                "type": "function_call",
+                "id": "fc_empty",
+                "call_id": "call_01a06f85607274009af6c3965c9345f5",
+                "name": "exec_command",
+                "arguments": "",
+                "status": "completed",
+            },
+            {
+                "type": "function_call",
+                "id": "fc_ws",
+                "call_id": "call_ws",
+                "name": "exec_command",
+                "arguments": "   ",
+                "status": "completed",
+            },
+            {
+                "type": "function_call",
+                "id": "fc_obj",
+                "call_id": "call_obj",
+                "name": "exec_command",
+                "arguments": {"cmd": "true"},
+                "status": "completed",
+            },
+            {
+                "type": "function_call",
+                "id": "fc_ok",
+                "call_id": "call_ok",
+                "name": "exec_command",
+                "arguments": '{"cmd": "pwd"}',
+                "status": "completed",
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "call_01a06f85607274009af6c3965c9345f5",
+                "output": "ok",
+            },
+        ],
+    }
+    original = deepcopy(body)
+
+    out = prepare_openai_responses_upstream_body(body)
+
+    assert body == original
+    empty, whitespace, obj, ok, output = out["input"]
+    for item in (empty, whitespace, obj, ok):
+        assert isinstance(item["arguments"], str)
+        parsed = json.loads(item["arguments"])
+        assert isinstance(parsed, dict)
+    assert json.loads(empty["arguments"]) == {}
+    assert json.loads(whitespace["arguments"]) == {}
+    assert json.loads(obj["arguments"]) == {"cmd": "true"}
+    assert json.loads(ok["arguments"]) == {"cmd": "pwd"}
+    assert output["type"] == "function_call_output"
+    assert output["output"] == "ok"
+
+
+def test_is_session_title_request_detects_desktop_prompt():
+    from codex_shim.translate import is_session_title_request
+
+    body = {
+        "model": "local-llama",
+        "input": [
+            {
+                "type": "message",
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_text",
+                        "text": (
+                            "You are a helpful assistant. You will be presented with a user prompt, "
+                            "and your job is to provide a short title for a task that will be created "
+                            "from that prompt.\n"
+                            "Generate a concise UI title (up to 36 characters) for this task.\n"
+                            "Fill the structured title field with plain text.\n"
+                            "User prompt:\nHello world, can you repeat it 50 times?"
+                        ),
+                    }
+                ],
+            }
+        ],
+    }
+    assert is_session_title_request(body) is True
+    assert is_session_title_request({"model": "local-llama", "input": [{"role": "user", "content": "Hello world"}]}) is False
+    agent_turn = {
+        **body,
+        "tools": [{"type": "function", "name": "shell"}],
+    }
+    assert is_session_title_request(agent_turn) is False
+
+
+def test_session_title_passthrough_candidates_are_mini_then_luna_low():
+    from codex_shim.translate import (
+        SESSION_TITLE_PASSTHROUGH_CANDIDATES,
+        apply_session_title_candidate,
+    )
+
+    assert [c.slug for c in SESSION_TITLE_PASSTHROUGH_CANDIDATES] == [
+        "gpt-5.4-mini",
+        "gpt-5.6-luna",
+    ]
+    assert SESSION_TITLE_PASSTHROUGH_CANDIDATES[0].reasoning_effort is None
+    assert SESSION_TITLE_PASSTHROUGH_CANDIDATES[1].reasoning_effort == "low"
+
+    original = {"model": "local-llama", "reasoning": {"effort": "high", "summary": "auto"}}
+    mini = apply_session_title_candidate(original, SESSION_TITLE_PASSTHROUGH_CANDIDATES[0])
+    luna = apply_session_title_candidate(original, SESSION_TITLE_PASSTHROUGH_CANDIDATES[1])
+
+    assert original["model"] == "local-llama"
+    assert mini["model"] == "gpt-5.4-mini"
+    assert mini["reasoning"] == {"effort": "high", "summary": "auto"}
+    assert luna["model"] == "gpt-5.6-luna"
+    assert luna["reasoning"]["effort"] == "low"
+    assert luna["reasoning"]["summary"] == "auto"
+
+
 def test_rewrite_openai_responses_function_call_back_to_custom():
     from codex_shim.translate import rewrite_openai_responses_custom_payload
 
