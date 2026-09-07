@@ -137,6 +137,7 @@ from .ws_passthrough import (
     CHATGPT_WS_URL,
     WsPassthroughConnectError,
     WsPassthroughSession,
+    await_ws_throttle,
     responses_websocket_url,
     ws_passthrough_enabled,
 )
@@ -171,6 +172,9 @@ from .translate import (
     normalize_responses_usage,
     prepare_codex_byok_responses_body,
     prepare_openai_responses_upstream_body,
+    is_session_title_request,
+    apply_session_title_candidate,
+    SESSION_TITLE_PASSTHROUGH_CANDIDATES,
     rewrite_openai_responses_custom_payload,
     responses_to_anthropic,
     responses_to_chat,
@@ -309,7 +313,13 @@ class ShimServer:
         _log_compaction_upstream_trace(phase="pre-native-compact", url=url, forwarded=forwarded)
         log_upstream_request("chatgpt-compact", url, forwarded)
         async with ClientSession(timeout=self._compact_timeout) as session:
-            posted = await post_chatgpt_with_retry(session, url, json=forwarded, headers=headers)
+            posted = await post_chatgpt_with_retry(
+                session,
+                url,
+                json=forwarded,
+                headers=headers,
+                disconnect_fn=lambda: _request_disconnected(request),
+            )
             upstream = posted.response
             upstream_forward_headers = observe_upstream_response("chatgpt-compact-passthrough", upstream)
             if posted.status >= 400:
@@ -1178,6 +1188,8 @@ class ShimServer:
             return None
         if self._needs_image_gen(body) or self._needs_image_followup(body):
             return None
+        if is_session_title_request(body) and chatgpt_passthrough_available():
+            return None
         try:
             route = await self._route(body)
         except web.HTTPException:
@@ -1257,19 +1269,31 @@ class ShimServer:
                 event = rewrite_event(event)
             await _write_ws_json(client_ws, event)
 
-        try:
-            await passthrough.send_response_create(forwarded, upstream_url=upstream_url)
-            await passthrough.relay_until_terminal(
-                source=source,
-                upstream_url=upstream_url,
-                model_override=target.response_model_override,
-                on_event=on_event,
-                rewrite_model=_rewrite_response_model,
-                write_event=write_event,
-            )
-        except WsPassthroughConnectError as exc:
-            print(f"[ws-passthrough] upstream relay failed url={upstream_url} err={exc}", flush=True)
-            return False
+        while True:
+            try:
+                await passthrough.send_response_create(forwarded, upstream_url=upstream_url)
+                await passthrough.relay_until_terminal(
+                    source=source,
+                    upstream_url=upstream_url,
+                    model_override=target.response_model_override,
+                    on_event=on_event,
+                    rewrite_model=_rewrite_response_model,
+                    write_event=write_event,
+                )
+                break
+            except WsPassthroughConnectError as exc:
+                if await await_ws_throttle(passthrough, upstream_url, exc):
+                    try:
+                        await passthrough.connect_upstream(upstream_url, headers)
+                    except WsPassthroughConnectError as retry_exc:
+                        print(
+                            f"[ws-passthrough] upstream reconnect failed url={upstream_url} err={retry_exc}",
+                            flush=True,
+                        )
+                        return False
+                    continue
+                print(f"[ws-passthrough] upstream relay failed url={upstream_url} err={exc}", flush=True)
+                return False
         if collector.response_id:
             items = self._build_turn_cache_items(request, raw_body, collector.output_items())
             if items:
@@ -1342,30 +1366,53 @@ class ShimServer:
                     return True
                 return not is_previous_response_id_upstream_event(event)
 
-            try:
-                await passthrough.send_response_create(forwarded, upstream_url=upstream_url)
-                terminal = await passthrough.relay_until_terminal(
-                    source=source,
-                    upstream_url=upstream_url,
-                    model_override=target.response_model_override,
-                    on_event=on_event,
-                    rewrite_model=_rewrite_response_model,
-                    write_event=write_event,
-                    forward_terminal=forward_terminal,
-                )
-            except WsPassthroughConnectError as exc:
-                print(
-                    f"[ws-passthrough] upstream relay failed; http-fallback url={upstream_url} err={exc}",
-                    flush=True,
-                )
-                await self._handle_chatgpt_response_create_websocket_http(
-                    request,
-                    passthrough.client_ws,
-                    payload,
-                    target,
-                    http_session=passthrough.client_session,
-                )
-                return True
+            while True:
+                try:
+                    await passthrough.send_response_create(forwarded, upstream_url=upstream_url)
+                    terminal = await passthrough.relay_until_terminal(
+                        source=source,
+                        upstream_url=upstream_url,
+                        model_override=target.response_model_override,
+                        on_event=on_event,
+                        rewrite_model=_rewrite_response_model,
+                        write_event=write_event,
+                        forward_terminal=forward_terminal,
+                    )
+                    break
+                except WsPassthroughConnectError as exc:
+                    if await await_ws_throttle(passthrough, upstream_url, exc):
+                        try:
+                            _, connection_reused = await passthrough.connect_upstream(
+                                upstream_url,
+                                headers,
+                            )
+                        except WsPassthroughConnectError as retry_exc:
+                            print(
+                                f"[ws-passthrough] upstream reconnect after throttle failed; "
+                                f"http-fallback url={upstream_url} err={retry_exc}",
+                                flush=True,
+                            )
+                            await self._handle_chatgpt_response_create_websocket_http(
+                                request,
+                                passthrough.client_ws,
+                                payload,
+                                target,
+                                http_session=passthrough.client_session,
+                            )
+                            return True
+                        continue
+                    print(
+                        f"[ws-passthrough] upstream relay failed; http-fallback url={upstream_url} err={exc}",
+                        flush=True,
+                    )
+                    await self._handle_chatgpt_response_create_websocket_http(
+                        request,
+                        passthrough.client_ws,
+                        payload,
+                        target,
+                        http_session=passthrough.client_session,
+                    )
+                    return True
             if (
                 terminal is not None
                 and is_previous_response_id_upstream_event(terminal)
@@ -1455,7 +1502,20 @@ class ShimServer:
         url = "https://chatgpt.com/backend-api/codex/responses"
         print(f"[ws-passthrough] http-fallback POST {url}", flush=True)
         log_upstream_request("chatgpt-passthrough-ws-http", url, forwarded)
-        posted = await post_chatgpt_with_retry(http_session, url, json=forwarded, headers=headers)
+
+        async def ping_ws() -> None:
+            if getattr(ws, "closed", False):
+                raise ClientDisconnected()
+            await ws.send_str('{"type":"ping"}')
+
+        posted = await post_chatgpt_with_retry(
+            http_session,
+            url,
+            json=forwarded,
+            headers=headers,
+            disconnect_fn=lambda: _request_disconnected(request) or bool(getattr(ws, "closed", False)),
+            ping_fn=ping_ws,
+        )
         upstream = posted.response
         upstream_forward_headers = observe_upstream_response("chatgpt-passthrough-ws", upstream)
         if posted.status >= 400:
@@ -1589,13 +1649,27 @@ class ShimServer:
         request: web.Request,
         ws: web.WebSocketResponse,
     ) -> None:
-        upstream = await session.post(url, json=forwarded, headers=headers)
-        if upstream.status >= 400:
-            text = await upstream.text()
-            code, message = parse_upstream_error(text, upstream.status)
-            upstream.release()
-            await _write_ws_error(ws, upstream.status, code, message)
+        async def ping_ws() -> None:
+            if getattr(ws, "closed", False):
+                raise ClientDisconnected()
+            await ws.send_str('{"type":"ping"}')
+
+        posted = await retry_aiohttp_post(
+            session,
+            url,
+            json=forwarded,
+            headers=headers,
+            policy=retry_policy_from_env(),
+            label="local-response-create-http",
+            disconnect_fn=lambda: _request_disconnected(request) or bool(getattr(ws, "closed", False)),
+            ping_fn=ping_ws,
+        )
+        if posted.status >= 400:
+            text = posted.error_text or ""
+            code, message = parse_upstream_error(text, posted.status)
+            await _write_ws_error(ws, posted.status, code, message)
             return
+        upstream = posted.response
         try:
             await _relay_sse_response_to_ws(
                 upstream,
@@ -1622,6 +1696,9 @@ class ShimServer:
                 response_model_override=override,
                 upstream_model=upstream,
             )
+        title_response = await self._maybe_session_title_passthrough(request, body)
+        if title_response is not None:
+            return title_response
         if is_cursor_passthrough_slug(model):
             return await self._cursor_passthrough(
                 request,
@@ -2004,6 +2081,45 @@ class ShimServer:
             return await _compact_json_response(provider="cursor", requested_slug=model)
         route = await self._route(body)
         return await _compact_json_response(provider="byok", requested_slug=route.slug, route=route)
+
+    async def _maybe_session_title_passthrough(
+        self,
+        request: web.Request,
+        body: dict[str, Any],
+    ) -> web.StreamResponse | None:
+        """Desktop names threads via the selected model. Route those through ChatGPT title candidates."""
+        if not is_session_title_request(body):
+            return None
+        if not chatgpt_passthrough_available():
+            return None
+        requested = str(body.get("model") or "")
+        if is_chatgpt_passthrough_slug(requested):
+            return None
+        last: web.StreamResponse | None = None
+        for index, candidate in enumerate(SESSION_TITLE_PASSTHROUGH_CANDIDATES):
+            title_body = apply_session_title_candidate(body, candidate)
+            print(
+                f"[title] {requested} -> {candidate.slug} chatgpt passthrough"
+                + (f" effort={candidate.reasoning_effort}" if candidate.reasoning_effort else ""),
+                flush=True,
+            )
+            last = await self._chatgpt_passthrough(
+                request,
+                title_body,
+                response_model_override=requested or candidate.slug,
+                upstream_model=chatgpt_upstream_model(candidate.slug),
+                allow_byok_fallback=False,
+            )
+            if last.status < 400:
+                return last
+            remaining = SESSION_TITLE_PASSTHROUGH_CANDIDATES[index + 1 :]
+            if remaining:
+                next_slug = remaining[0].slug
+                print(
+                    f"[title] {candidate.slug} failed status={last.status}; trying {next_slug}",
+                    flush=True,
+                )
+        return last
 
     def _needs_image_gen(self, body: dict[str, Any]) -> bool:
         tools = body.get("tools") or []
@@ -2405,6 +2521,9 @@ class ShimServer:
         if collect_stream:
             forwarded["stream"] = True
         forwarded["model"] = upstream_model or CHATGPT_MODEL_SLUG
+        rewrite_from = _chatgpt_response_model_aliases(
+            str(forwarded["model"]) if forwarded.get("model") else None
+        )
         headers = _chatgpt_passthrough_upstream_headers(
             request,
             access_token=access_token,
@@ -2414,8 +2533,107 @@ class ShimServer:
         _log_chatgpt_passthrough_trace(request, forwarded, headers, phase="pre-upstream")
         url = "https://chatgpt.com/backend-api/codex/responses"
         log_upstream_request("chatgpt-passthrough", url, forwarded)
+
+        def disconnect_fn() -> bool:
+            return _request_disconnected(request)
+
+        if (
+            forwarded.get("stream")
+            and not collect_stream
+            and not _input_has_compaction_trigger(raw_body.get("input"))
+        ):
+            response = _sse_response()
+            await response.prepare(request)
+            collector = ChatgptPassthroughResponseCollector(forwarded)
+            emitter = ChatgptRelayEmitter(model=requested or "chatgpt")
+            async with ClientSession(timeout=self.timeout) as session:
+                async with StreamGuard(
+                    response,
+                    emitter,
+                    label="chatgpt-passthrough",
+                ) as guard:
+                    posted = await post_chatgpt_with_retry(
+                        session,
+                        url,
+                        json=forwarded,
+                        headers=headers,
+                        disconnect_fn=disconnect_fn,
+                    )
+                    upstream = posted.response
+                    if posted.status >= 400:
+                        observe_upstream_response("chatgpt-passthrough", upstream)
+                        text = posted.error_text or ""
+                        log_upstream_response(
+                            "chatgpt-passthrough",
+                            url,
+                            posted.status,
+                            text,
+                            request_body=forwarded,
+                            stream=True,
+                        )
+                        if upstream is not None:
+                            upstream.release()
+                        code, message = parse_upstream_error(text, posted.status)
+                        await emitter.fail(response, message, code=code)
+                        return response
+                    observe_upstream_response("chatgpt-passthrough", upstream)
+                    log_upstream_response(
+                        "chatgpt-passthrough",
+                        url,
+                        upstream.status,
+                        request_body=forwarded,
+                        stream=True,
+                    )
+                    guard.attach_upstream(upstream)
+                    try:
+                        async for line in guard.iter_sse(request=request):
+                            if line == "[DONE]":
+                                guard.mark_upstream_done()
+                                break
+                            try:
+                                payload = json.loads(line)
+                            except json.JSONDecodeError:
+                                await _safe_write(response, f"data: {line}\n\n".encode())
+                                continue
+                            collector.record(payload)
+                            if response_model_override:
+                                _rewrite_response_model(
+                                    payload, response_model_override, from_models=rewrite_from
+                                )
+                            if isinstance(payload, dict):
+                                emitter.observe(payload)
+                            if payload.get("type") == "response.completed":
+                                response_obj = payload.get("response")
+                                usage = response_obj.get("usage") if isinstance(response_obj, dict) else None
+                                observe_upstream_response(
+                                    "chatgpt-passthrough",
+                                    upstream,
+                                    usage=usage if isinstance(usage, dict) else None,
+                                )
+                            await _write_sse(response, payload)
+                    except ClientError as exc:
+                        await guard.note_upstream_disconnect(exc)
+                    finally:
+                        if collector.response_id and collector.output_items():
+                            cache_items = self._build_turn_cache_items(
+                                request, raw_body, collector.output_items()
+                            )
+                            if cache_items:
+                                await self._store_chatgpt_passthrough_conversation_async(
+                                    session_key,
+                                    collector.response_id,
+                                    cache_items,
+                                    terminal=True,
+                                )
+            return response
         async with ClientSession(timeout=self.timeout) as session:
-            posted = await post_chatgpt_with_retry(session, url, json=forwarded, headers=headers)
+            posted = await post_chatgpt_with_retry(
+                session,
+                url,
+                json=forwarded,
+                headers=headers,
+                disconnect_fn=disconnect_fn,
+            )
             upstream = posted.response
             if posted.status >= 400:
                 upstream_forward_headers = observe_upstream_response("chatgpt-passthrough", upstream)
@@ -2483,7 +2701,9 @@ class ShimServer:
                     request_body=forwarded,
                     stream=False,
                 )
-                _rewrite_response_model(payload, response_model_override)
+                _rewrite_response_model(
+                    payload, response_model_override, from_models=rewrite_from
+                )
                 response = web.json_response(payload)
                 apply_upstream_headers_to_response(response, upstream_headers_from_response(upstream))
                 upstream.release()
@@ -2543,7 +2763,9 @@ class ShimServer:
                     request_body=forwarded,
                     stream=True,
                 )
-                _rewrite_response_model(completed, response_model_override)
+                _rewrite_response_model(
+                    completed, response_model_override, from_models=rewrite_from
+                )
                 response = web.json_response(completed)
                 apply_upstream_headers_to_response(response, upstream_forward_headers)
                 return response
@@ -2569,7 +2791,9 @@ class ShimServer:
                             continue
                         collector.record(payload)
                         if response_model_override:
-                            _rewrite_response_model(payload, response_model_override)
+                            _rewrite_response_model(
+                                payload, response_model_override, from_models=rewrite_from
+                            )
                         if isinstance(payload, dict):
                             emitter.observe(payload)
                         if payload.get("type") == "response.completed":
@@ -3340,6 +3564,7 @@ class ShimServer:
         timeout = ClientTimeout(total=config.timeout + 5, sock_connect=config.timeout, sock_read=config.timeout)
 
         async def classify(system_prompt: str, user_content: str) -> str:
+            policy = retry_policy_from_env()
             async with ClientSession(timeout=timeout) as session:
                 if model.is_anthropic:
                     url = _join_url(model.base_url, "/messages")
@@ -3349,9 +3574,18 @@ class ShimServer:
                         "system": system_prompt,
                         "messages": [{"role": "user", "content": user_content}],
                     }
-                    upstream = await session.post(url, json=payload, headers=_anthropic_headers({}, model))
-                    upstream.raise_for_status()
-                    data = await upstream.json(content_type=None)
+                    posted = await retry_aiohttp_post(
+                        session,
+                        url,
+                        json=payload,
+                        headers=_anthropic_headers({}, model),
+                        policy=policy,
+                        label=f"auto-router-anthropic:{model.slug}",
+                    )
+                    if posted.status >= 400:
+                        raise web.HTTPBadGateway(text=posted.error_text or f"classifier HTTP {posted.status}")
+                    data = await posted.response.json(content_type=None)
+                    posted.response.release()
                     return _anthropic_text(data)
                 url = _join_url(model.base_url, "/chat/completions")
                 payload = {
@@ -3364,9 +3598,18 @@ class ShimServer:
                         {"role": "user", "content": user_content},
                     ],
                 }
-                upstream = await session.post(url, json=payload, headers=_openai_headers({}, model))
-                upstream.raise_for_status()
-                data = await upstream.json(content_type=None)
+                posted = await retry_aiohttp_post(
+                    session,
+                    url,
+                    json=payload,
+                    headers=_openai_headers({}, model),
+                    policy=policy,
+                    label=f"auto-router-openai:{model.slug}",
+                )
+                if posted.status >= 400:
+                    raise web.HTTPBadGateway(text=posted.error_text or f"classifier HTTP {posted.status}")
+                data = await posted.response.json(content_type=None)
+                posted.response.release()
                 message = (data.get("choices") or [{}])[0].get("message") or {}
                 return str(message.get("content") or "")
 
@@ -3544,35 +3787,41 @@ class ShimServer:
         )
         _dump_debug_request(route.slug, url, forwarded)
         log_upstream_request(f"byok-openai-responses:{route.slug}", url, forwarded)
+
+        def disconnect_fn() -> bool:
+            return _request_disconnected(request)
+
+        policy = retry_policy_from_env()
         async with ClientSession(timeout=self.timeout) as session:
-            posted = await retry_aiohttp_post(
-                session,
-                url,
-                json=forwarded,
-                headers=headers,
-                policy=retry_policy_from_env(),
-                label=f"byok-openai-responses:{route.slug}",
-            )
-            upstream = posted.response
-            if posted.status >= 400:
-                observe_upstream_response(f"byok-openai-responses:{route.slug}", upstream)
-                text = posted.error_text or ""
-                log_upstream_response(
-                    f"byok-openai-responses:{route.slug}",
-                    url,
-                    posted.status,
-                    text,
-                    request_body=forwarded,
-                    stream=bool(forwarded.get("stream")),
-                )
-                code, message = parse_upstream_error(text, posted.status)
-                error = web.json_response(
-                    _responses_error_payload(route.slug, code, message),
-                    status=posted.status,
-                )
-                apply_upstream_headers_to_response(error, upstream_headers_from_response(upstream))
-                return error
             if not forwarded.get("stream"):
+                posted = await retry_aiohttp_post(
+                    session,
+                    url,
+                    json=forwarded,
+                    headers=headers,
+                    policy=policy,
+                    label=f"byok-openai-responses:{route.slug}",
+                    disconnect_fn=disconnect_fn,
+                )
+                upstream = posted.response
+                if posted.status >= 400:
+                    observe_upstream_response(f"byok-openai-responses:{route.slug}", upstream)
+                    text = posted.error_text or ""
+                    log_upstream_response(
+                        f"byok-openai-responses:{route.slug}",
+                        url,
+                        posted.status,
+                        text,
+                        request_body=forwarded,
+                        stream=False,
+                    )
+                    code, message = parse_upstream_error(text, posted.status)
+                    error = web.json_response(
+                        _responses_error_payload(route.slug, code, message),
+                        status=posted.status,
+                    )
+                    apply_upstream_headers_to_response(error, upstream_headers_from_response(upstream))
+                    return error
                 payload = await upstream.json(content_type=None)
                 if isinstance(payload, dict):
                     payload = rewrite_openai_responses_custom_payload(
@@ -3607,15 +3856,7 @@ class ShimServer:
                 )
                 upstream.release()
                 return response
-            observe_upstream_response(f"byok-openai-responses:{route.slug}", upstream)
-            log_upstream_response(
-                f"byok-openai-responses:{route.slug}",
-                url,
-                upstream.status,
-                request_body=forwarded,
-                stream=True,
-            )
-            response = prepare_downstream_sse_response(upstream)
+            response = _sse_response()
             await response.prepare(request)
             emitter = ChatgptRelayEmitter(model=route.slug)
             collector = ChatgptPassthroughResponseCollector(forwarded)
@@ -3623,8 +3864,40 @@ class ShimServer:
                 response,
                 emitter,
                 label=f"byok-openai-responses:{route.slug}",
-                upstream=upstream,
             ) as guard:
+                posted = await retry_aiohttp_post(
+                    session,
+                    url,
+                    json=forwarded,
+                    headers=headers,
+                    policy=policy,
+                    label=f"byok-openai-responses:{route.slug}",
+                    disconnect_fn=disconnect_fn,
+                )
+                upstream = posted.response
+                if posted.status >= 400:
+                    observe_upstream_response(f"byok-openai-responses:{route.slug}", upstream)
+                    text = posted.error_text or ""
+                    log_upstream_response(
+                        f"byok-openai-responses:{route.slug}",
+                        url,
+                        posted.status,
+                        text,
+                        request_body=forwarded,
+                        stream=True,
+                    )
+                    code, message = parse_upstream_error(text, posted.status)
+                    await emitter.fail(response, message, code=code)
+                    return response
+                observe_upstream_response(f"byok-openai-responses:{route.slug}", upstream)
+                log_upstream_response(
+                    f"byok-openai-responses:{route.slug}",
+                    url,
+                    upstream.status,
+                    request_body=forwarded,
+                    stream=True,
+                )
+                guard.attach_upstream(upstream)
                 try:
                     async for line in guard.iter_sse(request=request):
                         if line == "[DONE]":
@@ -3665,6 +3938,7 @@ class ShimServer:
         route: ShimModel,
         body: dict[str, Any],
         request_headers: Mapping[str, str] | None = None,
+        disconnect_fn: Any | None = None,
     ) -> tuple[Any, tuple[int, str, str, str] | None]:
         url = _join_url(route.base_url, "/chat/completions")
         headers = _openai_headers(
@@ -3684,6 +3958,7 @@ class ShimServer:
                 headers=headers,
                 policy=policy,
                 label=f"byok-openai-chat:{route.slug}",
+                disconnect_fn=disconnect_fn,
             )
             if posted.status < 400:
                 log_upstream_response(
@@ -3755,7 +4030,13 @@ class ShimServer:
                 responses_body=responses_body,
             )
         async with ClientSession(timeout=self.timeout) as session:
-            upstream, err = await self._post_openai_chat_completions(session, route, body, request.headers)
+            upstream, err = await self._post_openai_chat_completions(
+                session,
+                route,
+                body,
+                request.headers,
+                disconnect_fn=lambda: _request_disconnected(request),
+            )
             if err is not None:
                 status, text, code, message = err
                 if as_responses:
@@ -3847,7 +4128,11 @@ class ShimServer:
             pending_upstream = None
             if not as_responses:
                 pending_upstream, err = await self._post_openai_chat_completions(
-                    session, route, {**chat_body, "messages": messages}, request.headers
+                    session,
+                    route,
+                    {**chat_body, "messages": messages},
+                    request.headers,
+                    disconnect_fn=lambda: _request_disconnected(request),
                 )
                 if err is not None:
                     status, _text, code, message = err
@@ -3886,7 +4171,11 @@ class ShimServer:
                         else:
                             turn_body = {**chat_body, "messages": messages}
                             upstream, err = await self._post_openai_chat_completions(
-                                session, route, turn_body, request.headers
+                                session,
+                                route,
+                                turn_body,
+                                request.headers,
+                                disconnect_fn=lambda: _request_disconnected(request),
                             )
                         if err is not None:
                             status, _text, code, message = err
@@ -4016,6 +4305,7 @@ class ShimServer:
                 headers=headers,
                 policy=retry_policy_from_env(),
                 label=f"byok-openai-chat-anthropic:{route.slug}",
+                disconnect_fn=lambda: _request_disconnected(request),
             )
             upstream = posted.response
             if posted.status >= 400:
@@ -4045,6 +4335,7 @@ class ShimServer:
                 headers=headers,
                 policy=retry_policy_from_env(),
                 label=f"byok-anthropic-messages:{route.slug}",
+                disconnect_fn=lambda: _request_disconnected(request),
             )
             upstream = posted.response
             if posted.status >= 400:
@@ -4110,6 +4401,7 @@ class ShimServer:
                 headers=headers,
                 policy=retry_policy_from_env(),
                 label=f"byok-anthropic:{route.slug}",
+                disconnect_fn=lambda: _request_disconnected(request),
             )
             upstream = posted.response
             if posted.status >= 400:
@@ -4356,6 +4648,7 @@ def _finalize_chatgpt_passthrough_body(body: dict[str, Any]) -> dict[str, Any]:
     # only rewrite fields that have 400'd.
     forwarded = dict(body)
     forwarded["store"] = False
+    forwarded.pop("generate", None)
     return _apply_chatgpt_lite_constraints(forwarded)
 
 
@@ -4463,17 +4756,42 @@ def _has_shim_encrypted_content(value: dict[str, Any]) -> bool:
     return isinstance(encrypted_content, str) and encrypted_content.startswith(SHIM_ENCRYPTED_CONTENT_PREFIX)
 
 
-def _rewrite_response_model(payload: Any, model: str | None) -> None:
+def _chatgpt_response_model_aliases(*extra: str | None) -> set[str]:
+    aliases = {CHATGPT_MODEL_SLUG, *(candidate.slug for candidate in SESSION_TITLE_PASSTHROUGH_CANDIDATES)}
+    for slug in extra:
+        if slug:
+            aliases.add(slug)
+    return aliases
+
+
+def _is_rewritable_chatgpt_model(current: Any, aliases: set[str]) -> bool:
+    if not isinstance(current, str) or not current:
+        return False
+    if current in aliases:
+        return True
+    return any(
+        current.startswith(f"{alias}-") or current.startswith(f"{alias}.")
+        for alias in aliases
+    )
+
+
+def _rewrite_response_model(
+    payload: Any,
+    model: str | None,
+    *,
+    from_models: set[str] | None = None,
+) -> None:
     if not model:
         return
+    aliases = from_models if from_models is not None else _chatgpt_response_model_aliases()
     if isinstance(payload, dict):
-        if payload.get("model") == CHATGPT_MODEL_SLUG:
+        if _is_rewritable_chatgpt_model(payload.get("model"), aliases):
             payload["model"] = model
         for value in payload.values():
-            _rewrite_response_model(value, model)
+            _rewrite_response_model(value, model, from_models=aliases)
     elif isinstance(payload, list):
         for item in payload:
-            _rewrite_response_model(item, model)
+            _rewrite_response_model(item, model, from_models=aliases)
 
 
 # Desktop accumulates `response.reasoning_summary_text.delta` during the turn.

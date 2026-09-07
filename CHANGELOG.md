@@ -9,6 +9,30 @@ and this project does not yet follow semantic versioning (pre-1.0).
 
 ### Fixed
 
+- Upstream HTTP 429 / quota errors are absorbed in the shim instead of being
+  returned to Desktop (`retry_429` stays off). Rate-limit waits ramp from 60s
+  to 1h with jitter, then stay at 1h until success or Desktop disconnects.
+  ChatGPT `usage_limit_reached` quota waits at the 1h cap (or a shorter
+  `resets_in_seconds`) and also retry until success. Concurrent HTTP to the
+  same origin shares a cooldown gate; WebSocket lanes wait on their own
+  connection. Streaming SSE/WS keepalives start before those waits so Codex
+  does not idle-timeout `stream.next()`.
+
+- OpenCode Console `/v1/responses` 400s when a `function_call` in history has
+  empty `arguments` (`[invalid_request_error] arguments must be valid JSON`).
+  Muse Spark emitted a completed `exec_command` with `arguments: ""`. BYOK
+  openai-responses passthrough now stringifies object arguments and replaces
+  blank `arguments` with `{}` before the upstream request.
+
+- Desktop session titles now go to ChatGPT `gpt-5.4-mini` when Codex auth is
+  present, even if the selected picker model is BYOK (for example `local-llama`
+  with llama.cpp down). If mini fails, the shim retries `gpt-5.6-luna` at
+  `reasoning.effort=low`. ChatGPT Codex 400s on Desktop's `generate` flag and
+  dated snapshot slugs such as `gpt-5.4-mini-2026-03-17`; the shim strips
+  `generate` on ChatGPT passthrough and rewrites the response `model` back to
+  the selected slug. BYOK openai-responses hosts also reject `generate`; that
+  flag is stripped on that path too.
+
 - ChatGPT passthrough now lists GPT-6 Astra. Codex `/models` hides it below
   `client_version` 0.153.0 (`minimal_client_version` on the row). The shim
   uses `codex --version` from PATH when that binary exists, otherwise the

@@ -49,6 +49,176 @@ def is_retryable_status(status: int | None) -> bool:
     return status in RETRYABLE_STATUS
 
 
+THROTTLE_NONE = "none"
+THROTTLE_RATE_LIMIT = "rate_limit"
+THROTTLE_QUOTA = "quota"
+THROTTLE_TRANSPORT = "transport"
+
+_QUOTA_TYPES = frozenset(
+    {
+        "usage_limit_reached",
+        "quota_exceeded",
+        "quotaexceeded",
+        "usage_limit",
+    }
+)
+
+
+def _json_object(body: str | None) -> dict[str, Any]:
+    if not body:
+        return {}
+    try:
+        payload = json.loads(body)
+    except json.JSONDecodeError:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _error_object(payload: dict[str, Any]) -> dict[str, Any]:
+    err = payload.get("error")
+    return err if isinstance(err, dict) else {}
+
+
+def _error_tokens(body: str | None) -> str:
+    payload = _json_object(body)
+    err = _error_object(payload)
+    return " ".join(
+        str(item).lower()
+        for item in (
+            err.get("type"),
+            err.get("code"),
+            payload.get("type"),
+            payload.get("code"),
+            err.get("message"),
+            payload.get("message"),
+        )
+        if item is not None
+    )
+
+
+def parse_resets_in_seconds(body: str | None) -> float | None:
+    import time as _time
+    from datetime import datetime, timezone
+
+    payload = _json_object(body)
+    err = _error_object(payload)
+    for src in (err, payload):
+        value = src.get("resets_in_seconds")
+        if value is None:
+            value = src.get("resets_in")
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return max(0.0, float(value))
+        resets_at = src.get("resets_at")
+        if isinstance(resets_at, (int, float)) and not isinstance(resets_at, bool):
+            return max(0.0, float(resets_at) - _time.time())
+        if isinstance(resets_at, str) and resets_at.strip():
+            text = resets_at.strip()
+            try:
+                parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+            except ValueError:
+                parsed = None
+            if parsed is not None:
+                if parsed.tzinfo is None:
+                    parsed = parsed.replace(tzinfo=timezone.utc)
+                return max(0.0, parsed.timestamp() - _time.time())
+    return None
+
+
+def is_quota_limit(status: int | None, body: str | None) -> bool:
+    del status
+    payload = _json_object(body)
+    err = _error_object(payload)
+    tokens = _error_tokens(body)
+    if any(marker in tokens for marker in _QUOTA_TYPES):
+        return True
+    if err.get("plan_type") and parse_resets_in_seconds(body) is not None:
+        return True
+    if "usage limit" in tokens and "rate limit" not in tokens:
+        return True
+    return False
+
+
+def is_rate_limit(status: int | None, body: str | None) -> bool:
+    if is_quota_limit(status, body):
+        return False
+    if status == 429:
+        return True
+    compact = (
+        _error_tokens(body)
+        .replace(" ", "")
+        .replace("_", "")
+        .replace("-", "")
+    )
+    return any(
+        marker in compact
+        for marker in (
+            "freeusagelimiterror",
+            "ratelimit",
+            "toomanyrequests",
+        )
+    )
+
+
+def exception_http_status(exc: BaseException | None) -> int | None:
+    if exc is None:
+        return None
+    for attr in ("status", "code", "status_code"):
+        value = getattr(exc, attr, None)
+        if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+            return value
+    return None
+
+
+def classify_throttle(
+    *,
+    status: int | None = None,
+    content_type: str | None = None,
+    body: str | None = None,
+    exc: BaseException | None = None,
+) -> str:
+    del content_type
+    resolved_status = status if status is not None else exception_http_status(exc)
+    blob = body
+    if blob is None and exc is not None:
+        blob = str(exc)
+    if is_quota_limit(resolved_status, blob):
+        return THROTTLE_QUOTA
+    if is_rate_limit(resolved_status, blob):
+        return THROTTLE_RATE_LIMIT
+    if exc is not None and is_retryable_exception(exc):
+        return THROTTLE_TRANSPORT
+    if is_retryable_status(resolved_status):
+        return THROTTLE_TRANSPORT
+    return THROTTLE_NONE
+
+
+def classify_ws_event_throttle(event: Any) -> str:
+    if not isinstance(event, dict):
+        return THROTTLE_NONE
+    status = event.get("status") if isinstance(event.get("status"), int) else None
+    blobs: list[Any] = [event]
+    err = event.get("error")
+    if isinstance(err, dict):
+        blobs.append({"error": err})
+        nested_status = err.get("status") or err.get("code")
+        if status is None and isinstance(nested_status, int):
+            status = nested_status
+    response = event.get("response")
+    if isinstance(response, dict):
+        blobs.append(response)
+        inner = response.get("error")
+        if isinstance(inner, dict):
+            blobs.append({"error": inner})
+            nested_status = inner.get("status") or inner.get("code")
+            if status is None and isinstance(nested_status, int):
+                status = nested_status
+    for blob in blobs:
+        kind = classify_throttle(status=status, body=json.dumps(blob))
+        if kind != THROTTLE_NONE:
+            return kind
+    return THROTTLE_NONE
+
+
 _GENERIC_ERROR_MESSAGES = frozenset({"provider returned error", "error"})
 
 

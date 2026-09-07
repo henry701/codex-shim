@@ -11,7 +11,37 @@ from codex_shim.net.errors import (
     is_retryable_exception,
     parse_upstream_error,
 )
-from codex_shim.net.retry import RetryPolicy, request_urllib, retry_aiohttp_post, retry_policy_from_env
+from codex_shim.net.retry import (
+    RetryPolicy,
+    configure_origin_backoff,
+    get_origin_backoff,
+    request_urllib,
+    reset_origin_backoff,
+    retry_aiohttp_post,
+    retry_aiohttp_ws_connect,
+    retry_policy_from_env,
+)
+
+
+@pytest.fixture(autouse=True)
+def _reset_origin_backoff_between_tests():
+    reset_origin_backoff()
+    yield
+    reset_origin_backoff()
+
+
+def _rate_limit_policy(**overrides):
+    policy = RetryPolicy(
+        attempts=3,
+        backoff_base=0.5,
+        backoff_factor=2.0,
+        rate_limit_min=60.0,
+        rate_limit_max=3600.0,
+        rate_limit_jitter=0.0,
+    )
+    for key, value in overrides.items():
+        setattr(policy, key, value)
+    return policy
 
 
 class _Resp:
@@ -203,12 +233,16 @@ def test_retry_policy_from_env(monkeypatch):
     monkeypatch.setenv("CODEX_SHIM_RETRY_ATTEMPTS", "5")
     monkeypatch.setenv("CODEX_SHIM_RETRY_BACKOFF_BASE", "0.25")
     monkeypatch.setenv("CODEX_SHIM_RETRY_BACKOFF_FACTOR", "3")
+    monkeypatch.setenv("CODEX_SHIM_RETRY_RATE_LIMIT_MIN", "90")
+    monkeypatch.setenv("CODEX_SHIM_RETRY_RATE_LIMIT_MAX", "1800")
     policy = retry_policy_from_env()
     assert policy.attempts == 5
     assert policy.backoff_base == 0.25
     assert policy.backoff_factor == 3.0
     assert policy.delay_for(0) == 0.25
     assert policy.delay_for(1) == 0.75
+    assert policy.rate_limit_min == 90.0
+    assert policy.rate_limit_max == 1800.0
 
 
 def test_parse_upstream_error_and_retryable_exception():
@@ -329,12 +363,12 @@ async def test_retry_aiohttp_post_honors_retry_after_header(monkeypatch):
         session,
         "https://openrouter.ai/api/v1/chat/completions",
         json={"model": "x"},
-        policy=RetryPolicy(attempts=3, backoff_base=0.5, backoff_factor=2.0),
+        policy=_rate_limit_policy(),
         label="or-test",
     )
     assert posted.status == 200
     assert session.calls == 2
-    assert sleeps == [5.0]
+    assert sleeps == pytest.approx([60.0], abs=0.05)
 
 
 async def test_retry_aiohttp_post_honors_openrouter_retry_after_body(monkeypatch):
@@ -366,10 +400,10 @@ async def test_retry_aiohttp_post_honors_openrouter_retry_after_body(monkeypatch
         session,
         "https://openrouter.ai/api/v1/chat/completions",
         json={"model": "x"},
-        policy=RetryPolicy(attempts=3, backoff_base=0.5, backoff_factor=2.0),
+        policy=_rate_limit_policy(),
     )
     assert posted.status == 200
-    assert sleeps == [5.0]
+    assert sleeps == pytest.approx([60.0], abs=0.05)
 
 
 async def test_retry_aiohttp_post_extends_past_attempts_when_retry_after(monkeypatch):
@@ -396,11 +430,11 @@ async def test_retry_aiohttp_post_extends_past_attempts_when_retry_after(monkeyp
         session,
         "https://openrouter.ai/api/v1/chat/completions",
         json={"model": "x"},
-        policy=RetryPolicy(attempts=3, backoff_base=0.5, backoff_factor=2.0, wait_budget=20.0),
+        policy=_rate_limit_policy(wait_budget=20.0),
     )
     assert posted.status == 200
     assert session.calls == 5
-    assert sleeps == [5.0, 5.0, 5.0, 5.0]
+    assert sleeps == pytest.approx([60.0, 120.0, 240.0, 480.0], abs=0.05)
 
 
 async def test_retry_aiohttp_post_attempts_1_does_not_extend_on_retry_after(monkeypatch):
@@ -445,10 +479,10 @@ async def test_retry_aiohttp_post_defaults_429_wait_without_retry_after(monkeypa
         session,
         "https://opencode.ai/zen/v1/chat/completions",
         json={"model": "x"},
-        policy=RetryPolicy(attempts=3, backoff_base=0.5, backoff_factor=2.0),
+        policy=_rate_limit_policy(),
     )
     assert posted.status == 200
-    assert sleeps == [5.0]
+    assert sleeps == pytest.approx([60.0], abs=0.05)
 
 
 async def test_aiohttp_retryable_status_body_read_failure_retries_and_closes_response(monkeypatch):
@@ -545,7 +579,7 @@ async def test_tiny_retry_after_cannot_create_unbounded_extension_attempts(monke
 
     monkeypatch.setattr("codex_shim.net.retry.asyncio.sleep", fake_sleep)
     session = _AiohttpSession(
-        [_AiohttpResponse(429, "slow", headers={"Retry-After": "0.001"})] * 40
+        [_AiohttpResponse(503, "slow", headers={"Retry-After": "0.001"})] * 40
     )
     posted = await retry_aiohttp_post(
         session,
@@ -553,7 +587,7 @@ async def test_tiny_retry_after_cannot_create_unbounded_extension_attempts(monke
         json={"model": "x"},
         policy=RetryPolicy(attempts=3, backoff_base=0.0, wait_budget=30.0),
     )
-    assert posted.status == 429
+    assert posted.status == 503
     assert session.calls <= 12
     assert session.calls >= 3
 
@@ -593,8 +627,13 @@ def test_parse_retry_after_accepts_http_date_and_caps_delay():
     assert 10.0 <= parsed <= 13.0
 
     far = datetime.now(timezone.utc) + timedelta(seconds=120)
-    capped = parse_retry_after(type("R", (), {"headers": {"Retry-After": format_datetime(far)}})())
-    assert capped == 60.0
+    parsed_far = parse_retry_after(type("R", (), {"headers": {"Retry-After": format_datetime(far)}})())
+    assert parsed_far is not None
+    assert 110.0 <= parsed_far <= 130.0
+
+    huge = datetime.now(timezone.utc) + timedelta(seconds=7200)
+    capped = parse_retry_after(type("R", (), {"headers": {"Retry-After": format_datetime(huge)}})())
+    assert capped == 3600.0
 
 
 def test_aiohttp_and_urllib_share_retry_decision_sequence():
@@ -614,10 +653,564 @@ def test_aiohttp_and_urllib_share_retry_decision_sequence():
             state.record(wait, extension=state.in_extension(policy))
         return out
 
-        first = waits_for()
-        second = waits_for()
-        assert first == second
-        assert first[:2] == [5.0, 5.0]
-        assert first[-1] is None
-        assert 3 <= len(first) <= 11
-        assert all(wait is None or wait >= 5.0 for wait in first)
+    first = waits_for()
+    second = waits_for()
+    assert first == second
+    assert first[:2] == [5.0, 5.0]
+    assert first[-1] is None
+    assert 3 <= len(first) <= 11
+    assert all(wait is None or wait >= 5.0 for wait in first)
+
+
+_FREE_USAGE_BODY = (
+    '{"type":"error","error":{"type":"FreeUsageLimitError","message":"Rate limit exceeded"}}'
+)
+
+
+def _quota_body(*, resets_in_seconds: int) -> str:
+    return json.dumps(
+        {
+            "error": {
+                "type": "usage_limit_reached",
+                "message": "You've hit your usage limit",
+                "plan_type": "plus",
+                "resets_in_seconds": resets_in_seconds,
+            }
+        }
+    )
+
+
+async def test_retry_aiohttp_post_rate_limit_ramps_then_caps_endlessly(monkeypatch):
+    sleeps: list[float] = []
+
+    async def fake_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+
+    monkeypatch.setattr("codex_shim.net.retry.asyncio.sleep", fake_sleep)
+    session = _AiohttpSession(
+        [_AiohttpResponse(429, _FREE_USAGE_BODY, content_type="application/json")] * 8
+        + [_AiohttpResponse(200, "", "text/event-stream")]
+    )
+    posted = await retry_aiohttp_post(
+        session,
+        "https://opencode.ai/zen/v1/responses",
+        json={"model": "x"},
+        policy=_rate_limit_policy(),
+    )
+    assert posted.status == 200
+    assert session.calls == 9
+    assert sleeps[:2] == pytest.approx([60.0, 120.0], abs=0.05)
+    assert sleeps[-2:] == pytest.approx([3600.0, 3600.0], abs=0.05)
+    assert max(sleeps) == pytest.approx(3600.0, abs=0.05)
+
+
+async def test_retry_aiohttp_post_retry_after_7200_clamps_to_max(monkeypatch):
+    sleeps: list[float] = []
+
+    async def fake_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+
+    monkeypatch.setattr("codex_shim.net.retry.asyncio.sleep", fake_sleep)
+    session = _AiohttpSession(
+        [
+            _AiohttpResponse(429, "slow", headers={"Retry-After": "7200"}),
+            _AiohttpResponse(200, "", "text/event-stream"),
+        ]
+    )
+    posted = await retry_aiohttp_post(
+        session,
+        "https://opencode.ai/zen/v1/responses",
+        json={"model": "x"},
+        policy=_rate_limit_policy(),
+    )
+    assert posted.status == 200
+    assert sleeps == pytest.approx([3600.0], abs=0.05)
+
+
+async def test_retry_aiohttp_post_http_origin_gate_blocks_second_post(monkeypatch):
+    sleeps: list[float] = []
+    post_order: list[str] = []
+    a_waiting = __import__("asyncio").Event()
+    b_finished = __import__("asyncio").Event()
+
+    async def fake_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+        task = __import__("asyncio").current_task()
+        name = task.get_name() if task is not None else ""
+        if name == "gate-a" and not a_waiting.is_set():
+            a_waiting.set()
+            await b_finished.wait()
+
+    monkeypatch.setattr("codex_shim.net.retry.asyncio.sleep", fake_sleep)
+
+    class _SharedSession:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def post(self, url, json=None, headers=None):
+            task = __import__("asyncio").current_task()
+            post_order.append(task.get_name() if task is not None else "")
+            self.calls += 1
+            if self.calls == 1:
+                return _AiohttpResponse(429, _FREE_USAGE_BODY, content_type="application/json")
+            return _AiohttpResponse(200, "", "text/event-stream")
+
+    session = _SharedSession()
+    url = "https://opencode.ai/zen/v1/responses"
+
+    async def run_a():
+        return await retry_aiohttp_post(
+            session, url, json={"model": "x"}, policy=_rate_limit_policy()
+        )
+
+    async def run_b():
+        await a_waiting.wait()
+        posted = await retry_aiohttp_post(
+            session, url, json={"model": "x"}, policy=_rate_limit_policy()
+        )
+        b_finished.set()
+        return posted
+
+    import asyncio
+
+    posted_a, posted_b = await asyncio.gather(
+        asyncio.create_task(run_a(), name="gate-a"),
+        asyncio.create_task(run_b(), name="gate-b"),
+    )
+    assert posted_a.status == 200
+    assert posted_b.status == 200
+    assert "gate-b" in sleeps or any(name == "gate-b" for name in post_order)
+    assert sleeps[0] == pytest.approx(60.0, abs=0.05)
+    assert any(wait >= 59.0 for wait in sleeps[1:])
+    assert post_order[0] == "gate-a"
+    assert session.calls >= 3
+
+
+async def test_retry_aiohttp_post_origin_gate_does_not_span_hosts(monkeypatch):
+    sleeps: list[float] = []
+
+    async def fake_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+
+    monkeypatch.setattr("codex_shim.net.retry.asyncio.sleep", fake_sleep)
+    configure_origin_backoff("https://opencode.ai/zen/v1/responses", delay=90.0)
+    session = _AiohttpSession([_AiohttpResponse(200, "", "text/event-stream")])
+    posted = await retry_aiohttp_post(
+        session,
+        "https://chatgpt.com/backend-api/codex/responses",
+        json={"model": "x"},
+        policy=_rate_limit_policy(),
+    )
+    assert posted.status == 200
+    assert session.calls == 1
+    assert sleeps == []
+
+
+async def test_retry_aiohttp_post_seeded_origin_gate_sleeps_before_send(monkeypatch):
+    sleeps: list[float] = []
+
+    async def fake_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+
+    monkeypatch.setattr("codex_shim.net.retry.asyncio.sleep", fake_sleep)
+    configure_origin_backoff("https://opencode.ai/zen/v1/responses", delay=90.0)
+    session = _AiohttpSession([_AiohttpResponse(200, "", "text/event-stream")])
+    posted = await retry_aiohttp_post(
+        session,
+        "https://opencode.ai/zen/v1/chat/completions",
+        json={"model": "x"},
+        policy=_rate_limit_policy(),
+    )
+    assert posted.status == 200
+    assert session.calls == 1
+    assert sleeps == pytest.approx([90.0], abs=0.05)
+
+
+async def test_retry_aiohttp_post_quota_waits_max_endlessly(monkeypatch):
+    sleeps: list[float] = []
+
+    async def fake_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+
+    monkeypatch.setattr("codex_shim.net.retry.asyncio.sleep", fake_sleep)
+    session = _AiohttpSession(
+        [_AiohttpResponse(429, _quota_body(resets_in_seconds=600000), content_type="application/json")] * 2
+        + [_AiohttpResponse(200, "", "text/event-stream")]
+    )
+    posted = await retry_aiohttp_post(
+        session,
+        "https://chatgpt.com/backend-api/codex/responses",
+        json={"model": "x"},
+        policy=_rate_limit_policy(attempts=3),
+    )
+    assert posted.status == 200
+    assert session.calls == 3
+    assert sleeps == pytest.approx([3600.0, 3600.0], abs=0.05)
+
+
+async def test_retry_aiohttp_post_quota_honors_short_reset(monkeypatch):
+    sleeps: list[float] = []
+
+    async def fake_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+
+    monkeypatch.setattr("codex_shim.net.retry.asyncio.sleep", fake_sleep)
+    session = _AiohttpSession(
+        [
+            _AiohttpResponse(429, _quota_body(resets_in_seconds=90), content_type="application/json"),
+            _AiohttpResponse(200, "", "text/event-stream"),
+        ]
+    )
+    posted = await retry_aiohttp_post(
+        session,
+        "https://chatgpt.com/backend-api/codex/responses",
+        json={"model": "x"},
+        policy=_rate_limit_policy(),
+    )
+    assert posted.status == 200
+    assert sleeps == pytest.approx([90.0], abs=0.05)
+
+
+async def test_retry_aiohttp_post_gives_up_when_client_disconnects(monkeypatch):
+    sleeps: list[float] = []
+
+    async def fake_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+
+    monkeypatch.setattr("codex_shim.net.retry.asyncio.sleep", fake_sleep)
+    configure_origin_backoff("https://opencode.ai/zen/v1/responses", delay=60.0)
+    session = _AiohttpSession([_AiohttpResponse(200, "", "text/event-stream")])
+    from codex_shim.net.sse import ClientDisconnected
+
+    with pytest.raises(ClientDisconnected):
+        await retry_aiohttp_post(
+            session,
+            "https://opencode.ai/zen/v1/responses",
+            json={"model": "x"},
+            policy=_rate_limit_policy(),
+            disconnect_fn=lambda: True,
+        )
+    assert session.calls == 0
+    assert sleeps == []
+
+
+async def test_retry_aiohttp_post_emits_pings_during_rate_limit_wait(monkeypatch):
+    sleeps: list[float] = []
+    pings: list[int] = []
+
+    async def fake_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+
+    async def ping_fn() -> None:
+        pings.append(1)
+
+    monkeypatch.setattr("codex_shim.net.retry.asyncio.sleep", fake_sleep)
+    session = _AiohttpSession(
+        [
+            _AiohttpResponse(429, _FREE_USAGE_BODY, content_type="application/json"),
+            _AiohttpResponse(200, "", "text/event-stream"),
+        ]
+    )
+    posted = await retry_aiohttp_post(
+        session,
+        "https://opencode.ai/zen/v1/responses",
+        json={"model": "x"},
+        policy=_rate_limit_policy(),
+        ping_fn=ping_fn,
+        keepalive=15.0,
+    )
+    assert posted.status == 200
+    assert sum(sleeps) == pytest.approx(60.0, abs=0.05)
+    assert pings
+
+
+class _WsHandshakeError(Exception):
+    def __init__(self, status: int) -> None:
+        super().__init__(f"handshake {status}")
+        self.status = status
+
+
+class _WsSession:
+    def __init__(self, outcomes: list[object]) -> None:
+        self.outcomes = list(outcomes)
+        self.calls = 0
+
+    async def ws_connect(self, url, headers=None, heartbeat=None):
+        self.calls += 1
+        item = self.outcomes.pop(0)
+        if isinstance(item, BaseException):
+            raise item
+        return item
+
+
+async def test_retry_aiohttp_ws_connect_sleeps_per_connection_not_origin_gate(monkeypatch):
+    import asyncio
+
+    sleeps: list[tuple[str, float]] = []
+    a_waiting = asyncio.Event()
+    b_connected = asyncio.Event()
+
+    async def fake_sleep(seconds: float) -> None:
+        task = asyncio.current_task()
+        name = task.get_name() if task is not None else ""
+        sleeps.append((name, seconds))
+        if name == "ws-a":
+            a_waiting.set()
+            await b_connected.wait()
+
+    monkeypatch.setattr("codex_shim.net.retry.asyncio.sleep", fake_sleep)
+    session_a = _WsSession([_WsHandshakeError(429), object()])
+    session_b = _WsSession([object()])
+
+    async def run_a():
+        return await retry_aiohttp_ws_connect(
+            session_a,
+            "wss://chatgpt.com/backend-api/codex/responses",
+            policy=_rate_limit_policy(),
+            ws_session="a",
+        )
+
+    async def run_b():
+        await a_waiting.wait()
+        result = await retry_aiohttp_ws_connect(
+            session_b,
+            "wss://chatgpt.com/backend-api/codex/responses",
+            policy=_rate_limit_policy(),
+            ws_session="b",
+        )
+        b_connected.set()
+        return result
+
+    ws_a, ws_b = await asyncio.gather(
+        asyncio.create_task(run_a(), name="ws-a"),
+        asyncio.create_task(run_b(), name="ws-b"),
+    )
+    assert ws_a is not None
+    assert ws_b is not None
+    assert session_b.calls == 1
+    assert session_a.calls == 2
+    assert sleeps[0][0] == "ws-a"
+    assert sleeps[0][1] == pytest.approx(60.0, abs=0.05)
+    assert all(name != "ws-b" for name, _delay in sleeps)
+    origin = get_origin_backoff("wss://chatgpt.com/backend-api/codex/responses")
+    assert origin is not None
+    assert origin.kind == "none" or origin.exponent in {1, 2}
+
+
+def test_request_urllib_rate_limit_ramps_then_succeeds():
+    sleeps: list[float] = []
+    attempts = {"n": 0}
+
+    def fake_urlopen(request, timeout=20.0):
+        attempts["n"] += 1
+        if attempts["n"] < 4:
+            raise HTTPError(
+                "https://opencode.ai/zen/v1/models",
+                429,
+                "Too Many",
+                hdrs=None,
+                fp=BytesIO(_FREE_USAGE_BODY.encode()),
+            )
+        return _Resp()
+
+    result = request_urllib(
+        "https://opencode.ai/zen/v1/models",
+        policy=_rate_limit_policy(),
+        urlopen_fn=fake_urlopen,
+        sleep_fn=sleeps.append,
+        ensure_json=True,
+    )
+    assert result.status == 200
+    assert attempts["n"] == 4
+    assert sleeps == pytest.approx([60.0, 120.0, 240.0], abs=0.05)
+
+
+def test_request_urllib_seeded_origin_gate_sleeps_before_send():
+    sleeps: list[float] = []
+    configure_origin_backoff("https://opencode.ai/zen/v1/models", delay=90.0)
+
+    def fake_urlopen(request, timeout=20.0):
+        return _Resp()
+
+    result = request_urllib(
+        "https://opencode.ai/zen/v1/chat/completions",
+        policy=_rate_limit_policy(),
+        urlopen_fn=fake_urlopen,
+        sleep_fn=sleeps.append,
+        ensure_json=True,
+    )
+    assert result.status == 200
+    assert sleeps == pytest.approx([90.0], abs=0.05)
+
+
+def test_request_urllib_quota_waits_max_then_succeeds():
+    sleeps: list[float] = []
+    attempts = {"n": 0}
+
+    def fake_urlopen(request, timeout=20.0):
+        attempts["n"] += 1
+        if attempts["n"] < 3:
+            raise HTTPError(
+                "https://chatgpt.com/backend-api/codex/responses",
+                429,
+                "Too Many",
+                hdrs=None,
+                fp=BytesIO(_quota_body(resets_in_seconds=600000).encode()),
+            )
+        return _Resp()
+
+    result = request_urllib(
+        "https://chatgpt.com/backend-api/codex/responses",
+        policy=_rate_limit_policy(),
+        urlopen_fn=fake_urlopen,
+        sleep_fn=sleeps.append,
+        ensure_json=True,
+    )
+    assert result.status == 200
+    assert attempts["n"] == 3
+    assert sleeps == pytest.approx([3600.0, 3600.0], abs=0.05)
+
+
+def test_request_urllib_503_does_not_seed_origin_gate():
+    sleeps: list[float] = []
+    attempts = {"n": 0}
+
+    def fake_urlopen(request, timeout=20.0):
+        attempts["n"] += 1
+        if attempts["n"] == 1:
+            raise HTTPError(
+                "https://opencode.ai/zen/v1/models",
+                503,
+                "Unavailable",
+                hdrs=None,
+                fp=BytesIO(b"nope"),
+            )
+        return _Resp()
+
+    result = request_urllib(
+        "https://opencode.ai/zen/v1/models",
+        policy=_rate_limit_policy(backoff_base=0.5),
+        urlopen_fn=fake_urlopen,
+        sleep_fn=sleeps.append,
+        ensure_json=True,
+    )
+    assert result.status == 200
+    assert sleeps == pytest.approx([0.5], abs=0.05)
+    origin = get_origin_backoff("https://opencode.ai/zen/v1/models")
+    assert origin is None or origin.kind == "none"
+    assert origin is None or origin.not_before == 0
+
+
+async def test_retry_aiohttp_post_503_does_not_seed_origin_gate(monkeypatch):
+    sleeps: list[float] = []
+
+    async def fake_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+
+    monkeypatch.setattr("codex_shim.net.retry.asyncio.sleep", fake_sleep)
+    session = _AiohttpSession(
+        [
+            _AiohttpResponse(503, "nope"),
+            _AiohttpResponse(200, "", "text/event-stream"),
+        ]
+    )
+    posted = await retry_aiohttp_post(
+        session,
+        "https://opencode.ai/zen/v1/responses",
+        json={"model": "x"},
+        policy=_rate_limit_policy(),
+    )
+    assert posted.status == 200
+    assert sleeps == pytest.approx([0.5], abs=0.05)
+    origin = get_origin_backoff("https://opencode.ai/zen/v1/responses")
+    assert origin is None or origin.kind == "none"
+
+
+async def test_retry_aiohttp_ws_connect_pings_during_rate_limit_wait(monkeypatch):
+    sleeps: list[float] = []
+    pings: list[int] = []
+
+    async def fake_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+
+    async def ping_fn() -> None:
+        pings.append(1)
+
+    monkeypatch.setattr("codex_shim.net.retry.asyncio.sleep", fake_sleep)
+    session = _WsSession([_WsHandshakeError(429), object()])
+    ws = await retry_aiohttp_ws_connect(
+        session,
+        "wss://opencode.ai/zen",
+        policy=_rate_limit_policy(),
+        ping_fn=ping_fn,
+        keepalive=15.0,
+    )
+    assert ws is not None
+    assert session.calls == 2
+    assert sum(sleeps) == pytest.approx(60.0, abs=0.05)
+    assert pings
+
+
+async def test_retry_aiohttp_ws_connect_gives_up_when_client_disconnects(monkeypatch):
+    sleeps: list[float] = []
+
+    async def fake_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+
+    monkeypatch.setattr("codex_shim.net.retry.asyncio.sleep", fake_sleep)
+    session = _WsSession([_WsHandshakeError(429), object()])
+    from codex_shim.net.sse import ClientDisconnected
+
+    def disconnected() -> bool:
+        return True
+
+    with pytest.raises(ClientDisconnected):
+        await retry_aiohttp_ws_connect(
+            session,
+            "wss://opencode.ai/zen",
+            policy=_rate_limit_policy(),
+            disconnect_fn=disconnected,
+        )
+    assert session.calls == 0
+    assert sleeps == []
+
+
+async def test_await_ws_throttle_sleeps_on_429_connect_error(monkeypatch):
+    sleeps: list[float] = []
+
+    async def fake_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+
+    monkeypatch.setattr("codex_shim.net.retry.asyncio.sleep", fake_sleep)
+    monkeypatch.setenv("CODEX_SHIM_RETRY_RATE_LIMIT_JITTER", "0")
+    from codex_shim.ws_passthrough import WsPassthroughConnectError, await_ws_throttle
+
+    waited = await await_ws_throttle(
+        object(),
+        "wss://opencode.ai/zen",
+        WsPassthroughConnectError("FreeUsageLimitError", status=429),
+    )
+    assert waited is True
+    assert sleeps == pytest.approx([60.0], abs=0.05)
+
+
+async def test_await_ws_throttle_ignores_non_throttle_connect_error(monkeypatch):
+    sleeps: list[float] = []
+
+    async def fake_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+
+    monkeypatch.setattr("codex_shim.net.retry.asyncio.sleep", fake_sleep)
+    from codex_shim.ws_passthrough import WsPassthroughConnectError, await_ws_throttle
+
+    class _Session:
+        def client_disconnected(self) -> bool:
+            return False
+
+    waited = await await_ws_throttle(
+        _Session(),
+        "wss://opencode.ai/zen",
+        WsPassthroughConnectError("bad request", status=400),
+    )
+    assert waited is False
+    assert sleeps == []

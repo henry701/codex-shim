@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import Any
 
 from aiohttp import ClientSession
@@ -103,6 +104,9 @@ async def post_chatgpt_with_retry(
     attempts: int = DEFAULT_ATTEMPTS,
     backoff_base: float = DEFAULT_BACKOFF_BASE,
     backoff_factor: float = DEFAULT_BACKOFF_FACTOR,
+    disconnect_fn: Callable[[], bool] | None = None,
+    ping_fn: Callable[..., Any] | None = None,
+    keepalive: float | None = None,
 ) -> ChatgptEdgePost:
     """POST ChatGPT Codex, retrying edge blips on a fresh TCP connection each try."""
     posted = await retry_aiohttp_post(
@@ -112,6 +116,9 @@ async def post_chatgpt_with_retry(
         headers=headers,
         policy=_chatgpt_retry_policy(attempts, backoff_base, backoff_factor),
         label=url,
+        disconnect_fn=disconnect_fn,
+        ping_fn=ping_fn,
+        keepalive=keepalive,
     )
     if is_html_chatgpt_site_down(posted.status, posted.content_type, posted.error_text):
         return ChatgptEdgePost(

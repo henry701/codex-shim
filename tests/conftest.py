@@ -4,6 +4,15 @@ import pytest
 
 
 @pytest.fixture(autouse=True)
+def _reset_origin_backoff_between_tests():
+    from codex_shim.net.retry import reset_origin_backoff
+
+    reset_origin_backoff()
+    yield
+    reset_origin_backoff()
+
+
+@pytest.fixture(autouse=True)
 def _disable_periodic_catalog_refresh(monkeypatch):
     # Serve would otherwise rewrite the live Desktop catalog from stubbed discovery.
     monkeypatch.setattr("codex_shim.server._CATALOG_REFRESH_INITIAL_DELAY_SEC", None)

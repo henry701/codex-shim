@@ -15,6 +15,7 @@ from .retry import (
     parse_retry_after,
     request_urllib,
     retry_aiohttp_post,
+    retry_aiohttp_ws_connect,
     retry_policy_from_env,
 )
 from .sse import (
@@ -49,6 +50,7 @@ __all__ = [
     "request_disconnected",
     "request_urllib",
     "retry_aiohttp_post",
+    "retry_aiohttp_ws_connect",
     "retry_policy_from_env",
     "sse_lines",
     "write_anthropic_sse",

@@ -18,6 +18,15 @@ from .header_passthrough import (
     upstream_headers_from_response,
 )
 from .net.emitters import WsRelayEmitter
+from .net.errors import (
+    THROTTLE_QUOTA,
+    THROTTLE_RATE_LIMIT,
+    classify_throttle,
+    classify_ws_event_throttle,
+    parse_resets_in_seconds,
+)
+from .net.retry import backoff_ws_origin, retry_aiohttp_ws_connect, retry_policy_from_env
+from .net.sse import ClientDisconnected
 
 CHATGPT_WS_URL = "wss://chatgpt.com/backend-api/codex/responses"
 UPSTREAM_WS_HEARTBEAT = 30
@@ -87,6 +96,29 @@ def _is_upstream_transport_dead(exc: BaseException) -> bool:
     return "closing transport" in str(exc).lower()
 
 
+async def await_ws_throttle(session: Any, url: str, exc: BaseException) -> bool:
+    """Sleep this connection's backoff. True when the error is a throttle wait."""
+    status = getattr(exc, "status", None)
+    body = str(exc)
+    kind = classify_throttle(status=status if isinstance(status, int) else None, body=body, exc=exc)
+    policy = retry_policy_from_env()
+    if kind not in {THROTTLE_RATE_LIMIT, THROTTLE_QUOTA} or policy.attempts <= 1:
+        return False
+    disconnect_fn = getattr(session, "client_disconnected", None)
+    ping_fn = getattr(session, "ping_client", None)
+    await backoff_ws_origin(
+        url,
+        kind,
+        policy,
+        retry_after=None,
+        resets_in_seconds=parse_resets_in_seconds(body),
+        disconnect_fn=disconnect_fn if callable(disconnect_fn) else None,
+        ping_fn=ping_fn if callable(ping_fn) else None,
+        ws_session=id(session),
+    )
+    return True
+
+
 @dataclass
 class WsPassthroughSession:
     """One inbound client WebSocket paired with upstream WS lanes keyed by URL.
@@ -133,6 +165,18 @@ class WsPassthroughSession:
             return
         self.last_chained_response_id_by_url.pop(upstream_url, None)
 
+    def client_disconnected(self) -> bool:
+        ws = self.client_ws
+        return ws is None or bool(getattr(ws, "closed", False))
+
+    async def ping_client(self) -> None:
+        if self.client_disconnected():
+            raise ClientDisconnected()
+        await self.client_ws.send_str('{"type":"ping"}')
+
+    async def wait_ws_throttle(self, url: str, exc: BaseException) -> bool:
+        return await await_ws_throttle(self, url, exc)
+
     async def connect_upstream(self, url: str, headers: dict[str, str]) -> tuple[dict[str, str], bool]:
         existing = self.upstream_by_url.get(url)
         if existing is not None and _upstream_lane_reusable(existing):
@@ -140,13 +184,25 @@ class WsPassthroughSession:
         if existing is not None:
             await self.close_upstream(url)
         try:
-            upstream_ws = await self.client_session.ws_connect(
+            upstream_ws = await retry_aiohttp_ws_connect(
+                self.client_session,
                 url,
                 headers=headers,
                 heartbeat=UPSTREAM_WS_HEARTBEAT,
+                policy=retry_policy_from_env(),
+                label=f"ws-connect:{url}",
+                disconnect_fn=self.client_disconnected,
+                ping_fn=self.ping_client,
+                ws_session=id(self),
             )
+        except ClientDisconnected as exc:
+            raise WsPassthroughConnectError("client disconnected") from exc
         except Exception as exc:
-            raise WsPassthroughConnectError(str(exc)) from exc
+            status = getattr(exc, "status", None)
+            raise WsPassthroughConnectError(
+                str(exc),
+                status=status if isinstance(status, int) else None,
+            ) from exc
         self.upstream_by_url[url] = upstream_ws
         self.last_chained_response_id_by_url.pop(url, None)
         upgrade_headers = forwardable_ws_upgrade_headers(upstream_headers_from_response(upstream_ws))
@@ -205,6 +261,14 @@ class WsPassthroughSession:
                         continue
                     if not isinstance(event, dict):
                         continue
+                    if not content_forwarded:
+                        kind = classify_ws_event_throttle(event)
+                        if kind in {THROTTLE_RATE_LIMIT, THROTTLE_QUOTA}:
+                            await self.close_upstream(upstream_url)
+                            status = event.get("status")
+                            if not isinstance(status, int):
+                                status = 429
+                            raise WsPassthroughConnectError(json.dumps(event), status=status)
                     if on_event is not None:
                         on_event(event)
                     if rewrite_model is not None and model_override:

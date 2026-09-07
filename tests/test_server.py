@@ -327,6 +327,35 @@ def test_finalize_chatgpt_passthrough_body_forces_lite_reasoning_context():
     assert sanitized["parallel_tool_calls"] is False
 
 
+def test_ws_http_relay_and_classifier_post_through_retry_helper():
+    import inspect
+
+    relay = inspect.getsource(ShimServer._relay_local_response_create_over_http)
+    classifier = inspect.getsource(ShimServer._make_classifier)
+    from codex_shim.ws_passthrough import WsPassthroughSession
+
+    connect = inspect.getsource(WsPassthroughSession.connect_upstream)
+    assert "retry_aiohttp_post" in relay
+    assert "retry_aiohttp_post" in classifier
+    assert "retry_aiohttp_ws_connect" in connect
+
+
+def test_finalize_chatgpt_passthrough_body_strips_codex_generate_flag():
+    from codex_shim.server import _finalize_chatgpt_passthrough_body
+
+    sanitized = _finalize_chatgpt_passthrough_body(
+        {
+            "model": "gpt-5.4-mini",
+            "generate": True,
+            "store": True,
+        }
+    )
+
+    assert "generate" not in sanitized
+    assert sanitized["store"] is False
+    assert sanitized["model"] == "gpt-5.4-mini"
+
+
 def test_finalize_chatgpt_compact_passthrough_body_omits_store_and_stream():
     from codex_shim.server import _finalize_chatgpt_compact_passthrough_body
 
@@ -362,6 +391,34 @@ def test_rewrite_response_model_only_rewrites_chatgpt_metadata():
     assert payload == {
         "model": "custom-model",
         "nested": [{"model": "custom-model"}, {"model": "other"}],
+    }
+
+
+def test_rewrite_response_model_rewrites_session_title_passthrough_slug():
+    payload = {
+        "model": "gpt-5.4-mini",
+        "nested": [{"model": "gpt-5.4-mini"}, {"model": "other"}],
+    }
+
+    _rewrite_response_model(payload, "local-llama")
+
+    assert payload == {
+        "model": "local-llama",
+        "nested": [{"model": "local-llama"}, {"model": "other"}],
+    }
+
+
+def test_rewrite_response_model_rewrites_chatgpt_snapshot_slug():
+    payload = {
+        "model": "gpt-5.4-mini-2026-03-17",
+        "nested": [{"model": "gpt-5.5-2026-01-01"}, {"model": "other"}],
+    }
+
+    _rewrite_response_model(payload, "local-llama")
+
+    assert payload == {
+        "model": "local-llama",
+        "nested": [{"model": "local-llama"}, {"model": "other"}],
     }
 
 
@@ -437,6 +494,168 @@ async def test_image_generation_routes_to_chatgpt_passthrough_and_rewrites_model
     assert payload["output"][0]["model"] == "real-openai"
     assert captured["body"]["model"] == "gpt-5.5"
     assert captured["headers"]["Authorization"] == "Bearer stub"
+
+    await shim_client.close()
+
+
+async def test_session_title_request_routes_byok_model_to_chatgpt_passthrough(
+    monkeypatch, tmp_path, auth_present
+):
+    captured = {}
+
+    class FakeUpstream:
+        status = 200
+        content_type = "application/json"
+
+        async def json(self, content_type=None):
+            return {
+                "id": "resp_title",
+                "model": "gpt-5.4-mini-2026-03-17",
+                "output": [{"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "Repeat hello world"}]}],
+            }
+
+        def release(self):
+            pass
+
+    async def fake_post(self, url, json=None, headers=None):
+        captured["url"] = str(url)
+        captured["body"] = json
+        captured["headers"] = headers
+        return FakeUpstream()
+
+    monkeypatch.setattr("codex_shim.server.ClientSession.post", fake_post)
+    monkeypatch.setattr(server_module, "_chatgpt_conversations_dir", lambda: tmp_path / "chatgpt-conversations")
+    settings = tmp_path / "settings.json"
+    settings.write_text(
+        json.dumps(
+            {
+                "customModels": [
+                    {
+                        "model": "gemma-local",
+                        "displayName": "Local Gemma",
+                        "slug": "local-llama",
+                        "provider": "generic-chat-completion-api",
+                        "baseUrl": "http://127.0.0.1:28000/v1",
+                        "apiKey": "local",
+                    }
+                ]
+            }
+        )
+    )
+    shim_client = TestClient(TestServer(ShimServer(settings).app()))
+    await shim_client.start_server()
+
+    resp = await shim_client.post(
+        "/v1/responses",
+        json={
+            "model": "local-llama",
+            "generate": True,
+            "input": [
+                {
+                    "role": "user",
+                    "content": (
+                        "You are a helpful assistant. You will be presented with a user prompt, "
+                        "and your job is to provide a short title for a task that will be created "
+                        "from that prompt.\n"
+                        "Generate a concise UI title (up to 36 characters) for this task.\n"
+                        "Fill the structured title field with plain text.\n"
+                        "User prompt:\nHello world, can you repeat it 50 times?"
+                    ),
+                }
+            ],
+        },
+    )
+    assert resp.status == 200
+    payload = await resp.json()
+    assert payload["model"] == "local-llama"
+    assert captured["url"] == "https://chatgpt.com/backend-api/codex/responses"
+    assert captured["body"]["model"] == "gpt-5.4-mini"
+    assert "generate" not in captured["body"]
+    assert captured["headers"]["Authorization"] == "Bearer stub"
+
+    await shim_client.close()
+
+
+async def test_session_title_falls_back_to_luna_low_when_mini_fails(
+    monkeypatch, tmp_path, auth_present
+):
+    posts: list[dict[str, Any]] = []
+
+    class FakeFail:
+        status = 400
+        content_type = "application/json"
+
+        async def text(self):
+            return '{"detail":"mini unavailable"}'
+
+        def release(self):
+            pass
+
+    class FakeOk:
+        status = 200
+        content_type = "application/json"
+
+        async def json(self, content_type=None):
+            return {
+                "id": "resp_title_luna",
+                "model": "gpt-5.6-luna",
+                "output": [{"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "Repeat hello world"}]}],
+            }
+
+        def release(self):
+            pass
+
+    async def fake_post(self, url, json=None, headers=None):
+        posts.append(json or {})
+        if (json or {}).get("model") == "gpt-5.4-mini":
+            return FakeFail()
+        return FakeOk()
+
+    monkeypatch.setattr("codex_shim.server.ClientSession.post", fake_post)
+    monkeypatch.setattr(server_module, "_chatgpt_conversations_dir", lambda: tmp_path / "chatgpt-conversations")
+    settings = tmp_path / "settings.json"
+    settings.write_text(
+        json.dumps(
+            {
+                "customModels": [
+                    {
+                        "model": "gemma-local",
+                        "displayName": "Local Gemma",
+                        "slug": "local-llama",
+                        "provider": "generic-chat-completion-api",
+                        "baseUrl": "http://127.0.0.1:28000/v1",
+                        "apiKey": "local",
+                    }
+                ]
+            }
+        )
+    )
+    shim_client = TestClient(TestServer(ShimServer(settings).app()))
+    await shim_client.start_server()
+
+    resp = await shim_client.post(
+        "/v1/responses",
+        json={
+            "model": "local-llama",
+            "generate": True,
+            "input": [
+                {
+                    "role": "user",
+                    "content": (
+                        "Generate a concise UI title (up to 36 characters) for this task.\n"
+                        "Fill the structured title field with plain text.\n"
+                        "User prompt:\nHello world"
+                    ),
+                }
+            ],
+        },
+    )
+    assert resp.status == 200
+    payload = await resp.json()
+    assert payload["model"] == "local-llama"
+    assert [body.get("model") for body in posts] == ["gpt-5.4-mini", "gpt-5.6-luna"]
+    assert posts[1].get("reasoning", {}).get("effort") == "low"
+    assert "generate" not in posts[1]
 
     await shim_client.close()
 
@@ -2575,6 +2794,9 @@ async def test_byok_stream_pings_while_upstream_is_silent(monkeypatch, tmp_path)
 async def test_byok_stream_pings_during_upstream_429_retry(monkeypatch, tmp_path):
     """Codex idle-timeouts the stream if 429 retries happen before any SSE bytes."""
     monkeypatch.setattr("codex_shim.net.sse.SSE_KEEPALIVE_INTERVAL", 0.05)
+    monkeypatch.setenv("CODEX_SHIM_RETRY_RATE_LIMIT_MIN", "0.05")
+    monkeypatch.setenv("CODEX_SHIM_RETRY_RATE_LIMIT_MAX", "1")
+    monkeypatch.setenv("CODEX_SHIM_RETRY_RATE_LIMIT_JITTER", "0")
     hits = {"n": 0}
 
     async def chat(request):
@@ -2627,6 +2849,9 @@ async def test_byok_stream_pings_during_upstream_429_retry(monkeypatch, tmp_path
 
 async def test_byok_websocket_pings_during_upstream_429_retry(monkeypatch, tmp_path):
     monkeypatch.setattr("codex_shim.net.sse.SSE_KEEPALIVE_INTERVAL", 0.05)
+    monkeypatch.setenv("CODEX_SHIM_RETRY_RATE_LIMIT_MIN", "0.05")
+    monkeypatch.setenv("CODEX_SHIM_RETRY_RATE_LIMIT_MAX", "1")
+    monkeypatch.setenv("CODEX_SHIM_RETRY_RATE_LIMIT_JITTER", "0")
     hits = {"n": 0}
 
     async def chat(request):

@@ -624,10 +624,20 @@ legacy `[model_providers.codex_shim]` block, and managed `[features]` block are
 removed before the new managed blocks are written, so duplicate profile/provider
 keys should not accumulate.
 
-Codex may make small background calls to OpenAI model slugs such as
-`gpt-5.4-mini` for its own product behavior. Those calls are not Ollama routing
-failures; use the shim request log to confirm the actual selected model for the
-agent turn.
+Codex Desktop names new threads with a background Responses turn whose prompt
+includes “Generate a concise UI title”. Current Desktop sends that turn as the
+**selected BYOK model**, not `gpt-5.4-mini`. When ChatGPT auth is present, the
+shim reroutes those title requests through an ordered ChatGPT list
+(`gpt-5.4-mini`, then `gpt-5.6-luna` with `reasoning.effort=low`) and rewrites
+the response `model` back to the selected slug. ChatGPT Codex and BYOK
+`/v1/responses` hosts both reject Codex’s `generate` flag; the shim strips it
+on those paths. The same BYOK path requires `function_call.arguments` to be a
+JSON string; blank arguments (Muse Spark has emitted `""` on a completed
+`exec_command`) are sent as `{}`.
+
+Other small Codex product calls that still use OpenAI slugs such as
+`gpt-5.4-mini` are not Ollama routing failures; use the shim request log to
+confirm the actual selected model for the agent turn.
 
 ---
 
@@ -762,10 +772,13 @@ Debug env knobs:
 | `CODEX_SHIM_UPSTREAM_HEADER_LOG=1` | Log upstream response headers + usage |
 | `CODEX_SHIM_PASSTHROUGH_TRACE=1` | Log forwarded client headers per ChatGPT request |
 | `CODEX_SHIM_STREAM_LOG=1` | Log SSE/WS event types |
-| `CODEX_SHIM_RETRY_ATTEMPTS` | HTTP transport retries for aiohttp POST and discovery GET (default: `3`). OAuth refresh stays 1 attempt — refresh tokens are single-use. |
-| `CODEX_SHIM_RETRY_WAIT_BUDGET` | Extra seconds of Retry-After waits after `CODEX_SHIM_RETRY_ATTEMPTS` is exhausted (default: `30`). One-shot OAuth refresh stays 1 attempt. |
-| `CODEX_SHIM_RETRY_BACKOFF_BASE` | Initial retry delay in seconds (default: `0.5`) |
-| `CODEX_SHIM_RETRY_BACKOFF_FACTOR` | Exponential backoff multiplier (default: `2`) |
+| `CODEX_SHIM_RETRY_ATTEMPTS` | Finite retries for transport / 5xx (default: `3`). OAuth refresh stays 1 attempt — refresh tokens are single-use. |
+| `CODEX_SHIM_RETRY_WAIT_BUDGET` | Extra seconds of Retry-After waits after `CODEX_SHIM_RETRY_ATTEMPTS` is exhausted for transport / 5xx only (default: `30`). Does not bound 429 or quota waits. |
+| `CODEX_SHIM_RETRY_BACKOFF_BASE` | Initial transport / 5xx retry delay in seconds (default: `0.5`) |
+| `CODEX_SHIM_RETRY_BACKOFF_FACTOR` | Transport / 5xx exponential backoff multiplier (default: `2`) |
+| `CODEX_SHIM_RETRY_RATE_LIMIT_MIN` | Floor for upstream 429 / rate-limit waits in seconds (default: `60`). `Retry-After` below this still waits this long. |
+| `CODEX_SHIM_RETRY_RATE_LIMIT_MAX` | Cap for 429 / quota waits in seconds (default: `3600`). Rate-limit delays ramp from min to this cap, then stay there until 2xx or Desktop disconnects. Quota waits use this cap (or a shorter `resets_in_seconds`). |
+| `CODEX_SHIM_RETRY_RATE_LIMIT_JITTER` | ± fraction applied to rate-limit waits (default: `0.2`). Quota waits are not jittered. |
 | `CODEX_SHIM_SSE_KEEPALIVE_INTERVAL` | Downstream SSE `{"type":"ping"}` interval in seconds while a stream is open (default: `15`) |
 | `CODEX_SHIM_WS_PASSTHROUGH=0` | Force legacy HTTP+SSE upstream for ChatGPT/BYOK WS routes (default: on) |
 | `CODEX_SHIM_CHATGPT_WS_FORCE_EXPAND=1` | Force cache expansion on ChatGPT Codex WS (default: native passthrough on reused upstream WS) |
