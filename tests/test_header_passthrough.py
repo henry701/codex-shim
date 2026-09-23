@@ -112,6 +112,49 @@ def test_client_headers_for_upstream_drops_content_encoding():
     assert merged["originator"] == "Codex Desktop"
 
 
+def test_chatgpt_passthrough_upgrades_stale_desktop_client_identity(monkeypatch):
+    """gpt-6-luna is rejected for ChatGPT accounts when Desktop still sends CLI 0.153.4.
+
+    The system CLI that the shim can see is newer. Upstream must see that version
+    and the codex_cli_rs originator, which is the identity that accepts the model.
+    """
+    monkeypatch.setattr(
+        "codex_shim.header_passthrough.chatgpt_client_version_for_upstream",
+        lambda: "0.156.0",
+    )
+    merged = chatgpt_passthrough_upstream_headers(
+        {
+            "User-Agent": "codex_cli_rs/0.153.4 (Ubuntu; x86_64)",
+            "originator": "Codex Desktop",
+            "x-codex-beta-features": "memories",
+        },
+        access_token="token",
+        account_id="acct",
+        accept="text/event-stream",
+    )
+    assert merged["User-Agent"] == "codex_cli_rs/0.156.0"
+    assert merged["originator"] == "codex_cli_rs"
+    assert merged["x-codex-beta-features"] == "memories"
+
+
+def test_chatgpt_passthrough_keeps_current_client_identity(monkeypatch):
+    monkeypatch.setattr(
+        "codex_shim.header_passthrough.chatgpt_client_version_for_upstream",
+        lambda: "0.156.0",
+    )
+    merged = chatgpt_passthrough_upstream_headers(
+        {
+            "User-Agent": "codex_cli_rs/0.156.0",
+            "originator": "Codex Desktop",
+        },
+        access_token="token",
+        account_id="acct",
+        accept="application/json",
+    )
+    assert merged["User-Agent"] == "codex_cli_rs/0.156.0"
+    assert merged["originator"] == "Codex Desktop"
+
+
 def test_chatgpt_passthrough_upstream_headers_drop_content_encoding():
     merged = chatgpt_passthrough_upstream_headers(
         {

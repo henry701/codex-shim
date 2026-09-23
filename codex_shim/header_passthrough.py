@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from typing import Any, Mapping
+
+_CODEX_CLI_VERSION_RE = re.compile(r"(\d+\.\d+\.\d+(?:[-.][0-9A-Za-z]+)*)")
 
 from aiohttp import web
 
@@ -160,6 +163,59 @@ def anthropic_upstream_headers(
     )
 
 
+def chatgpt_client_version_for_upstream() -> str | None:
+    """System ``codex --version``. Lazy import avoids a cycle with ``discover``."""
+    from .discover import chatgpt_codex_client_version
+
+    version = chatgpt_codex_client_version()
+    return version or None
+
+
+def _version_key(version: str) -> tuple[int, ...]:
+    parts: list[int] = []
+    for bit in version.split("."):
+        digits = ""
+        for char in bit:
+            if char.isdigit():
+                digits += char
+            else:
+                break
+        if not digits:
+            break
+        parts.append(int(digits))
+    return tuple(parts)
+
+
+def _codex_cli_version_in_user_agent(user_agent: str) -> str | None:
+    match = _CODEX_CLI_VERSION_RE.search(user_agent or "")
+    return match.group(1) if match else None
+
+
+def _upgrade_stale_chatgpt_client_identity(headers: dict[str, str]) -> None:
+    """Present the system CLI identity when Desktop still sends an older Codex.
+
+    ChatGPT rejects ``gpt-6-luna`` for a ChatGPT account when the forwarded
+    client is older than that model's ``minimal_client_version`` (0.155.0).
+    Desktop bundles its own ``codex`` and can lag ``/usr/bin/codex``.
+    """
+    system_version = chatgpt_client_version_for_upstream()
+    if not system_version:
+        return
+    ua_key = next((key for key in headers if key.lower() == "user-agent"), None)
+    if ua_key is None:
+        return
+    client_version = _codex_cli_version_in_user_agent(headers[ua_key])
+    if client_version is None:
+        return
+    if _version_key(client_version) >= _version_key(system_version):
+        return
+    headers["User-Agent"] = f"codex_cli_rs/{system_version}"
+    for key in list(headers):
+        if key.lower() == "originator":
+            headers.pop(key)
+    headers["originator"] = "codex_cli_rs"
+
+
 def chatgpt_passthrough_upstream_headers(
     request_headers: Mapping[str, str],
     *,
@@ -176,7 +232,7 @@ def chatgpt_passthrough_upstream_headers(
         setdefaults["OpenAI-Beta"] = "responses=2026-02-06"
     if not _header_present(request_headers, "originator"):
         setdefaults["originator"] = "codex_cli_rs"
-    return client_headers_for_upstream(
+    merged = client_headers_for_upstream(
         request_headers,
         setdefaults=setdefaults,
         overrides={
@@ -187,6 +243,8 @@ def chatgpt_passthrough_upstream_headers(
             "OpenAI-Beta": "responses=2026-02-06",
         },
     )
+    _upgrade_stale_chatgpt_client_identity(merged)
+    return merged
 
 
 def chatgpt_passthrough_ws_upstream_headers(
@@ -202,13 +260,15 @@ def chatgpt_passthrough_ws_upstream_headers(
         setdefaults["OpenAI-Beta"] = "responses_websockets=2026-02-06"
     if not _header_present(request_headers, "originator"):
         setdefaults["originator"] = "codex_cli_rs"
-    return client_headers_for_upstream(
+    merged = client_headers_for_upstream(
         request_headers,
         setdefaults=setdefaults,
         overrides={
             "Authorization": f"Bearer {access_token}",
         },
     )
+    _upgrade_stale_chatgpt_client_identity(merged)
+    return merged
 
 
 def openai_responses_ws_upstream_headers(
