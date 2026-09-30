@@ -97,6 +97,15 @@ def _isolate_published_desktop_catalog(monkeypatch, tmp_path_factory):
 
 
 @pytest.fixture(autouse=True)
+def _isolate_codex_models_cache(monkeypatch, tmp_path_factory):
+    # ~/.codex/models_cache.json tracks whatever the live ChatGPT backend serves
+    # today; tests must resolve passthrough slugs against a fixed catalog.
+    isolated = tmp_path_factory.mktemp("codex-models-cache") / "models_cache.json"
+    monkeypatch.setattr("codex_shim.settings.DEFAULT_CODEX_MODELS_CACHE", isolated)
+    monkeypatch.setattr("codex_shim.server.DEFAULT_CODEX_MODELS_CACHE", isolated)
+
+
+@pytest.fixture(autouse=True)
 def _disable_cursor_passthrough_by_default(monkeypatch, request):
     if "cursor_present" in request.fixturenames:
         return

@@ -8,6 +8,7 @@ last bind — the Helmholtz / lcs-new-age parent-agent use-case.
 from __future__ import annotations
 
 import json
+import re
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -17,6 +18,8 @@ import pytest
 LIVE_HEALTH_URL = "http://127.0.0.1:8765/health"
 SHIM_LOG = Path.home() / ".codex-shim" / "shim.log"
 BIND_MARKER = "======== Running on http://127.0.0.1:8765 ========"
+# Any Luna generation: gpt-5.6-luna, codex-gpt-6-luna, gpt-6.1-luna, ...
+LUNA_SLUG_RE = re.compile(r"gpt-\d+(?:[.-]\d+)*-luna")
 
 
 def _live_health() -> dict | None:
@@ -55,7 +58,8 @@ def test_live_goal_session_luna_responses_after_last_bind():
     if not SHIM_LOG.is_file():
         pytest.skip("shim.log is missing")
     tail = _log_since_last_bind()
-    assert "[req] /v1/responses" in tail
+    if "[req] /v1/responses" not in tail:
+        pytest.skip("no /v1/responses traffic since the last shim bind")
     assert "status=200" in tail
-    assert "gpt-5-6-luna" in tail or "gpt-5.6-luna" in tail
+    assert LUNA_SLUG_RE.search(tail), "no Luna request since the last shim bind"
     assert "chatgpt-passthrough" in tail
