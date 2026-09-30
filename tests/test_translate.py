@@ -1340,12 +1340,11 @@ def test_session_title_passthrough_candidates_are_mini_then_luna_low():
         apply_session_title_candidate,
     )
 
-    assert [c.slug for c in SESSION_TITLE_PASSTHROUGH_CANDIDATES] == [
-        "gpt-5.4-mini",
-        "gpt-5.6-luna",
+    assert [(c.slug, c.reasoning_effort) for c in SESSION_TITLE_PASSTHROUGH_CANDIDATES] == [
+        ("gpt-5.4-mini", None),
+        ("gpt-6-luna", "low"),
+        ("gpt-5.6-luna", "low"),
     ]
-    assert SESSION_TITLE_PASSTHROUGH_CANDIDATES[0].reasoning_effort is None
-    assert SESSION_TITLE_PASSTHROUGH_CANDIDATES[1].reasoning_effort == "low"
 
     original = {"model": "local-llama", "reasoning": {"effort": "high", "summary": "auto"}}
     mini = apply_session_title_candidate(original, SESSION_TITLE_PASSTHROUGH_CANDIDATES[0])
@@ -1354,7 +1353,7 @@ def test_session_title_passthrough_candidates_are_mini_then_luna_low():
     assert original["model"] == "local-llama"
     assert mini["model"] == "gpt-5.4-mini"
     assert mini["reasoning"] == {"effort": "high", "summary": "auto"}
-    assert luna["model"] == "gpt-5.6-luna"
+    assert luna["model"] == "gpt-6-luna"
     assert luna["reasoning"]["effort"] == "low"
     assert luna["reasoning"]["summary"] == "auto"
 

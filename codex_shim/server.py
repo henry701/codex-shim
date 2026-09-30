@@ -160,6 +160,7 @@ from .settings import (
     byok_model_has_credentials,
     chatgpt_upstream_model,
     is_chatgpt_passthrough_slug,
+    load_chatgpt_passthrough_catalog_models,
     usable_byok_models,
 )
 from .translate import (
@@ -176,6 +177,7 @@ from .translate import (
     is_session_title_request,
     apply_session_title_candidate,
     SESSION_TITLE_PASSTHROUGH_CANDIDATES,
+    SessionTitleCandidate,
     rewrite_openai_responses_custom_payload,
     responses_to_anthropic,
     responses_to_chat,
@@ -228,6 +230,21 @@ def _chatgpt_passthrough_upstream_headers(
         account_id=account_id,
         accept=accept,
     )
+
+
+def _served_session_title_candidates() -> tuple[SessionTitleCandidate, ...]:
+    """Title candidates the ChatGPT catalog still serves, in preference order.
+
+    ``chatgpt_upstream_model`` maps unknown slugs to the default upstream, so a
+    retired candidate would silently turn into that default and shadow the rest
+    of the chain. Keep the full list only when the catalog knows none of them.
+    """
+    served = {
+        str(model.get("_upstream_model") or "")
+        for model in load_chatgpt_passthrough_catalog_models()
+    }
+    kept = tuple(c for c in SESSION_TITLE_PASSTHROUGH_CANDIDATES if c.slug in served)
+    return kept or SESSION_TITLE_PASSTHROUGH_CANDIDATES
 
 
 class ShimServer:
@@ -2082,8 +2099,9 @@ class ShimServer:
         requested = str(body.get("model") or "")
         if is_chatgpt_passthrough_slug(requested):
             return None
+        candidates = _served_session_title_candidates()
         last: web.StreamResponse | None = None
-        for index, candidate in enumerate(SESSION_TITLE_PASSTHROUGH_CANDIDATES):
+        for index, candidate in enumerate(candidates):
             title_body = apply_session_title_candidate(body, candidate)
             print(
                 f"[title] {requested} -> {candidate.slug} chatgpt passthrough"
@@ -2099,7 +2117,7 @@ class ShimServer:
             )
             if last.status < 400:
                 return last
-            remaining = SESSION_TITLE_PASSTHROUGH_CANDIDATES[index + 1 :]
+            remaining = candidates[index + 1 :]
             if remaining:
                 next_slug = remaining[0].slug
                 print(

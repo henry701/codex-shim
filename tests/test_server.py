@@ -660,6 +660,76 @@ async def test_session_title_falls_back_to_luna_low_when_mini_fails(
     await shim_client.close()
 
 
+async def test_session_title_skips_candidates_missing_from_chatgpt_catalog(
+    monkeypatch, tmp_path, auth_present
+):
+    posts: list[dict[str, Any]] = []
+
+    class FakeOk:
+        status = 200
+        content_type = "application/json"
+
+        async def json(self, content_type=None):
+            return {"id": "resp_title", "model": "gpt-6-luna", "output": []}
+
+        def release(self):
+            pass
+
+    async def fake_post(self, url, json=None, headers=None):
+        posts.append(json or {})
+        return FakeOk()
+
+    served = ["gpt-6-luna", "gpt-5.6-luna", "gpt-5.5"]
+    def fake_catalog(*_args, **_kwargs):
+        return [{"slug": f"codex-{m}", "_upstream_model": m} for m in served]
+
+    monkeypatch.setattr(server_module, "load_chatgpt_passthrough_catalog_models", fake_catalog)
+    monkeypatch.setattr("codex_shim.settings.load_chatgpt_passthrough_catalog_models", fake_catalog)
+    monkeypatch.setattr("codex_shim.server.ClientSession.post", fake_post)
+    monkeypatch.setattr(server_module, "_chatgpt_conversations_dir", lambda: tmp_path / "chatgpt-conversations")
+    settings = tmp_path / "settings.json"
+    settings.write_text(
+        json.dumps(
+            {
+                "customModels": [
+                    {
+                        "model": "gemma-local",
+                        "displayName": "Local Gemma",
+                        "slug": "local-llama",
+                        "provider": "generic-chat-completion-api",
+                        "baseUrl": "http://127.0.0.1:28000/v1",
+                        "apiKey": "local",
+                    }
+                ]
+            }
+        )
+    )
+    shim_client = TestClient(TestServer(ShimServer(settings).app()))
+    await shim_client.start_server()
+
+    resp = await shim_client.post(
+        "/v1/responses",
+        json={
+            "model": "local-llama",
+            "input": [
+                {
+                    "role": "user",
+                    "content": (
+                        "Generate a concise UI title (up to 36 characters) for this task.\n"
+                        "Fill the structured title field with plain text.\n"
+                        "User prompt:\nHello world"
+                    ),
+                }
+            ],
+        },
+    )
+    assert resp.status == 200
+    # Retired gpt-5.4-mini must not be silently rewritten to the default upstream.
+    assert [(b.get("model"), b.get("reasoning", {}).get("effort")) for b in posts] == [("gpt-6-luna", "low")]
+
+    await shim_client.close()
+
+
 async def test_chatgpt_passthrough_requests_advertise_zstd_encoding(monkeypatch, tmp_path, auth_present):
     captured = {}
 

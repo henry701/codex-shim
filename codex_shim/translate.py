@@ -16,7 +16,8 @@ THINK_RE = re.compile(r"<think>.*?</think>", re.IGNORECASE | re.DOTALL)
 
 # Desktop session-title turns. Codex historically sent these as gpt-5.4-mini
 # product calls; current Desktop uses the selected BYOK model instead.
-# Ordered ChatGPT retries; extend this tuple to add later fallbacks.
+# Ordered ChatGPT retries, cheapest first. Candidates the live ChatGPT catalog
+# no longer serves are skipped at request time (see server).
 @dataclass(frozen=True)
 class SessionTitleCandidate:
     slug: str
@@ -25,6 +26,7 @@ class SessionTitleCandidate:
 
 SESSION_TITLE_PASSTHROUGH_CANDIDATES: tuple[SessionTitleCandidate, ...] = (
     SessionTitleCandidate("gpt-5.4-mini"),
+    SessionTitleCandidate("gpt-6-luna", reasoning_effort="low"),
     SessionTitleCandidate("gpt-5.6-luna", reasoning_effort="low"),
 )
 SESSION_TITLE_PASSTHROUGH_SLUG = SESSION_TITLE_PASSTHROUGH_CANDIDATES[0].slug
