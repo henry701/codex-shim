@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from urllib.error import HTTPError, URLError
 
 import pytest
@@ -94,6 +95,39 @@ def test_chatgpt_codex_client_version_uses_installed_cli(monkeypatch):
     _stub_codex_cli(monkeypatch, path="/usr/bin/codex", stdout="codex-cli 0.160.0\n")
     clear_detected_codex_cli_version()
     assert chatgpt_codex_client_version() == "0.160.0"
+
+
+def test_chatgpt_codex_client_version_reprobes_after_cli_upgrade(monkeypatch, tmp_path):
+    monkeypatch.delenv("CODEX_SHIM_CHATGPT_MODELS_CLIENT_VERSION", raising=False)
+    binary = tmp_path / "codex"
+    binary.write_text("old")
+    monkeypatch.setattr(
+        "codex_shim.discover.shutil.which",
+        lambda name: str(binary) if name == "codex" else None,
+    )
+    versions = iter(["codex-cli 0.157.1\n", "codex-cli 0.159.0\n"])
+    calls = []
+
+    class _Result:
+        def __init__(self, stdout):
+            self.returncode = 0
+            self.stdout = stdout
+            self.stderr = ""
+
+    def fake_run(*_args, **_kwargs):
+        calls.append(1)
+        return _Result(next(versions))
+
+    monkeypatch.setattr("codex_shim.discover.subprocess.run", fake_run)
+    clear_detected_codex_cli_version()
+    assert chatgpt_codex_client_version() == "0.157.1"
+    assert chatgpt_codex_client_version() == "0.157.1"
+    assert len(calls) == 1
+
+    binary.write_text("upgraded binary")
+    os.utime(binary, ns=(binary.stat().st_atime_ns, binary.stat().st_mtime_ns + 1_000_000_000))
+    assert chatgpt_codex_client_version() == "0.159.0"
+    assert len(calls) == 2
 
 
 def test_chatgpt_codex_client_version_falls_back_when_codex_missing(monkeypatch):

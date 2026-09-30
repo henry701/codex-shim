@@ -35,7 +35,7 @@ CHATGPT_CODEX_MODELS_URL = "https://chatgpt.com/backend-api/codex/models"
 DEFAULT_CHATGPT_CODEX_CLIENT_VERSION = "0.153.0"
 _CODEX_CLI_VERSION_RE = re.compile(r"(\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.]+)?)")
 _UNSET = object()
-_detected_codex_cli_version: str | None | object = _UNSET
+_detected_codex_cli_version: tuple[tuple[str | None, tuple[int, int] | None], str | None] | object = _UNSET
 CODEX_OAUTH_TOKEN_URL = "https://auth.openai.com/oauth/token"
 CODEX_OAUTH_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
 DISCOVER_INDEX_BASE = 10_000
@@ -736,29 +736,44 @@ def clear_detected_codex_cli_version() -> None:
     _detected_codex_cli_version = _UNSET
 
 
-def detect_codex_cli_version(*, timeout: float = 5.0) -> str | None:
-    """Return the Codex CLI version from ``codex`` on PATH, or ``None`` if unavailable."""
-    global _detected_codex_cli_version
-    cached = _detected_codex_cli_version
-    if cached is not _UNSET:
-        return cached if isinstance(cached, str) else None
-    binary = shutil.which("codex")
+def _codex_binary_identity(binary: str | None) -> tuple[str | None, tuple[int, int] | None]:
+    """Cache key for ``codex`` on PATH: resolved path plus mtime/size, so upgrades invalidate."""
     if not binary:
-        _detected_codex_cli_version = None
-        return None
+        return (None, None)
     try:
-        result = subprocess.run(
-            [binary, "--version"],
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            check=False,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        _detected_codex_cli_version = None
-        return None
-    parsed = parse_codex_cli_version(f"{result.stdout or ''}\n{result.stderr or ''}")
-    _detected_codex_cli_version = parsed
+        resolved = os.path.realpath(binary)
+        st = os.stat(resolved)
+    except OSError:
+        return (binary, None)
+    return (resolved, (st.st_mtime_ns, st.st_size))
+
+
+def detect_codex_cli_version(*, timeout: float = 5.0) -> str | None:
+    """Return the Codex CLI version from ``codex`` on PATH, or ``None`` if unavailable.
+
+    Re-probes when the resolved binary changes (package upgrade under a long-lived shim).
+    """
+    global _detected_codex_cli_version
+    binary = shutil.which("codex")
+    identity = _codex_binary_identity(binary)
+    cached = _detected_codex_cli_version
+    if isinstance(cached, tuple) and cached[0] == identity:
+        return cached[1]
+    parsed: str | None = None
+    if binary:
+        try:
+            result = subprocess.run(
+                [binary, "--version"],
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            result = None
+        if result is not None:
+            parsed = parse_codex_cli_version(f"{result.stdout or ''}\n{result.stderr or ''}")
+    _detected_codex_cli_version = (identity, parsed)
     return parsed
 
 
