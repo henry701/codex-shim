@@ -1124,21 +1124,33 @@ class ShimServer:
                             )
                             continue
                         body = {k: v for k, v in payload.items() if k != "type"}
-                        if _shim_io_log_enabled() or _input_has_compaction_trigger(body.get("input")):
-                            _log_client_request("/v1/responses/ws", body, transport="ws")
+                        _log_client_request(
+                            "/v1/responses/ws",
+                            body,
+                            transport="ws",
+                            thread_id=thread_id_from_headers(request.headers),
+                        )
                         if await self._maybe_handle_ws_compaction_v2(request, ws, payload):
                             continue
                         target = await self._resolve_ws_passthrough_target(payload)
                         if target is not None and ws_passthrough_enabled():
                             if passthrough is None:
-                                passthrough = WsPassthroughSession(client_session=http_session, client_ws=ws)
+                                passthrough = WsPassthroughSession(
+                                    client_session=http_session,
+                                    client_ws=ws,
+                                    client_transport_closed=lambda: _request_transport_closed(request),
+                                )
                                 self._register_ws_passthrough(passthrough)
-                            handled = await self._handle_ws_passthrough_response_create(
-                                request,
-                                passthrough,
-                                payload,
-                                target,
-                            )
+                            try:
+                                handled = await self._handle_ws_passthrough_response_create(
+                                    request,
+                                    passthrough,
+                                    payload,
+                                    target,
+                                )
+                            except ClientDisconnected:
+                                print("[ws-passthrough] client gone mid-relay; closing session", flush=True)
+                                break
                             if handled:
                                 continue
                         if target is not None and target.kind == "chatgpt":
@@ -1160,10 +1172,11 @@ class ShimServer:
                         await _write_ws_error(ws, 400, "invalid_request_error", "binary websocket frames are not supported")
                     elif msg.type == WSMsgType.ERROR:
                         break
-                if passthrough is not None:
-                    await passthrough.close_upstream()
-                    self._unregister_ws_passthrough(passthrough)
         finally:
+            if passthrough is not None:
+                # Also on cancellation (client gone): never leave upstream lanes open.
+                self._unregister_ws_passthrough(passthrough)
+                await passthrough.close_upstream()
             await pinger.stop()
         return ws
 
@@ -6793,7 +6806,18 @@ def _summarize_input_items(input_items: Any, *, tail: int = 6) -> tuple[int, lis
     return len(input_items), summary
 
 
-def _log_client_request(endpoint: str, body: dict[str, Any], *, transport: str = "http") -> None:
+def _request_transport_closed(request: web.Request) -> bool:
+    transport = request.transport
+    return transport is None or transport.is_closing()
+
+
+def _log_client_request(
+    endpoint: str,
+    body: dict[str, Any],
+    *,
+    transport: str = "http",
+    thread_id: str | None = None,
+) -> None:
     try:
         tools = body.get("tools") or []
         names = []
@@ -6810,7 +6834,8 @@ def _log_client_request(endpoint: str, body: dict[str, Any], *, transport: str =
             f"previous_response_id={body.get('previous_response_id')!r} "
             f"tools={len(tools)} ({names[:8]}) "
             f"input={input_count} ({input_summary})"
-            f"{cache_suffix}",
+            f"{cache_suffix}"
+            f"{f' thread_id={thread_id}' if thread_id else ''}",
             flush=True,
         )
     except Exception as exc:

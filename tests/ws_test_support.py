@@ -20,6 +20,7 @@ class MockUpstreamWsState:
     received_frames: list[dict[str, Any]] = field(default_factory=list)
     response_sequences: list[list[dict[str, Any]]] = field(default_factory=list)
     upgrade_headers: dict[str, str] = field(default_factory=dict)
+    closed_connections: int = 0
     _sequence_index: int = 0
 
     def next_responses(self) -> list[dict[str, Any]]:
@@ -56,6 +57,7 @@ def build_mock_upstream_ws_app(state: MockUpstreamWsState, path: str = "/v1/resp
             state.received_frames.append(payload)
             for event in state.next_responses():
                 await ws.send_str(json.dumps(event, separators=(",", ":")))
+        state.closed_connections += 1
         return ws
 
     app.router.add_get(path, ws_handler)

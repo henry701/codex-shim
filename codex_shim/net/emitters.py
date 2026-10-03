@@ -248,8 +248,11 @@ class WsRelayEmitter:
             return self.terminal_event or "error"
         failed = _synthetic_responses_object(self.last_response, self.model, "failed")
         failed["error"] = {"code": code, "message": message}
+        event = {"type": "response.failed", "response": failed}
         await self._write_event({"type": "error", "code": code, "message": message})
-        await self._write_event({"type": "response.failed", "response": failed})
+        await self._write_event(event)
+        self.last_emitted = event
         self.already_emitted = True
+        self.saw_terminal = True
         self.terminal_event = "response.failed"
         return "response.failed"
