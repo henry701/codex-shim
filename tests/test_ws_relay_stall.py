@@ -69,6 +69,8 @@ def _short_timeouts(monkeypatch, *, first: float = 0.2, idle: float = 0.2) -> No
 def test_timeouts_default_and_zero_disables(monkeypatch):
     monkeypatch.delenv(WS_FIRST_EVENT_TIMEOUT_ENV, raising=False)
     monkeypatch.delenv(WS_IDLE_TIMEOUT_ENV, raising=False)
+    # Safety net only: generous enough for long xhigh/compaction thinking gaps.
+    assert DEFAULT_WS_FIRST_EVENT_TIMEOUT_SEC == DEFAULT_WS_IDLE_TIMEOUT_SEC == 900.0
     assert ws_relay_timeouts_from_env() == WsRelayTimeouts(
         first_event=DEFAULT_WS_FIRST_EVENT_TIMEOUT_SEC, idle=DEFAULT_WS_IDLE_TIMEOUT_SEC
     )
