@@ -247,6 +247,24 @@ def _served_session_title_candidates() -> tuple[SessionTitleCandidate, ...]:
     return kept or SESSION_TITLE_PASSTHROUGH_CANDIDATES
 
 
+def _redact_codex_tool_body(body: dict[str, Any]) -> dict[str, Any]:
+    logged = dict(body)
+    images = logged.get("images")
+    if isinstance(images, list):
+        logged["images"] = f"<{len(images)} images>"
+    return logged
+
+
+def _search_log_summary(body: dict[str, Any]) -> str:
+    commands = body.get("commands") if isinstance(body.get("commands"), dict) else {}
+    queries = commands.get("search_query") if isinstance(commands.get("search_query"), list) else []
+    texts = []
+    for item in queries[:5]:
+        if isinstance(item, dict) and item.get("q"):
+            texts.append(str(item["q"])[:80])
+    return f"model={body.get('model')!r} queries={texts!r}"
+
+
 class ShimServer:
     def __init__(self, settings_path: Path = DEFAULT_SETTINGS, host: str = DEFAULT_HOST):
         self.settings = ModelSettings(settings_path)
@@ -815,6 +833,9 @@ class ShimServer:
         app.router.add_get("/v1/responses", self.responses_websocket)
         app.router.add_post("/v1/responses", self.responses)
         app.router.add_post("/v1/responses/compact", self.responses_compact)
+        app.router.add_post("/v1/images/generations", self.images_generations)
+        app.router.add_post("/v1/images/edits", self.images_edits)
+        app.router.add_post("/v1/alpha/search", self.alpha_search)
         app.router.add_get("/picker", self.picker_page)
         app.router.add_get("/api/models", self.api_models)
         app.router.add_post("/api/switch", self.switch_model)
@@ -1065,6 +1086,115 @@ class ShimServer:
             for model in usable_byok_models(await self._load_models())
         )
         return web.json_response({"object": "list", "data": sort_catalog_entries(data, slug_key="id")})
+
+    async def images_generations(self, request: web.Request) -> web.Response:
+        return await self._proxy_chatgpt_codex_json(
+            request,
+            "https://chatgpt.com/backend-api/codex/images/generations",
+            "chatgpt-images-generations",
+        )
+
+    async def images_edits(self, request: web.Request) -> web.Response:
+        return await self._proxy_chatgpt_codex_json(
+            request,
+            "https://chatgpt.com/backend-api/codex/images/edits",
+            "chatgpt-images-edits",
+        )
+
+    async def alpha_search(self, request: web.Request) -> web.Response:
+        """Proxy Codex web search (``POST /v1/alpha/search``).
+
+        The built-in web-search tool posts ``alpha/search`` on the provider
+        base. A missing route is aiohttp's ``404: Not Found``.
+        """
+        return await self._proxy_chatgpt_codex_json(
+            request,
+            "https://chatgpt.com/backend-api/codex/alpha/search",
+            "chatgpt-search",
+            rewrite_catalog_model=True,
+        )
+
+    async def _proxy_chatgpt_codex_json(
+        self,
+        request: web.Request,
+        url: str,
+        surface: str,
+        *,
+        rewrite_catalog_model: bool = False,
+    ) -> web.Response:
+        """Forward a JSON Codex tool call to chatgpt.com with ChatGPT auth."""
+        try:
+            body = await request.json()
+        except json.JSONDecodeError as exc:
+            raise web.HTTPBadRequest(text="invalid JSON") from exc
+        if not isinstance(body, dict):
+            raise web.HTTPBadRequest(text="JSON object required")
+        if rewrite_catalog_model:
+            model = str(body.get("model") or "")
+            if model and is_chatgpt_passthrough_slug(model):
+                upstream_model = chatgpt_upstream_model(model)
+                if upstream_model and upstream_model != model:
+                    print(
+                        f"[{surface}] model {model} -> {upstream_model}",
+                        flush=True,
+                    )
+                    body["model"] = upstream_model
+        auth_path = DEFAULT_CODEX_AUTH.expanduser()
+        try:
+            auth = json.loads(auth_path.read_text())
+        except (FileNotFoundError, json.JSONDecodeError) as exc:
+            raise web.HTTPUnauthorized(text="~/.codex/auth.json not found") from exc
+        tokens = auth.get("tokens") or {}
+        access_token = tokens.get("access_token")
+        account_id = tokens.get("account_id") or ""
+        if not access_token:
+            raise web.HTTPUnauthorized(text="auth.json has no access_token")
+        headers = _chatgpt_passthrough_upstream_headers(
+            request,
+            access_token=access_token,
+            account_id=account_id,
+            accept="application/json",
+        )
+        logged = _redact_codex_tool_body(body)
+        if surface == "chatgpt-search":
+            print(f"[chatgpt-search] {_search_log_summary(body)}", flush=True)
+        log_upstream_request(surface, url, logged)
+
+        async with ClientSession(timeout=self.timeout) as session:
+            posted = await post_chatgpt_with_retry(
+                session,
+                url,
+                json=body,
+                headers=headers,
+                disconnect_fn=lambda: _request_disconnected(request),
+            )
+            upstream = posted.response
+            if posted.status >= 400 or upstream is None:
+                text = posted.error_text or ""
+                log_upstream_response(
+                    surface,
+                    url,
+                    posted.status,
+                    text,
+                    request_body=logged,
+                )
+                if upstream is not None:
+                    upstream.release()
+                return web.Response(
+                    status=posted.status or 502,
+                    text=text,
+                    content_type=posted.content_type or "application/json",
+                )
+            try:
+                raw = await upstream.read()
+            finally:
+                upstream.release()
+        log_upstream_response(surface, url, posted.status, request_body=logged)
+        try:
+            payload = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            return web.Response(status=posted.status, body=raw, content_type="application/json")
+        return web.json_response(payload, status=posted.status)
 
     async def chat_completions(self, request: web.Request) -> web.StreamResponse:
         body = await request.json()

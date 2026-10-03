@@ -498,6 +498,100 @@ async def test_image_generation_routes_to_chatgpt_passthrough_and_rewrites_model
     await shim_client.close()
 
 
+async def test_images_edits_proxies_to_chatgpt_codex(monkeypatch, tmp_path, auth_present):
+    captured = {}
+
+    class _Resp:
+        async def read(self):
+            return b'{"created": 1, "data": [{"b64_json": "aGk="}]}'
+
+        def release(self):
+            pass
+
+    class _Posted:
+        status = 200
+        error_text = ""
+        content_type = "application/json"
+        response = _Resp()
+
+    async def fake_post(session, url, *, json, headers, disconnect_fn=None, **kwargs):
+        captured["url"] = url
+        captured["json"] = json
+        captured["headers"] = headers
+        return _Posted()
+
+    monkeypatch.setattr("codex_shim.server.post_chatgpt_with_retry", fake_post)
+    shim_client = TestClient(TestServer(ShimServer(tmp_path / "settings.json").app()))
+    await shim_client.start_server()
+    resp = await shim_client.post(
+        "/v1/images/edits",
+        json={
+            "model": "gpt-image-1.5",
+            "prompt": "add a hat",
+            "images": [{"image_url": "data:image/png;base64,Zm9v"}],
+        },
+    )
+    assert resp.status == 200
+    payload = await resp.json()
+    assert payload["data"][0]["b64_json"] == "aGk="
+    assert captured["url"] == "https://chatgpt.com/backend-api/codex/images/edits"
+    assert captured["json"]["prompt"] == "add a hat"
+    assert captured["headers"]["Authorization"] == "Bearer stub"
+    await shim_client.close()
+
+
+async def test_alpha_search_proxies_to_chatgpt_codex_and_rewrites_catalog_slug(
+    monkeypatch, tmp_path, auth_present
+):
+    captured = {}
+
+    class _Resp:
+        async def read(self):
+            return b'{"results":[{"title":"Cielo"}]}'
+
+        def release(self):
+            pass
+
+    class _Posted:
+        status = 200
+        error_text = ""
+        content_type = "application/json"
+        response = _Resp()
+
+    async def fake_post(session, url, *, json, headers, disconnect_fn=None, **kwargs):
+        captured["url"] = url
+        captured["json"] = json
+        captured["headers"] = headers
+        return _Posted()
+
+    monkeypatch.setattr("codex_shim.server.post_chatgpt_with_retry", fake_post)
+    monkeypatch.setattr(
+        "codex_shim.server.is_chatgpt_passthrough_slug",
+        lambda slug: slug == "codex-gpt-6-luna",
+    )
+    monkeypatch.setattr(
+        "codex_shim.server.chatgpt_upstream_model",
+        lambda slug: "gpt-6-luna" if slug == "codex-gpt-6-luna" else slug,
+    )
+    shim_client = TestClient(TestServer(ShimServer(tmp_path / "settings.json").app()))
+    await shim_client.start_server()
+    resp = await shim_client.post(
+        "/v1/alpha/search",
+        json={
+            "id": "search-1",
+            "model": "codex-gpt-6-luna",
+            "commands": {"search_query": [{"q": "Cielo pagamentos"}]},
+        },
+    )
+    assert resp.status == 200
+    payload = await resp.json()
+    assert payload["results"][0]["title"] == "Cielo"
+    assert captured["url"] == "https://chatgpt.com/backend-api/codex/alpha/search"
+    assert captured["json"]["model"] == "gpt-6-luna"
+    assert captured["headers"]["Authorization"] == "Bearer stub"
+    await shim_client.close()
+
+
 async def test_session_title_request_routes_byok_model_to_chatgpt_passthrough(
     monkeypatch, tmp_path, auth_present
 ):
