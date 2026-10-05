@@ -13,11 +13,8 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from aiohttp import ClientWSTimeout, WSMsgType
-from aiohttp.test_utils import TestClient, TestServer
 
-import codex_shim.server as server_module
 from codex_shim.net.sse import ClientDisconnected
-from codex_shim.server import ShimServer
 from codex_shim.ws_passthrough import (
     DEFAULT_WS_FIRST_EVENT_TIMEOUT_SEC,
     DEFAULT_WS_IDLE_TIMEOUT_SEC,
@@ -28,7 +25,13 @@ from codex_shim.ws_passthrough import (
     WsRelayTimeouts,
     ws_relay_timeouts_from_env,
 )
-from ws_test_support import MockUpstreamWsState, start_mock_upstream_ws
+from ws_test_support import (
+    MockUpstreamWsState,
+    completed_events,
+    install_chatgpt_auth,
+    recv_until_terminal,
+    start_shim_with_mock_chatgpt_ws,
+)
 
 LANE = "ws://example/v1/responses"
 
@@ -154,59 +157,7 @@ async def test_client_gone_mid_relay_closes_upstream(monkeypatch):
 
 @pytest.fixture
 def auth_present(monkeypatch, tmp_path):
-    auth = tmp_path / "auth.json"
-    auth.write_text(
-        json.dumps(
-            {"tokens": {"access_token": "test-token", "account_id": "acct-test"}}
-        )
-    )
-    monkeypatch.setattr("codex_shim.settings.DEFAULT_CODEX_AUTH", auth)
-    monkeypatch.setattr("codex_shim.server.DEFAULT_CODEX_AUTH", auth)
-    monkeypatch.setattr(
-        server_module,
-        "_chatgpt_conversations_dir",
-        lambda: tmp_path / "chatgpt-conversations",
-    )
-    return auth
-
-
-async def _start(
-    monkeypatch, tmp_path, state: MockUpstreamWsState
-) -> tuple[TestClient, TestClient]:
-    _, upstream_client = await start_mock_upstream_ws(state)
-    url = str(upstream_client.make_url("/v1/responses")).replace("http://", "ws://", 1)
-    monkeypatch.setattr("codex_shim.ws_passthrough.CHATGPT_WS_URL", url)
-    monkeypatch.setattr("codex_shim.server.CHATGPT_WS_URL", url)
-    settings = tmp_path / "settings.json"
-    settings.write_text("{}")
-    shim_client = TestClient(TestServer(ShimServer(settings).app()))
-    await shim_client.start_server()
-    return shim_client, upstream_client
-
-
-def _completed(resp_id: str) -> list[dict]:
-    return [
-        {"type": "response.created", "response": {"id": resp_id, "model": "gpt-5.5"}},
-        {
-            "type": "response.completed",
-            "response": {"id": resp_id, "model": "gpt-5.5", "status": "completed"},
-        },
-    ]
-
-
-async def _recv_until_terminal(ws, frame_wait_sec: float) -> list[dict]:
-    events: list[dict] = []
-    while True:
-        msg = await ws.receive(timeout=frame_wait_sec)
-        assert msg.type.name == "TEXT", msg
-        event = json.loads(msg.data)
-        events.append(event)
-        if event.get("type") in {
-            "response.completed",
-            "response.failed",
-            "response.incomplete",
-        }:
-            return events
+    return install_chatgpt_auth(monkeypatch, tmp_path)
 
 
 @pytest.mark.asyncio
@@ -215,9 +166,9 @@ async def test_post_compaction_no_prev_id_turn_on_reused_lane_does_not_hang(
 ):
     _short_timeouts(monkeypatch, first=0.3, idle=0.3)
     state = MockUpstreamWsState(
-        response_sequences=[_completed("resp_compacted"), [], _completed("resp_retry")]
+        response_sequences=[completed_events("resp_compacted"), [], completed_events("resp_retry")]
     )
-    shim_client, upstream_client = await _start(monkeypatch, tmp_path, state)
+    shim_client, upstream_client = await start_shim_with_mock_chatgpt_ws(monkeypatch, tmp_path, state)
     compacted_input = [
         {"type": "message", "role": "user", "content": "summary of earlier turns"}
     ]
@@ -232,7 +183,7 @@ async def test_post_compaction_no_prev_id_turn_on_reused_lane_does_not_hang(
                 "input": [{"type": "message", "role": "user", "content": "hi"}],
             }
         )
-        assert (await _recv_until_terminal(ws, 2))[-1]["type"] == "response.completed"
+        assert (await recv_until_terminal(ws, 2))[-1]["type"] == "response.completed"
 
         # Post-compaction shape: no previous_response_id, full compacted input, reused lane, silent upstream.
         await ws.send_json(
@@ -242,7 +193,7 @@ async def test_post_compaction_no_prev_id_turn_on_reused_lane_does_not_hang(
                 "input": compacted_input,
             }
         )
-        stalled = await _recv_until_terminal(ws, 3)
+        stalled = await recv_until_terminal(ws, 3)
         assert [e["type"] for e in stalled][-2:] == ["error", "response.failed"]
         assert stalled[-1]["response"]["error"]["code"] == WS_RELAY_STALL_ERROR_CODE
         for _ in range(50):
@@ -261,7 +212,7 @@ async def test_post_compaction_no_prev_id_turn_on_reused_lane_does_not_hang(
                 "input": compacted_input,
             }
         )
-        assert (await _recv_until_terminal(ws, 2))[-1]["type"] == "response.completed"
+        assert (await recv_until_terminal(ws, 2))[-1]["type"] == "response.completed"
         assert len(state.handshakes) == 2
         await ws.close()
     finally:
@@ -276,7 +227,7 @@ async def test_client_drop_mid_relay_closes_upstream_lane(
     _short_timeouts(monkeypatch, first=0, idle=0)
     monkeypatch.setattr("codex_shim.ws_passthrough.CLIENT_GONE_POLL_SEC", 0.02)
     state = MockUpstreamWsState(response_sequences=[[]])
-    shim_client, upstream_client = await _start(monkeypatch, tmp_path, state)
+    shim_client, upstream_client = await start_shim_with_mock_chatgpt_ws(monkeypatch, tmp_path, state)
     try:
         ws = await shim_client.ws_connect(
             "/v1/responses",

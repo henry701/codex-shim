@@ -496,3 +496,52 @@ async def test_suppressed_previous_response_id_error_remains_precontent():
     assert terminal is not None
     assert terminal["type"] == "error"
     assert url in session.upstream_by_url
+
+
+def _error_frame(code: str, message: str = "upstream said no", **extra) -> str:
+    return json.dumps({"type": "error", "error": {"code": code, "message": message}, **extra})
+
+
+@pytest.mark.asyncio
+async def test_unmapped_upstream_error_is_followed_by_response_failed_and_drops_lane(capsys):
+    # Codex ignores an error frame with no status (not the connection-limit code) and would
+    # wait forever; the relay must end the turn with a response.failed carrying the same code.
+    events = [
+        json.dumps({"type": "response.created", "response": {"id": "r1", "model": "gpt-5.5"}}),
+        json.dumps({"type": "response.in_progress", "response": {"id": "r1", "model": "gpt-5.5"}}),
+        _error_frame("context_length_exceeded", "too long"),
+    ]
+    session, url, sent, capture = _relay_session(events)
+    terminal = await session.relay_until_terminal(source="test-ws", upstream_url=url, write_event=capture)
+    assert terminal is not None and terminal["type"] == "error"
+    assert [event["type"] for event in sent] == [
+        "response.created",
+        "response.in_progress",
+        "error",
+        "response.failed",
+    ]
+    failed = sent[-1]["response"]
+    assert failed["id"] == "r1"
+    assert failed["status"] == "failed"
+    assert failed["error"] == {"code": "context_length_exceeded", "message": "too long"}
+    assert url not in session.upstream_by_url
+    out = capsys.readouterr().out
+    assert "terminal=response.failed" in out
+    assert "upstream_error[" in out and "code='context_length_exceeded'" in out
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "frame",
+    [
+        _error_frame("invalid_request_error", status=400),
+        _error_frame("invalid_request_error", status_code=400),
+        _error_frame("websocket_connection_limit_reached"),
+    ],
+)
+async def test_codex_mapped_upstream_error_is_not_doubled(frame):
+    session, url, sent, capture = _relay_session([frame])
+    terminal = await session.relay_until_terminal(source="test-ws", upstream_url=url, write_event=capture)
+    assert terminal is not None and terminal["type"] == "error"
+    assert [event["type"] for event in sent] == ["error"]
+    assert url not in session.upstream_by_url

@@ -1453,7 +1453,7 @@ class ShimServer:
                     continue
                 print(f"[ws-passthrough] upstream relay failed url={upstream_url} err={exc}", flush=True)
                 return False
-        if collector.response_id:
+        if collector.completed_response_id:
             items = self._build_turn_cache_items(request, raw_body, collector.output_items())
             if items:
                 await self._store_chatgpt_passthrough_conversation_async(
@@ -1624,7 +1624,7 @@ class ShimServer:
                 return True
             break
 
-        if collector.response_id:
+        if collector.completed_response_id:
             passthrough.note_chained_response(upstream_url, collector.response_id)
             items = self._build_turn_cache_items(request, raw_body, collector.output_items())
             if items:
@@ -1705,7 +1705,7 @@ class ShimServer:
                 upstream_forward_headers=upstream_forward_headers,
             )
         finally:
-            cache_store(collector.response_id, collector.output_items(), terminal=True)
+            cache_store(collector.completed_response_id, collector.output_items(), terminal=True)
             await _close_upstream(upstream)
 
     async def _handle_response_create_websocket(
@@ -2759,7 +2759,7 @@ class ShimServer:
                     except ClientError as exc:
                         await guard.note_upstream_disconnect(exc)
                     finally:
-                        if collector.response_id and collector.output_items():
+                        if collector.completed_response_id and collector.output_items():
                             cache_items = self._build_turn_cache_items(
                                 request, raw_body, collector.output_items()
                             )
@@ -2953,7 +2953,7 @@ class ShimServer:
                 except ClientError as exc:
                     await guard.note_upstream_disconnect(exc)
                 finally:
-                    if collector.response_id and collector.output_items():
+                    if collector.completed_response_id and collector.output_items():
                         cache_items = self._build_turn_cache_items(request, raw_body, collector.output_items())
                         if cache_items:
                             await self._store_chatgpt_passthrough_conversation_async(
@@ -4067,11 +4067,11 @@ class ShimServer:
                             await _safe_write(response, f"data: {line}\n\n".encode())
                 except ClientError as exc:
                     await guard.note_upstream_disconnect(exc)
-            if emitter.saw_terminal:
+            if collector.completed_response_id:
                 self._store_responses_turn_conversation(
                     request,
                     body,
-                    collector.response_id,
+                    collector.completed_response_id,
                     collector.output_items(),
                 )
             return response
@@ -4754,9 +4754,17 @@ class ChatgptPassthroughResponseCollector:
     def __init__(self, forwarded: dict[str, Any]):
         self._input = _chatgpt_input_items(forwarded.get("input"))
         self.response_id: str | None = None
+        self.completed = False
         self._output: list[Any] = []
 
+    @property
+    def completed_response_id(self) -> str | None:
+        """Response id only once upstream completed it; failed/errored turns never advance cache or chain."""
+        return self.response_id if self.completed else None
+
     def record(self, event: dict[str, Any]) -> None:
+        if event.get("type") == "response.completed":
+            self.completed = True
         response = event.get("response")
         if isinstance(response, dict):
             response_id = response.get("id")

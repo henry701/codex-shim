@@ -21,7 +21,7 @@ from .header_passthrough import (
     observe_upstream_response,
     upstream_headers_from_response,
 )
-from .net.emitters import WsRelayEmitter
+from .net.emitters import WsRelayEmitter, describe_ws_error
 from .net.errors import (
     THROTTLE_QUOTA,
     THROTTLE_RATE_LIMIT,
@@ -89,6 +89,7 @@ class _RelayStats:
     upstream_events: int = 0
     max_silence: float = 0.0
     stop: str = "exception"
+    upstream_error: str | None = None
 
     def note_event(self) -> None:
         now = time.monotonic()
@@ -104,7 +105,8 @@ class _RelayStats:
             f"elapsed={now - self.started_at:.1f}s "
             f"upstream_events={self.upstream_events} "
             f"max_silence={max(self.max_silence, trailing_silence):.1f}s "
-            f"terminal={terminal or 'NONE'} stop={self.stop}",
+            f"terminal={terminal or 'NONE'} stop={self.stop}"
+            f"{f' upstream_error[{self.upstream_error}]' if self.upstream_error else ''}",
             flush=True,
         )
 
@@ -486,9 +488,18 @@ class WsPassthroughSession:
                     if event.get("type") in _TERMINAL_EVENT_TYPES:
                         stats.stop = "terminal"
                         terminal_event = event
+                        is_error = event.get("type") == "error"
+                        if is_error:
+                            stats.upstream_error = describe_ws_error(event)
                         if forward_terminal is None or forward_terminal(event):
                             await write_event(event)
                             content_forwarded = True
+                            # Closes an error frame Codex would not map with response.failed.
+                            await emitter.complete()
+                            if is_error:
+                                # The turn is over; don't reuse a lane that may still hold
+                                # trailing frames. A suppressed error is the caller's to retry.
+                                await self._drop_lane(upstream_url)
                         break
                     await write_event(event)
                     content_forwarded = True
