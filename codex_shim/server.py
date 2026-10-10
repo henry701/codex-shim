@@ -135,6 +135,7 @@ from .header_passthrough import (
     upstream_headers_from_response,
 )
 from .ws_passthrough import (
+    shim_error_message,
     CHATGPT_WS_URL,
     WsPassthroughConnectError,
     WsPassthroughSession,
@@ -1231,11 +1232,17 @@ class ShimServer:
         ws = web.WebSocketResponse(compress=True, heartbeat=30)
         await ws.prepare(request)
         passthrough: WsPassthroughSession | None = None
+        holder: dict[str, WsPassthroughSession | None] = {"session": None}
+        inbox: asyncio.Queue[Any] = asyncio.Queue()
+        pump = asyncio.create_task(_pump_client_websocket(ws, inbox, lambda: holder["session"]))
         pinger = DownstreamPinger(lambda: ping_websocket(ws), owner_task=asyncio.current_task())
         pinger.start()
         try:
             async with ClientSession(timeout=self.timeout) as http_session:
-                async for msg in ws:
+                while True:
+                    msg = await inbox.get()
+                    if msg is None:
+                        break
                     if msg.type == WSMsgType.TEXT:
                         try:
                             payload = json.loads(msg.data)
@@ -1246,11 +1253,16 @@ class ShimServer:
                             await _write_ws_error(ws, 400, "invalid_request_error", "websocket frame must be a JSON object")
                             continue
                         if payload.get("type") != "response.create":
+                            frame_type = payload.get("type")
+                            print(
+                                f"[ws] no upstream websocket for frame type={frame_type!r}",
+                                flush=True,
+                            )
                             await _write_ws_error(
                                 ws,
                                 400,
                                 "invalid_request_error",
-                                "only response.create websocket frames are supported",
+                                f"no upstream websocket for frame type {frame_type!r}",
                             )
                             continue
                         body = {k: v for k, v in payload.items() if k != "type"}
@@ -1270,6 +1282,7 @@ class ShimServer:
                                     client_ws=ws,
                                     client_transport_closed=lambda: _request_transport_closed(request),
                                 )
+                                holder["session"] = passthrough
                                 self._register_ws_passthrough(passthrough)
                             try:
                                 handled = await self._handle_ws_passthrough_response_create(
@@ -1303,6 +1316,8 @@ class ShimServer:
                     elif msg.type == WSMsgType.ERROR:
                         break
         finally:
+            pump.cancel()
+            await asyncio.gather(pump, return_exceptions=True)
             if passthrough is not None:
                 # Also on cancellation (client gone): never leave upstream lanes open.
                 self._unregister_ws_passthrough(passthrough)
@@ -1684,7 +1699,7 @@ class ShimServer:
             )
             if upstream is not None:
                 upstream.release()
-            await _write_ws_error(ws, posted.status, code, message)
+            await _write_ws_error(ws, posted.status, code, message, upstream=True)
             return
         collector = ChatgptPassthroughResponseCollector(forwarded)
 
@@ -1814,7 +1829,7 @@ class ShimServer:
         if posted.status >= 400:
             text = posted.error_text or ""
             code, message = parse_upstream_error(text, posted.status)
-            await _write_ws_error(ws, posted.status, code, message)
+            await _write_ws_error(ws, posted.status, code, message, upstream=True)
             return
         upstream = posted.response
         try:
@@ -6791,7 +6806,7 @@ async def _ws_error_from_http_response(ws: web.WebSocketResponse, response: web.
     if isinstance(response, web.Response):
         text = response.text or ""
     code, message = parse_upstream_error(text, response.status)
-    await _write_ws_error(ws, response.status, code, message)
+    await _write_ws_error(ws, response.status, code, message, upstream=True)
 
 
 async def _stream_compaction_v2_sse(
@@ -6838,7 +6853,49 @@ async def _stream_compaction_v2_sse(
     return response
 
 
-async def _write_ws_error(ws: web.WebSocketResponse, status: int, code: str, message: str) -> None:
+async def _pump_client_websocket(
+    ws: web.WebSocketResponse,
+    inbox: asyncio.Queue[Any],
+    passthrough: Any,
+) -> None:
+    """Read the client socket while a relay is in progress.
+
+    ``response.create`` is the only frame the shim interprets (model rewrite,
+    lane selection, relay). Every other JSON object is copied to the active
+    upstream lane unchanged, so new Codex frame types do not need a shim allowlist.
+    """
+    try:
+        async for msg in ws:
+            if msg.type == WSMsgType.TEXT:
+                try:
+                    payload = json.loads(msg.data)
+                except json.JSONDecodeError:
+                    payload = None
+                if isinstance(payload, dict) and payload.get("type") != "response.create":
+                    session = passthrough()
+                    forwarded = False
+                    if session is not None:
+                        forwarded = await session.forward_client_frame(msg.data, payload.get("type"))
+                    if forwarded:
+                        print(f"[ws] forwarded frame type={payload.get('type')!r}", flush=True)
+                        continue
+            await inbox.put(msg)
+            if msg.type in {WSMsgType.CLOSE, WSMsgType.CLOSED, WSMsgType.CLOSING, WSMsgType.ERROR}:
+                break
+    finally:
+        await inbox.put(None)
+
+
+async def _write_ws_error(
+    ws: web.WebSocketResponse,
+    status: int,
+    code: str,
+    message: str,
+    *,
+    upstream: bool = False,
+) -> None:
+    if not upstream:
+        message = shim_error_message(message)
     await _write_ws_json(
         ws,
         {

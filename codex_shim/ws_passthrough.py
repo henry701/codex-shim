@@ -40,6 +40,7 @@ from .net.retry import (
 from .net.sse import ClientDisconnected
 
 CHATGPT_WS_URL = "wss://chatgpt.com/backend-api/codex/responses"
+SHIM_ERROR_PREFIX = "[codex-shim] "
 UPSTREAM_WS_HEARTBEAT = 30
 _VERSIONED_BASE_RE = re.compile(r"/v\d+$")
 _TERMINAL_EVENT_TYPES = frozenset({"response.completed", "response.failed", "response.incomplete", "error"})
@@ -220,10 +221,12 @@ class WsPassthroughSession:
     client_session: ClientSession
     client_ws: web.WebSocketResponse
     upstream_by_url: dict[str, ClientWebSocketResponse] = field(default_factory=dict)
+    active_upstream_url: str | None = None
     last_chained_response_id_by_url: dict[str, str] = field(default_factory=dict)
     thread_ids: set[str] = field(default_factory=set)
     throttle: RequestThrottle = field(default_factory=RequestThrottle)
-    # The handler is blocked in the relay, so nobody reads client_ws; a dropped
+    # The relay itself does not read client_ws. A concurrent pump forwards every
+    # client frame except response.create to the active upstream lane. A dropped
     # client only shows on the transport. Server wires this to request.transport.
     client_transport_closed: Callable[[], bool] | None = None
 
@@ -334,10 +337,24 @@ class WsPassthroughSession:
         print(f"[ws-passthrough] connected upstream url={url}", flush=True)
         return upgrade_headers, False
 
+    async def forward_client_frame(self, raw: str, frame_type: Any) -> bool:
+        """Forward a client frame unchanged to the lane that last took a response.create."""
+        url = self.active_upstream_url
+        upstream = self.upstream_by_url.get(url) if url else None
+        if upstream is None or getattr(upstream, "closed", False):
+            return False
+        try:
+            await upstream.send_str(raw)
+        except Exception as exc:
+            print(f"[ws] failed to forward {frame_type!r} url={url} err={exc}", flush=True)
+            return False
+        return True
+
     async def send_response_create(self, body: dict[str, Any], *, upstream_url: str) -> None:
         upstream_ws = self.upstream_by_url.get(upstream_url)
         if upstream_ws is None or upstream_ws.closed:
             raise WsPassthroughConnectError("upstream websocket is not connected")
+        self.active_upstream_url = upstream_url
         payload = {"type": "response.create", **body}
         try:
             await upstream_ws.send_str(json.dumps(payload, separators=(",", ":")))
@@ -550,7 +567,11 @@ class WsPassthroughSession:
         )
         await self._drop_lane(upstream_url)
         what = "no upstream event" if stall is RelayStall.FIRST_EVENT_TIMEOUT else "upstream went silent"
-        await emitter.fail(None, f"{what} for {wait:g}s; retry the turn", code=WS_RELAY_STALL_ERROR_CODE)
+        await emitter.fail(
+            None,
+            shim_error_message(f"{what} for {wait:g}s; retry the turn"),
+            code=WS_RELAY_STALL_ERROR_CODE,
+        )
         return emitter.last_emitted
 
     async def close_upstream(self, upstream_url: str | None = None) -> None:
@@ -560,8 +581,17 @@ class WsPassthroughSession:
             return
         upstream_ws = self.upstream_by_url.pop(upstream_url, None)
         self.last_chained_response_id_by_url.pop(upstream_url, None)
+        if self.active_upstream_url == upstream_url:
+            self.active_upstream_url = None
         if upstream_ws is not None and not upstream_ws.closed:
             await upstream_ws.close()
+
+
+def shim_error_message(message: str) -> str:
+    text = str(message or "")
+    if text.startswith(SHIM_ERROR_PREFIX):
+        return text
+    return f"{SHIM_ERROR_PREFIX}{text}"
 
 
 async def _write_error(ws: web.WebSocketResponse, status: int, code: str, message: str) -> None:
@@ -570,7 +600,7 @@ async def _write_error(ws: web.WebSocketResponse, status: int, code: str, messag
             {
                 "type": "error",
                 "status": status,
-                "error": {"type": code, "code": code, "message": message},
+                "error": {"type": code, "code": code, "message": shim_error_message(message)},
             },
             separators=(",", ":"),
         )

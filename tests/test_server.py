@@ -6132,6 +6132,84 @@ async def test_chatgpt_ws_passthrough_relays_events(monkeypatch, tmp_path, auth_
         await upstream_client.close()
 
 
+async def test_chatgpt_ws_forwards_non_create_frames_during_open_turn(monkeypatch, tmp_path, auth_present):
+    state = MockUpstreamWsState(
+        hold_completion_until_client_frame=True,
+        response_sequences=[
+            [
+                {"type": "response.created", "response": {"id": "resp_async", "model": "gpt-5.5"}},
+                {
+                    "type": "response.completed",
+                    "response": {"id": "resp_async", "model": "gpt-5.5", "status": "completed"},
+                },
+            ],
+            [
+                {"type": "response.created", "response": {"id": "resp_next", "model": "gpt-5.5"}},
+                {
+                    "type": "response.completed",
+                    "response": {"id": "resp_next", "model": "gpt-5.5", "status": "completed"},
+                },
+            ],
+        ],
+    )
+    upstream_state, upstream_client = await start_mock_upstream_ws(state)
+    _patch_chatgpt_ws_url(monkeypatch, _ws_url_from_test_client(upstream_client))
+
+    settings = tmp_path / "settings.json"
+    settings.write_text("{}")
+    shim_client = TestClient(TestServer(ShimServer(settings).app()))
+    await shim_client.start_server()
+    try:
+        ws = await shim_client.ws_connect("/v1/responses")
+        await ws.send_json(
+            {
+                "type": "response.create",
+                "model": "codex-gpt-5-5",
+                "input": [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]}],
+                "stream": True,
+            }
+        )
+        created = json.loads((await ws.receive(timeout=2)).data)
+        assert created["type"] == "response.created"
+        await ws.send_json(
+            {
+                "type": "response.interrupt",
+                "response_id": "resp_async",
+                "mode": "discard_partial_items",
+            }
+        )
+        completed = json.loads((await ws.receive(timeout=2)).data)
+        assert completed["type"] == "response.completed"
+        assert [frame["type"] for frame in upstream_state.received_frames] == [
+            "response.create",
+            "response.interrupt",
+        ]
+        assert upstream_state.received_frames[1]["response_id"] == "resp_async"
+        await ws.send_json(
+            {
+                "type": "response.create",
+                "model": "codex-gpt-5-5",
+                "input": [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "again"}]}],
+                "stream": True,
+            }
+        )
+        created_again = json.loads((await ws.receive(timeout=2)).data)
+        assert created_again["type"] == "response.created"
+        await ws.send_json({"type": "some.future_frame", "n": 1})
+        completed_again = json.loads((await ws.receive(timeout=2)).data)
+        assert completed_again["type"] == "response.completed"
+        assert [frame["type"] for frame in upstream_state.received_frames] == [
+            "response.create",
+            "response.interrupt",
+            "response.create",
+            "some.future_frame",
+        ]
+        await ws.close()
+    finally:
+        await shim_client.close()
+        await upstream_client.close()
+
+
 async def test_chatgpt_ws_passthrough_multi_create_same_connection(monkeypatch, tmp_path, auth_present):
     first_input = [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "run"}]}]
     tool_call = {

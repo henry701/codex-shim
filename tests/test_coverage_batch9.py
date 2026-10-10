@@ -676,13 +676,13 @@ async def test_websocket_invalid_frames_and_stream_400(monkeypatch, tmp_path):
         ws = await client.ws_connect("/v1/responses")
         await ws.send_str("not-json")
         bad = json.loads((await ws.receive(timeout=2)).data)
-        assert bad["error"]["message"] == "invalid JSON websocket frame"
+        assert bad["error"]["message"] == "[codex-shim] invalid JSON websocket frame"
         await ws.send_str("[]")
         obj = json.loads((await ws.receive(timeout=2)).data)
         assert "JSON object" in obj["error"]["message"]
         await ws.send_json({"type": "ping"})
         typ = json.loads((await ws.receive(timeout=2)).data)
-        assert "response.create" in typ["error"]["message"]
+        assert typ["error"]["message"] == "[codex-shim] no upstream websocket for frame type 'ping'"
         await ws.send_bytes(b"bin")
         binary = json.loads((await ws.receive(timeout=2)).data)
         assert "binary" in binary["error"]["message"]

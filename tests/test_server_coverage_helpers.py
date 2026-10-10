@@ -282,4 +282,4 @@ async def test_write_ws_error_payload_shape():
     payload = json.loads(ws.sent[0])
     assert payload["type"] == "error"
     assert payload["status"] == 401
-    assert payload["error"]["message"] == "nope"
+    assert payload["error"]["message"] == "[codex-shim] nope"

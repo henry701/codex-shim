@@ -25,6 +25,8 @@ class MockUpstreamWsState:
     response_sequences: list[list[dict[str, Any]]] = field(default_factory=list)
     upgrade_headers: dict[str, str] = field(default_factory=dict)
     closed_connections: int = 0
+    hold_completion_until_client_frame: bool = False
+    held_completion: dict[str, Any] | None = None
     _sequence_index: int = 0
 
     def next_responses(self) -> list[dict[str, Any]]:
@@ -59,7 +61,21 @@ def build_mock_upstream_ws_app(state: MockUpstreamWsState, path: str = "/v1/resp
             if not isinstance(payload, dict):
                 continue
             state.received_frames.append(payload)
-            for event in state.next_responses():
+            if payload.get("type") != "response.create":
+                held = state.held_completion
+                state.held_completion = None
+                if held is not None:
+                    await ws.send_str(json.dumps(held, separators=(",", ":")))
+                continue
+            events = state.next_responses()
+            if state.hold_completion_until_client_frame:
+                created = [event for event in events if event.get("type") != "response.completed"]
+                state.held_completion = next(
+                    (event for event in events if event.get("type") == "response.completed"),
+                    None,
+                )
+                events = created
+            for event in events:
                 await ws.send_str(json.dumps(event, separators=(",", ":")))
         state.closed_connections += 1
         return ws
