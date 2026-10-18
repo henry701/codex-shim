@@ -114,7 +114,8 @@ def test_prepare_responses_input_items_expands_then_synthesizes():
     assert repaired[2]["type"] == "function_call"
     assert repaired[2]["call_id"] == "call_2"
     assert repaired[3]["call_id"] == "call_2"
-    assert len(warnings) == 1
+    assert any("synthesized" in warning for warning in warnings)
+    assert any("replayed item id" in warning for warning in warnings)
 
 
 def test_synthesize_orphan_tool_calls_uses_resolved_bridge_tool_name():
@@ -227,7 +228,7 @@ def test_prepare_keeps_real_output_when_cache_uuid_and_call_prefix_differ():
     assert len(outputs) == 1
     assert outputs[0]["call_id"] == f"call_{uuid}"
     assert outputs[0]["output"] == "telegram-desktop"
-    assert warnings == []
+    assert warnings == ["cleared 1 replayed item id(s); rustponsesapi cannot look them up"]
 
 
 def test_prepare_clears_server_minted_ids_that_require_persisted_lookup():
@@ -283,14 +284,45 @@ def test_prepare_clears_server_minted_ids_that_require_persisted_lookup():
     for item in repaired:
         by_type.setdefault(item["type"], []).append(item)
     assert by_type["message"][0]["content"] == "kept"
-    assert "id" not in by_type["message"][0]
-    assert by_type["message"][1]["id"] == client_msg
+    assert by_type["message"][1]["content"] == "client"
+    assert all("id" not in item for item in by_type["message"])
     assert "id" not in by_type["reasoning"][0]
     assert by_type["reasoning"][0]["encrypted_content"] == "ciphertext"
     assert by_type["function_call"][0]["call_id"] == call_id
-    assert by_type["function_call"][0]["id"] == "fc_900801da886f4c028988e9a0c8d9915a"
-    assert by_type["function_call"][1]["id"] == short_fc
+    assert by_type["function_call"][1]["call_id"] == "call_7bf23739ba1d481fa26d0883350cc220"
+    for call in by_type["function_call"]:
+        assert call["id"].startswith("fc_")
+        assert "-" in call["id"]
+        assert call["id"] not in {server_fc, short_fc}
     assert by_type["custom_tool_call"][0]["call_id"] == call_id
     assert by_type["custom_tool_call"][0]["id"].startswith("ctc_")
     assert "-" in by_type["custom_tool_call"][0]["id"]
+    assert any("replayed item id" in warning for warning in warnings)
+
+
+def test_native_delta_keeps_client_ids_and_drops_hex_ids():
+    client_msg = "msg_01a13da5-4ffd-7830-9d9b-00f5efa06dd6"
+    short_fc = "fc_7bf23739ba1d481fa26d0883350cc220"
+    repaired, warnings = prepare_responses_input_items(
+        cache=None,
+        session_key="sess",
+        previous_response_id="resp_live",
+        input_items=[
+            {"type": "message", "id": client_msg, "role": "user", "content": "hi"},
+            {
+                "type": "function_call",
+                "id": short_fc,
+                "call_id": "call_7bf23739ba1d481fa26d0883350cc220",
+                "name": "wait",
+                "arguments": "{}",
+            },
+        ],
+        expand_enabled=False,
+        context="turn",
+        orphan_synthesis=False,
+    )
+    assert repaired[0]["id"] == client_msg
+    assert repaired[1]["call_id"] == "call_7bf23739ba1d481fa26d0883350cc220"
+    assert repaired[1]["id"].startswith("fc_")
+    assert "-" in repaired[1]["id"]
     assert any("persisted item id" in warning for warning in warnings)

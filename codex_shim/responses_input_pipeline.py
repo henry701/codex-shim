@@ -33,10 +33,10 @@ STALE_TOOL_OUTPUT_MESSAGE = (
 
 _TOOL_CALL_ITEM_TYPES = frozenset({"function_call", "custom_tool_call"})
 _TOOL_OUTPUT_ITEM_TYPES = frozenset({"function_call_output", "custom_tool_call_output"})
-# ChatGPT's rust responses API looks up input item ids it minted (prefix plus a
-# long hex suffix) in persisted storage. store=false cannot resolve that lookup.
-# Codex-minted ids carry a UUID and hyphens, so they are not this shape.
-_PERSISTED_ITEM_ID = re.compile(r"^[a-z][a-z0-9]*_[0-9a-f]{40,}$")
+# Hex item ids (no hyphens) are server-minted. rustponsesapi looks them up in
+# persisted storage, which store=false cannot do. 32 hex is a UUID without
+# hyphens (fc_ec30...); 40+ hex is the longer response id.
+_PERSISTED_ITEM_ID = re.compile(r"^[a-z][a-z0-9]*_[0-9a-f]{32,}$")
 _TOOL_CALL_ID_PREFIX = {"function_call": "fc", "custom_tool_call": "ctc"}
 
 
@@ -294,16 +294,25 @@ def is_persisted_response_item_id(value: Any) -> bool:
     return isinstance(value, str) and _PERSISTED_ITEM_ID.fullmatch(value) is not None
 
 
-def clear_persisted_lookup_ids(items: list[Any]) -> tuple[list[Any], int]:
+def clear_persisted_lookup_ids(items: list[Any], *, drop_all: bool = False) -> tuple[list[Any], int]:
     """Drop or replace ids that rustponsesapi would resolve from storage.
 
-    Tool calls keep a fresh ``fc_``/``ctc_`` id so Lite still accepts the item.
+    ``drop_all`` is for a stateless replay: ``previous_response_id`` is removed
+    and the full history is inlined, so every supplied id is a lookup. Tool
+    calls keep a fresh ``fc_``/``ctc_`` id so Lite still accepts the item.
     ``call_id`` is unchanged. Every other item keeps its body and loses the id.
     """
     cleared = 0
     output: list[Any] = []
     for raw in items:
-        if not isinstance(raw, dict) or not is_persisted_response_item_id(raw.get("id")):
+        if not isinstance(raw, dict):
+            output.append(raw)
+            continue
+        item_id = raw.get("id")
+        if not isinstance(item_id, str) or not item_id:
+            output.append(raw)
+            continue
+        if not drop_all and not is_persisted_response_item_id(item_id):
             output.append(raw)
             continue
         item = dict(raw)
@@ -342,10 +351,12 @@ def prepare_responses_input_items(
         aligned, warnings = synthesize_orphan_tool_calls(aligned, name_resolver=name_resolver)
         aligned, extra = synthesize_missing_tool_outputs(aligned)
         warnings = [*warnings, *extra]
-    cleared_items, cleared = clear_persisted_lookup_ids(aligned)
+    stateless_replay = expand_enabled and isinstance(previous_response_id, str) and bool(previous_response_id)
+    cleared_items, cleared = clear_persisted_lookup_ids(aligned, drop_all=stateless_replay)
     if cleared:
+        kind = "replayed" if stateless_replay else "persisted"
         warnings.append(
-            f"cleared {cleared} persisted item id(s); rustponsesapi cannot look them up"
+            f"cleared {cleared} {kind} item id(s); rustponsesapi cannot look them up"
         )
     return cleared_items, warnings
 

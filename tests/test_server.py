@@ -1064,7 +1064,13 @@ async def test_chatgpt_passthrough_expands_previous_response_id_by_default(
     assert second.status == 200
 
     assert "previous_response_id" not in captured[1]
-    assert captured[1]["input"] == [*first_input, tool_call, tool_output]
+    sent_input = captured[1]["input"]
+    assert sent_input[0] == first_input[0]
+    assert sent_input[1]["call_id"] == "call_1"
+    assert sent_input[1]["name"] == "exec_command"
+    assert sent_input[1]["id"].startswith("fc_")
+    assert "-" in sent_input[1]["id"]
+    assert sent_input[2] == tool_output
 
     await shim_client.close()
 
@@ -1637,7 +1643,13 @@ async def test_chatgpt_passthrough_websocket_expands_previous_response_id(monkey
         assert msg.type == WSMsgType.TEXT
 
     assert "previous_response_id" not in captured[1]
-    assert captured[1]["input"] == [*first_input, tool_call, tool_output]
+    sent_input = captured[1]["input"]
+    assert sent_input[0] == first_input[0]
+    assert sent_input[1]["call_id"] == "call_1"
+    assert sent_input[1]["name"] == "exec_command"
+    assert sent_input[1]["id"].startswith("fc_")
+    assert "-" in sent_input[1]["id"]
+    assert sent_input[2] == tool_output
 
     await shim_client.close()
 
