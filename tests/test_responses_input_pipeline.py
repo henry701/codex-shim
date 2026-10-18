@@ -228,3 +228,69 @@ def test_prepare_keeps_real_output_when_cache_uuid_and_call_prefix_differ():
     assert outputs[0]["call_id"] == f"call_{uuid}"
     assert outputs[0]["output"] == "telegram-desktop"
     assert warnings == []
+
+
+def test_prepare_clears_server_minted_ids_that_require_persisted_lookup():
+    server_msg = "msg_" + "ab" * 22
+    server_rs = "rs_" + "cd" * 22
+    server_fc = "fc_" + "ef" * 22
+    server_ctc = "ctc_" + "12" * 22
+    client_msg = "msg_01a13da5-4ffd-7830-9d9b-00f5efa06dd6"
+    short_fc = "fc_7bf23739ba1d481fa26d0883350cc220"
+    call_id = "call_900801da886f4c028988e9a0c8d9915a"
+    cache = _FakeCache(
+        [
+            {"type": "message", "id": server_msg, "role": "assistant", "content": "kept"},
+            {"type": "message", "id": client_msg, "role": "user", "content": "client"},
+            {
+                "type": "reasoning",
+                "id": server_rs,
+                "encrypted_content": "ciphertext",
+                "summary": [],
+            },
+            {
+                "type": "function_call",
+                "id": server_fc,
+                "call_id": call_id,
+                "name": "exec",
+                "arguments": "{}",
+            },
+            {
+                "type": "function_call",
+                "id": short_fc,
+                "call_id": "call_7bf23739ba1d481fa26d0883350cc220",
+                "name": "wait",
+                "arguments": "{}",
+            },
+            {
+                "type": "custom_tool_call",
+                "id": server_ctc,
+                "call_id": call_id,
+                "name": "exec",
+                "input": "{}",
+            },
+        ]
+    )
+    repaired, warnings = prepare_responses_input_items(
+        cache=cache,
+        session_key="sess",
+        previous_response_id="resp_missing",
+        input_items=[{"type": "message", "role": "user", "content": "answer"}],
+        expand_enabled=True,
+        context="turn",
+    )
+    by_type: dict[str, list] = {}
+    for item in repaired:
+        by_type.setdefault(item["type"], []).append(item)
+    assert by_type["message"][0]["content"] == "kept"
+    assert "id" not in by_type["message"][0]
+    assert by_type["message"][1]["id"] == client_msg
+    assert "id" not in by_type["reasoning"][0]
+    assert by_type["reasoning"][0]["encrypted_content"] == "ciphertext"
+    assert by_type["function_call"][0]["call_id"] == call_id
+    assert by_type["function_call"][0]["id"] == "fc_900801da886f4c028988e9a0c8d9915a"
+    assert by_type["function_call"][1]["id"] == short_fc
+    assert by_type["custom_tool_call"][0]["call_id"] == call_id
+    assert by_type["custom_tool_call"][0]["id"].startswith("ctc_")
+    assert "-" in by_type["custom_tool_call"][0]["id"]
+    assert any("persisted item id" in warning for warning in warnings)

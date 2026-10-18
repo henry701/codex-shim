@@ -11,6 +11,8 @@ the upstream connection already holds the prior tool call.
 from __future__ import annotations
 
 import copy
+import re
+import uuid
 from collections.abc import Callable
 from typing import Any, Protocol
 
@@ -31,6 +33,11 @@ STALE_TOOL_OUTPUT_MESSAGE = (
 
 _TOOL_CALL_ITEM_TYPES = frozenset({"function_call", "custom_tool_call"})
 _TOOL_OUTPUT_ITEM_TYPES = frozenset({"function_call_output", "custom_tool_call_output"})
+# ChatGPT's rust responses API looks up input item ids it minted (prefix plus a
+# long hex suffix) in persisted storage. store=false cannot resolve that lookup.
+# Codex-minted ids carry a UUID and hyphens, so they are not this shape.
+_PERSISTED_ITEM_ID = re.compile(r"^[a-z][a-z0-9]*_[0-9a-f]{40,}$")
+_TOOL_CALL_ID_PREFIX = {"function_call": "fc", "custom_tool_call": "ctc"}
 
 
 class ConversationCache(Protocol):
@@ -283,6 +290,33 @@ def expand_cached_responses_input(
     return expanded
 
 
+def is_persisted_response_item_id(value: Any) -> bool:
+    return isinstance(value, str) and _PERSISTED_ITEM_ID.fullmatch(value) is not None
+
+
+def clear_persisted_lookup_ids(items: list[Any]) -> tuple[list[Any], int]:
+    """Drop or replace ids that rustponsesapi would resolve from storage.
+
+    Tool calls keep a fresh ``fc_``/``ctc_`` id so Lite still accepts the item.
+    ``call_id`` is unchanged. Every other item keeps its body and loses the id.
+    """
+    cleared = 0
+    output: list[Any] = []
+    for raw in items:
+        if not isinstance(raw, dict) or not is_persisted_response_item_id(raw.get("id")):
+            output.append(raw)
+            continue
+        item = dict(raw)
+        prefix = _TOOL_CALL_ID_PREFIX.get(str(item.get("type") or ""))
+        if prefix:
+            item["id"] = f"{prefix}_{uuid.uuid4()}"
+        else:
+            item.pop("id", None)
+        cleared += 1
+        output.append(item)
+    return output, cleared
+
+
 def prepare_responses_input_items(
     *,
     cache: ConversationCache | None,
@@ -303,11 +337,17 @@ def prepare_responses_input_items(
         context=context,
     )
     aligned = align_responses_tool_call_ids(expanded)
-    if not orphan_synthesis:
-        return aligned, []
-    repaired, warnings = synthesize_orphan_tool_calls(aligned, name_resolver=name_resolver)
-    stubbed, extra = synthesize_missing_tool_outputs(repaired)
-    return stubbed, [*warnings, *extra]
+    warnings: list[str] = []
+    if orphan_synthesis:
+        aligned, warnings = synthesize_orphan_tool_calls(aligned, name_resolver=name_resolver)
+        aligned, extra = synthesize_missing_tool_outputs(aligned)
+        warnings = [*warnings, *extra]
+    cleared_items, cleared = clear_persisted_lookup_ids(aligned)
+    if cleared:
+        warnings.append(
+            f"cleared {cleared} persisted item id(s); rustponsesapi cannot look them up"
+        )
+    return cleared_items, warnings
 
 
 def _log_pipeline_warnings(warnings: list[str]) -> None:
