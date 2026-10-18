@@ -298,11 +298,10 @@ async def test_relay_close_frame_drops_lane():
     url = "wss://example/v1/responses"
     session.upstream_by_url[url] = ClosingWs()
     terminal = await session.relay_until_terminal(source="test-ws", upstream_url=url)
-    assert terminal is not None
-    assert terminal["type"] == "response.incomplete"
+    assert terminal is None
     assert url not in session.upstream_by_url
-    sent = json.loads(client_ws.send_str.await_args.args[0])
-    assert sent["type"] == "response.incomplete"
+    client_ws.close.assert_awaited()
+    client_ws.send_str.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -362,10 +361,10 @@ async def test_relay_text_without_terminal_synthesizes_incomplete():
         upstream_url=url,
         write_event=capture,
     )
-    assert terminal is not None
-    assert terminal["type"] == "response.incomplete"
-    assert [event["type"] for event in sent] == ["response.created", "response.incomplete"]
+    assert terminal is None
+    assert [event["type"] for event in sent] == ["response.created"]
     assert url not in session.upstream_by_url
+    client_ws.close.assert_awaited()
 
 
 @pytest.mark.asyncio
@@ -419,11 +418,10 @@ async def test_relay_error_frame_drops_lane():
     url = "wss://example/v1/responses"
     session.upstream_by_url[url] = ErrorWs()
     terminal = await session.relay_until_terminal(source="test-ws", upstream_url=url)
-    assert terminal is not None
-    assert terminal["type"] == "response.incomplete"
+    assert terminal is None
     assert url not in session.upstream_by_url
-    sent = json.loads(client_ws.send_str.await_args.args[0])
-    assert sent["type"] == "response.incomplete"
+    client_ws.close.assert_awaited()
+    client_ws.send_str.assert_not_awaited()
 
 
 def _relay_session(events: list[str], **ws_kwargs):
@@ -454,21 +452,21 @@ async def test_relay_reset_after_forwarded_event_synthesizes_incomplete_without_
     events = [json.dumps({"type": "response.created", "response": {"id": "r1", "model": "gpt-5.5"}})]
     session, url, sent, capture = _relay_session(events, raise_after=ConnectionResetError("reset"))
     terminal = await session.relay_until_terminal(source="test-ws", upstream_url=url, write_event=capture)
-    assert terminal is not None
-    assert terminal["type"] == "response.incomplete"
-    assert [event["type"] for event in sent] == ["response.created", "response.incomplete"]
+    assert terminal is None
+    assert [event["type"] for event in sent] == ["response.created"]
     assert url not in session.upstream_by_url
+    session.client_ws.close.assert_awaited()
 
 
 @pytest.mark.asyncio
-async def test_relay_close_after_forwarded_event_emits_one_terminal():
+async def test_relay_close_after_forwarded_event_closes_client_without_synthetic_terminal():
     events = [json.dumps({"type": "response.created", "response": {"id": "r1", "model": "gpt-5.5"}})]
     session, url, sent, capture = _relay_session(events, close_after=True)
     terminal = await session.relay_until_terminal(source="test-ws", upstream_url=url, write_event=capture)
-    assert terminal is not None
-    assert terminal["type"] == "response.incomplete"
-    assert [event["type"] for event in sent] == ["response.created", "response.incomplete"]
+    assert terminal is None
+    assert [event["type"] for event in sent] == ["response.created"]
     assert url not in session.upstream_by_url
+    session.client_ws.close.assert_awaited()
 
 
 @pytest.mark.asyncio

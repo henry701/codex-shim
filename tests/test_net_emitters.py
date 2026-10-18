@@ -133,12 +133,12 @@ async def test_responses_emitter_and_ws_relay():
         events.append(event)
 
     ws = WsRelayEmitter(write_event, model="codex-gpt-5-6-luna")
-    assert await ws.complete() == "response.incomplete"
-    assert await ws.complete() == "response.incomplete"
+    assert await ws.complete() == "unterminated"
+    assert await ws.complete() == "unterminated"
     fresh = WsRelayEmitter(write_event, model="codex-gpt-5-6-luna")
     assert await fresh.fail(None, "nope", code="unauthorized") == "response.failed"
     assert await fresh.fail(None, "nope", code="unauthorized") == "response.failed"
-    assert events[0]["type"] == "response.incomplete"
+    assert events[0]["type"] == "error"
     assert any(event.get("type") == "response.failed" for event in events)
 
 

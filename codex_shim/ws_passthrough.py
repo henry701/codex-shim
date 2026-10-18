@@ -530,16 +530,34 @@ class WsPassthroughSession:
             await self._drop_lane(upstream_url)
             if content_forwarded:
                 if not emitter.saw_terminal:
-                    await emitter.complete()
-                    terminal_event = emitter.last_emitted
+                    await self._close_client_unterminated(stats.stop)
                 return terminal_event
             raise WsPassthroughConnectError(str(exc)) from exc
         if terminal_event is None:
             await self.close_upstream(upstream_url)
             if not emitter.saw_terminal:
-                await emitter.complete()
-                terminal_event = emitter.last_emitted
+                await self._close_client_unterminated(stats.stop or "upstream_eof")
         return terminal_event
+
+    async def _close_client_unterminated(self, stop: str) -> None:
+        """Upstream ended the socket without a terminal event. Close the client too.
+
+        A synthetic ``response.incomplete`` makes Codex fail the turn as
+        "Incomplete response returned, reason: unknown". Closing the socket is the
+        same signal Codex already retries: the server went away before
+        ``response.completed``.
+        """
+        print(
+            f"[ws-passthrough] upstream ended before terminal stop={stop}; closing client websocket",
+            flush=True,
+        )
+        ws = self.client_ws
+        if getattr(ws, "closed", False):
+            return
+        try:
+            await ws.close()
+        except Exception as exc:
+            print(f"[ws-passthrough] client close failed: {exc}", flush=True)
 
     async def _abort_stalled_relay(
         self,

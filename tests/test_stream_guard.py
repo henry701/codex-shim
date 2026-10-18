@@ -121,9 +121,8 @@ async def test_ws_relay_emitter_synthesizes_incomplete():
 
     emitter = WsRelayEmitter(write_event, model="test")
     terminal = await emitter.complete()
-    assert terminal == "response.incomplete"
-    assert sent[0]["type"] == "response.incomplete"
-    assert sent[0]["response"]["status"] == "incomplete"
+    assert terminal == "unterminated"
+    assert sent == []
 
 
 class _BoomWrite:

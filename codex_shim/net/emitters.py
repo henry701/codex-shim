@@ -284,16 +284,10 @@ class WsRelayEmitter:
         if self.upstream_error is not None:
             code, message = ws_error_code_message(self.upstream_error)
             return await self._emit_failed(code, message, error_frame=False)
-        event = {
-            "type": "response.incomplete",
-            "response": _synthetic_responses_object(self.last_response, self.model, "incomplete"),
-        }
-        await self._write_event(event)
-        self.last_emitted = event
-        self.already_emitted = True
-        self.saw_terminal = True
-        self.terminal_event = "response.incomplete"
-        return "response.incomplete"
+        # Do not invent response.incomplete. Codex treats that event as a finished
+        # turn and reports a missing reason as "Incomplete response returned, reason: unknown".
+        # The caller closes the client socket so Codex retries a disconnect.
+        return "unterminated"
 
     async def fail(self, response: Any, message: str, *, code: str) -> str:
         del response

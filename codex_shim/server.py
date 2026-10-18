@@ -6949,7 +6949,12 @@ async def _relay_sse_response_to_ws(
             )
         await _write_ws_json(ws, event)
     if not emitter.saw_terminal:
-        await emitter.complete()
+        print(
+            "[ws] upstream SSE ended before a terminal event; closing client websocket",
+            flush=True,
+        )
+        if not getattr(ws, "closed", False):
+            await ws.close()
 
 
 async def _write_anthropic_sse(response: web.StreamResponse, event: str, payload: dict[str, Any]) -> None:
