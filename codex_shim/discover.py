@@ -32,10 +32,14 @@ MODELS_DEV_API_URL = "https://models.dev/api.json"
 MODELS_DEV_OPENCODE_PROVIDER = "opencode"
 OPENAI_MODELS_URL = "https://api.openai.com/v1/models"
 CHATGPT_CODEX_MODELS_URL = "https://chatgpt.com/backend-api/codex/models"
-DEFAULT_CHATGPT_CODEX_CLIENT_VERSION = "0.153.0"
+DEFAULT_CHATGPT_CODEX_CLIENT_VERSION = "0.167.0"
+# Desktop's bundled CLI still runs when /usr/bin/codex was rebuilt for OpenSSL 4
+# and cannot load libssl.so.4. Probe it before the hardcoded version.
+CHATGPT_DESKTOP_CODEX_CLI = "/usr/lib/chatgpt/resources/codex"
 _CODEX_CLI_VERSION_RE = re.compile(r"(\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.]+)?)")
 _UNSET = object()
-_detected_codex_cli_version: tuple[tuple[str | None, tuple[int, int] | None], str | None] | object = _UNSET
+_CodexBinaryIdentity = tuple[str | None, tuple[int, int] | None]
+_detected_codex_cli_version: tuple[tuple[_CodexBinaryIdentity, ...], str | None] | object = _UNSET
 CODEX_OAUTH_TOKEN_URL = "https://auth.openai.com/oauth/token"
 CODEX_OAUTH_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
 DISCOVER_INDEX_BASE = 10_000
@@ -748,31 +752,61 @@ def _codex_binary_identity(binary: str | None) -> tuple[str | None, tuple[int, i
     return (resolved, (st.st_mtime_ns, st.st_size))
 
 
-def detect_codex_cli_version(*, timeout: float = 5.0) -> str | None:
-    """Return the Codex CLI version from ``codex`` on PATH, or ``None`` if unavailable.
+def _codex_cli_candidates() -> list[str]:
+    """PATH ``codex`` first, then the ChatGPT Desktop bundle if it is a different file."""
+    candidates: list[str] = []
+    seen: set[str] = set()
+    path_bin = shutil.which("codex")
+    if path_bin:
+        candidates.append(path_bin)
+        try:
+            seen.add(os.path.realpath(path_bin))
+        except OSError:
+            seen.add(path_bin)
+    desktop = CHATGPT_DESKTOP_CODEX_CLI
+    if os.path.isfile(desktop):
+        try:
+            real = os.path.realpath(desktop)
+        except OSError:
+            real = desktop
+        if real not in seen:
+            candidates.append(desktop)
+    return candidates
 
-    Re-probes when the resolved binary changes (package upgrade under a long-lived shim).
+
+def _probe_codex_cli_version(binary: str, *, timeout: float) -> str | None:
+    try:
+        result = subprocess.run(
+            [binary, "--version"],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return parse_codex_cli_version(f"{result.stdout or ''}\n{result.stderr or ''}")
+
+
+def detect_codex_cli_version(*, timeout: float = 5.0) -> str | None:
+    """Return a Codex CLI version, or ``None`` if every candidate fails.
+
+    Tries ``codex`` on PATH, then ``/usr/lib/chatgpt/resources/codex``. A PATH
+    binary that cannot start (for example ``libssl.so.4`` missing after the
+    OpenSSL 4 rebuild) does not hide the Desktop binary. Re-probes when any
+    candidate binary changes.
     """
     global _detected_codex_cli_version
-    binary = shutil.which("codex")
-    identity = _codex_binary_identity(binary)
+    candidates = _codex_cli_candidates()
+    identity = tuple(_codex_binary_identity(binary) for binary in candidates)
     cached = _detected_codex_cli_version
     if isinstance(cached, tuple) and cached[0] == identity:
         return cached[1]
     parsed: str | None = None
-    if binary:
-        try:
-            result = subprocess.run(
-                [binary, "--version"],
-                capture_output=True,
-                text=True,
-                timeout=timeout,
-                check=False,
-            )
-        except (OSError, subprocess.TimeoutExpired):
-            result = None
-        if result is not None:
-            parsed = parse_codex_cli_version(f"{result.stdout or ''}\n{result.stderr or ''}")
+    for binary in candidates:
+        parsed = _probe_codex_cli_version(binary, timeout=timeout)
+        if parsed:
+            break
     _detected_codex_cli_version = (identity, parsed)
     return parsed
 
@@ -781,7 +815,8 @@ def chatgpt_codex_client_version(*, client_version: str | None = None) -> str:
     """``client_version`` for ChatGPT Codex ``/models``.
 
     Preference: explicit argument, ``CODEX_SHIM_CHATGPT_MODELS_CLIENT_VERSION``,
-    ``codex --version`` on PATH, then ``DEFAULT_CHATGPT_CODEX_CLIENT_VERSION``.
+    ``codex --version`` on PATH, the ChatGPT Desktop bundled CLI, then
+    ``DEFAULT_CHATGPT_CODEX_CLIENT_VERSION``.
     """
     explicit = (client_version or os.environ.get("CODEX_SHIM_CHATGPT_MODELS_CLIENT_VERSION") or "").strip()
     if explicit:

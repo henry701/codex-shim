@@ -28,6 +28,12 @@ and this project does not yet follow semantic versioning (pre-1.0).
 
 ### Fixed
 
+- ChatGPT `/models` asked as Codex CLI 0.153.0 after `/usr/bin/codex` failed to
+  start (`libssl.so.4` missing; the Arch package was rebuilt for OpenSSL 4
+  while this system still has OpenSSL 3). That client version omits
+  `gpt-6.1-sol`. Detection now tries `/usr/lib/chatgpt/resources/codex` before
+  the hardcoded fallback, and the fallback is 0.167.0.
+
 - ChatGPT Codex WebSocket `rate_limits.updated` telemetry was classified as
   HTTP 429 because `ratelimit` is a substring of `ratelimits`, then the shim
   synthesized `status=429` and backed off for up to an hour. Throttle

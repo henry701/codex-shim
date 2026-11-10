@@ -12,6 +12,7 @@ import pytest
 from codex_shim.catalog_slugs import codex_catalog_slug, upstream_from_codex_catalog_slug
 from codex_shim.discover import (
     CHATGPT_CODEX_MODELS_URL,
+    CHATGPT_DESKTOP_CODEX_CLI,
     DEFAULT_CHATGPT_CODEX_CLIENT_VERSION,
     chatgpt_codex_client_version,
     clear_detected_codex_cli_version,
@@ -44,8 +45,10 @@ def test_upstream_from_codex_catalog_slug_keeps_gpt_6_astra():
 
 
 def test_default_chatgpt_codex_client_version_meets_gpt_6_astra_minimum():
-    # Codex /models omits gpt-6-astra below client_version 0.153.0 (row.minimal_client_version).
-    assert _client_version_parts(DEFAULT_CHATGPT_CODEX_CLIENT_VERSION) >= (0, 153, 0)
+    # Codex /models omits gpt-6-astra below client_version 0.153.0, and omits
+    # gpt-6.1-sol when the shim still asks as 0.153.0. 0.162.1 is the oldest
+    # version probed live that returns gpt-6.1-sol.
+    assert _client_version_parts(DEFAULT_CHATGPT_CODEX_CLIENT_VERSION) >= (0, 162, 1)
 
 
 def test_fallback_chatgpt_passthrough_includes_gpt_6_astra():
@@ -76,6 +79,8 @@ def _stub_codex_cli(monkeypatch, *, path: str | None, stdout: str = "", stderr: 
         lambda name: path if name == "codex" else None,
     )
     if path is None:
+        monkeypatch.setattr("codex_shim.discover.os.path.isfile", lambda _path: False)
+
         def boom(*_args, **_kwargs):
             raise AssertionError("must not spawn codex when it is missing from PATH")
 
@@ -132,8 +137,39 @@ def test_chatgpt_codex_client_version_reprobes_after_cli_upgrade(monkeypatch, tm
 
 def test_chatgpt_codex_client_version_falls_back_when_codex_missing(monkeypatch):
     _stub_codex_cli(monkeypatch, path=None)
+    monkeypatch.setattr("codex_shim.discover.os.path.isfile", lambda _path: False)
     clear_detected_codex_cli_version()
     assert chatgpt_codex_client_version() == DEFAULT_CHATGPT_CODEX_CLIENT_VERSION
+
+
+def test_chatgpt_codex_client_version_uses_desktop_cli_when_path_cli_fails(monkeypatch):
+    monkeypatch.delenv("CODEX_SHIM_CHATGPT_MODELS_CLIENT_VERSION", raising=False)
+    monkeypatch.setattr(
+        "codex_shim.discover.shutil.which",
+        lambda name: "/usr/bin/codex" if name == "codex" else None,
+    )
+    monkeypatch.setattr(
+        "codex_shim.discover.os.path.isfile",
+        lambda path: path == CHATGPT_DESKTOP_CODEX_CLI,
+    )
+
+    class _Result:
+        def __init__(self, returncode, stdout="", stderr=""):
+            self.returncode = returncode
+            self.stdout = stdout
+            self.stderr = stderr
+
+    def fake_run(args, **_kwargs):
+        binary = args[0]
+        if binary == "/usr/bin/codex":
+            return _Result(127, stderr="error while loading shared libraries: libssl.so.4: cannot open shared object file")
+        if binary == CHATGPT_DESKTOP_CODEX_CLI:
+            return _Result(0, stdout="codex-cli 0.167.0\n")
+        raise AssertionError(f"unexpected binary {binary}")
+
+    monkeypatch.setattr("codex_shim.discover.subprocess.run", fake_run)
+    clear_detected_codex_cli_version()
+    assert chatgpt_codex_client_version() == "0.167.0"
 
 
 def test_chatgpt_codex_client_version_falls_back_when_version_unreadable(monkeypatch):
