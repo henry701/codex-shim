@@ -22,8 +22,8 @@ for surface in "${ITEMS[@]}"; do
         bash "${ROOT}/scripts/smoke_chatgpt_passthrough.sh" || FAILED=1
       ;;
     opencode|oc-free|zen_public)
-      echo "=== surface: OpenCode Free (${SMOKE_OPENCODE_MODEL:-oc-free-ling-3-0-flash-fin-free}) ==="
-      SMOKE_MODEL="${SMOKE_OPENCODE_MODEL:-oc-free-ling-3-0-flash-fin-free}" \
+      echo "=== surface: OpenCode Free (${SMOKE_OPENCODE_MODEL:-oc-free-deepseek-v4-1-flash-free}) ==="
+      SMOKE_MODEL="${SMOKE_OPENCODE_MODEL:-oc-free-deepseek-v4-1-flash-free}" \
         bash "${ROOT}/scripts/smoke_opencode_free.sh" || FAILED=1
       ;;
     nvidia|nemotron)
