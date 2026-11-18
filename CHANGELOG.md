@@ -28,6 +28,20 @@ and this project does not yet follow semantic versioning (pre-1.0).
 
 ### Fixed
 
+- Explicit `opencode.ai`-hosted rows (OpenCode Go `ocgo-*` from
+  `opencode-go refresh`, hand-added Zen `zen-*`) carried no
+  `reasoning_efforts`, so the Desktop catalog invented `low/medium/high`
+  (picker: Light/Medium/High) for models whose real set is different.
+  GLM-5.3 via OpenCode Go showed Light/Medium/High while OpenCode itself
+  serves Default/Low/High/Max. Discovery now copies the model's models.dev
+  `reasoning_options` effort list onto those rows at settings load (GLM-5.3
+  → low/high/max, shown as Light/High/Max; GLM-5.2 → high/max). models.dev
+  `default` is dropped wherever it appears: it means "provider default, send
+  nothing" (OpenCode's own variant filter drops it for the same reason), and
+  the ChatGPT webview has no label for it. An explicit `reasoning_efforts`
+  on a row still wins; non-opencode hosts and models.dev misses keep the
+  previous low/medium/high catalog fallback.
+
 - ChatGPT `/models` asked as Codex CLI 0.153.0 after `/usr/bin/codex` failed to
   start (`libssl.so.4` missing; the Arch package was rebuilt for OpenSSL 4
   while this system still has OpenSSL 3). That client version omits

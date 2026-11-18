@@ -164,6 +164,58 @@ def test_opencode_go_model_row_prefers_chat_and_prefixes_slug():
     }
 
 
+def test_catalog_matches_opencode_efforts_for_generated_go_rows(monkeypatch, tmp_path):
+    # `opencode-go refresh` rows carry no effort metadata; models.dev publishes the
+    # real effort list (GLM-5.3: low/high/max). The picker must show those instead
+    # of the invented low/medium/high fallback, and the default must be a listed one.
+    monkeypatch.setattr(
+        "codex_shim.discover.fetch_models_dev_catalog",
+        lambda: {
+            "opencode": {
+                "models": {
+                    "glm-5.3": {
+                        "id": "glm-5.3",
+                        "name": "GLM 5.3",
+                        "reasoning_options": [
+                            {"type": "effort", "values": ["default", "low", "high", "max"]}
+                        ],
+                    }
+                }
+            }
+        },
+        raising=False,
+    )
+    settings = tmp_path / "models.json"
+    settings.write_text(
+        json.dumps(
+            {
+                "discover": {"zen": True, "zen_public": True},
+                "models": [
+                    {
+                        "slug": "ocgo-glm-5-3",
+                        "model": "glm-5.3",
+                        "display_name": "OpenCode Go — GLM-5.3",
+                        "provider": "generic-chat-completion-api",
+                        "base_url": "https://opencode.ai/inference/go/openai/v1",
+                        "api_key": "ocgo-secret",
+                        "generated_by": "codex-shim opencode-go refresh",
+                    }
+                ],
+            }
+        )
+    )
+
+    [route] = ModelSettings(settings).load()
+    entry = catalog_entry(route)
+
+    assert [level["effort"] for level in entry["supported_reasoning_levels"]] == [
+        "low",
+        "high",
+        "max",
+    ]
+    assert entry["default_reasoning_level"] == "high"
+
+
 def test_opencode_go_model_row_uses_messages_when_chat_fails():
     row = opencode_go_model_row(
         "qwen3.7-max",

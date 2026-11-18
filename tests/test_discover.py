@@ -125,6 +125,145 @@ def test_discover_byok_models_adds_zen_public_models(monkeypatch):
     assert "zen-kimi-k2-6" not in slugs
 
 
+def _opencode_glm_models_dev_catalog() -> dict:
+    return {
+        "opencode": {
+            "models": {
+                "glm-5.3": {
+                    "id": "glm-5.3",
+                    "name": "GLM 5.3",
+                    "reasoning_options": [{"type": "effort", "values": ["default", "low", "high", "max"]}],
+                }
+            }
+        }
+    }
+
+
+def _ocgo_glm_go_model() -> ShimModel:
+    return ShimModel(
+        slug="ocgo-glm-5-3",
+        model="glm-5.3",
+        display_name="OpenCode Go — GLM-5.3",
+        provider="generic-chat-completion-api",
+        base_url="https://opencode.ai/inference/go/openai/v1",
+        api_key="ocgo-secret",
+        raw={"generated_by": "codex-shim opencode-go refresh"},
+    )
+
+
+_DISCOVERY_FLAGS_FOR_OC_TESTS = {
+    "zen": True,
+    "zen_public": False,
+    "openrouter_free": False,
+    "nvidia_integrate": False,
+    "nous": False,
+}
+
+
+def _by_slug(models: list[ShimModel], slug: str) -> ShimModel:
+    return next(model for model in models if model.slug == slug)
+
+
+def test_discover_byok_models_enriches_opencode_hosted_explicit_rows(monkeypatch):
+    # ocgo rows come from `opencode-go refresh` and carry no effort metadata;
+    # without enrichment the Desktop catalog invents low/medium/high.
+    monkeypatch.setattr(
+        "codex_shim.discover.fetch_models_dev_catalog",
+        lambda: _opencode_glm_models_dev_catalog(),
+        raising=False,
+    )
+    models = discover_byok_models(
+        [_ocgo_glm_go_model()],
+        settings_data={"discover": dict(_DISCOVERY_FLAGS_FOR_OC_TESTS)},
+    )
+
+    route = _by_slug(models, "ocgo-glm-5-3")
+    assert route.raw["reasoning_efforts"] == ["low", "high", "max"]
+
+
+def test_discover_byok_models_enriches_zen_hosted_explicit_rows(monkeypatch):
+    monkeypatch.setattr(
+        "codex_shim.discover.fetch_models_dev_catalog",
+        lambda: _opencode_glm_models_dev_catalog(),
+        raising=False,
+    )
+    zen_row = ShimModel(
+        slug="zen-glm-5-3",
+        model="glm-5.3",
+        display_name="OpenCode Zen — GLM-5.3",
+        provider="generic-chat-completion-api",
+        base_url="https://opencode.ai/inference/openai/v1",
+        api_key="zen-secret",
+    )
+    models = discover_byok_models([zen_row], settings_data={"discover": dict(_DISCOVERY_FLAGS_FOR_OC_TESTS)})
+
+    route = _by_slug(models, "zen-glm-5-3")
+    assert route.raw["reasoning_efforts"] == ["low", "high", "max"]
+
+
+def test_discover_byok_models_preserves_explicit_reasoning_efforts(monkeypatch):
+    monkeypatch.setattr(
+        "codex_shim.discover.fetch_models_dev_catalog",
+        lambda: _opencode_glm_models_dev_catalog(),
+        raising=False,
+    )
+    explicit = _ocgo_glm_go_model()
+    explicit = replace(explicit, raw={**explicit.raw, "reasoning_efforts": ["medium"]})
+    models = discover_byok_models([explicit], settings_data={"discover": dict(_DISCOVERY_FLAGS_FOR_OC_TESTS)})
+
+    assert _by_slug(models, "ocgo-glm-5-3").raw["reasoning_efforts"] == ["medium"]
+
+
+def test_discover_byok_models_skips_opencode_enrichment_for_other_hosts(monkeypatch):
+    monkeypatch.setattr(
+        "codex_shim.discover.fetch_models_dev_catalog",
+        lambda: _opencode_glm_models_dev_catalog(),
+        raising=False,
+    )
+    hosted = replace(
+        _ocgo_glm_go_model(),
+        slug="hf-glm-5-3",
+        base_url="https://router.huggingface.co/v1",
+    )
+    models = discover_byok_models([hosted], settings_data={"discover": dict(_DISCOVERY_FLAGS_FOR_OC_TESTS)})
+
+    assert "reasoning_efforts" not in _by_slug(models, "hf-glm-5-3").raw
+
+
+def test_discover_byok_models_skips_opencode_enrichment_when_discovery_disabled(monkeypatch):
+    monkeypatch.setattr(
+        "codex_shim.discover.fetch_models_dev_catalog",
+        lambda: _opencode_glm_models_dev_catalog(),
+        raising=False,
+    )
+    models = discover_byok_models([_ocgo_glm_go_model()], settings_data={"discover": False})
+
+    assert _by_slug(models, "ocgo-glm-5-3").raw == {"generated_by": "codex-shim opencode-go refresh"}
+
+
+def test_discover_byok_models_leaves_unknown_opencode_models_on_fallback(monkeypatch):
+    monkeypatch.setattr(
+        "codex_shim.discover.fetch_models_dev_catalog",
+        lambda: _opencode_glm_models_dev_catalog(),
+        raising=False,
+    )
+    models = discover_byok_models(
+        [replace(_ocgo_glm_go_model(), model="not-in-catalog")],
+        settings_data={"discover": dict(_DISCOVERY_FLAGS_FOR_OC_TESTS)},
+    )
+
+    assert "reasoning_efforts" not in _by_slug(models, "ocgo-glm-5-3").raw
+
+
+def test_efforts_from_models_dev_row_drops_default_effort():
+    from codex_shim.discover import _efforts_from_models_dev_row
+
+    efforts = _efforts_from_models_dev_row(
+        {"reasoning_options": [{"type": "effort", "values": ["default", "low", "high", "max"]}]}
+    )
+    assert efforts == ["low", "high", "max"]
+
+
 def test_discovered_zen_public_is_keyless_with_hermes_attribution(monkeypatch):
     monkeypatch.setattr(
         "codex_shim.discover.fetch_models_dev_opencode_free_model_ids",

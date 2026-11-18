@@ -544,6 +544,7 @@ Useful model fields:
 | `max_output_tokens` | Default max output when translating to Anthropic. |
 | `no_image_support` | When true, catalog advertises text-only input. |
 | `extra_headers` | Optional upstream headers merged into requests. |
+| `reasoning_efforts` | Picker effort list (e.g. `["low","high","max"]`) for this row. Omitted on an `opencode.ai`-hosted row: copied from the model's models.dev `reasoning_options`, so `ocgo-*`/`zen-*` entries match OpenCode's own picker. models.dev `default` is never advertised (it means "send no effort"). |
 
 ### OpenCode Go
 
@@ -587,6 +588,14 @@ If you need a minimal manual fallback, add one model with the same key env:
   ]
 }
 ```
+
+Reasoning effort options in the Desktop picker follow models.dev: rows on
+`opencode.ai` hosts without an explicit `reasoning_efforts` field get the
+model's models.dev effort list copied in (GLM-5.3 → `low/high/max`, shown as
+Light/High/Max — the ChatGPT webview's label for `low`). models.dev `default`
+is dropped; in OpenCode's UI that option means "send no effort" and the
+ChatGPT picker has no equivalent label. Set `reasoning_efforts` on a row to
+pin the list yourself.
 
 The current OpenCode Go model list and endpoint split are documented at
 <https://opencode.ai/docs/go/>.

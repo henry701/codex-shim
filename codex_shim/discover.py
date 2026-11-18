@@ -289,7 +289,11 @@ def _efforts_from_models_dev_row(row: dict[str, Any]) -> list[str]:
         raw = row.get(key)
         if isinstance(raw, list):
             efforts.extend(_normalize_effort(item) for item in raw)
-    return _unique_strings([item for item in efforts if item])
+    # models.dev v2 lists "default" as an effort value meaning "send nothing and
+    # let the provider pick" (OpenCode's variant.ts drops it for the same
+    # reason). It is not a real variant: the ChatGPT webview has no label for
+    # it and codex-rs would forward it upstream as a literal effort string.
+    return _unique_strings([item for item in efforts if item and item != "default"])
 
 
 _OPENAI_RESPONSES_SDK_NPM = "@ai-sdk/openai"
@@ -488,6 +492,9 @@ def discover_byok_models(
 ) -> list[ShimModel]:
     """Return explicit models plus auto-discovered entries from provider listings."""
     explicit_models = refresh_local_explicit_models(explicit_models, settings_data=settings_data)
+    explicit_models = enrich_explicit_opencode_reasoning_efforts(
+        explicit_models, settings_data=settings_data
+    )
     templates: list[DiscoverTemplate] = []
     for kind in _BUILTIN_TEMPLATE_ORDER:
         builtin = _BUILTIN_TEMPLATES.get(kind)
@@ -506,6 +513,64 @@ def discover_byok_models(
         rows = _discover_rows_for_template(template)
         discovered.extend(_rows_to_shim_models(rows, template))
     return merge_discovered_models(explicit_models, discovered)
+
+
+def _is_opencode_hosted_base_url(base_url: str) -> bool:
+    host = (urlparse(str(base_url or "")).hostname or "").lower().rstrip(".")
+    return host == "opencode.ai" or host.endswith(".opencode.ai")
+
+
+def _explicit_reasoning_efforts(model: ShimModel) -> list[str] | None:
+    raw = model.raw if isinstance(model.raw, dict) else {}
+    efforts = raw.get("reasoning_efforts")
+    if isinstance(efforts, (list, tuple)) and efforts:
+        return [str(effort) for effort in efforts]
+    return None
+
+
+def enrich_explicit_opencode_reasoning_efforts(
+    models: list[ShimModel],
+    *,
+    settings_data: dict[str, Any] | None = None,
+) -> list[ShimModel]:
+    """Fill missing ``reasoning_efforts`` on explicit opencode.ai-hosted rows.
+
+    Rows written by ``opencode-go refresh`` (and hand-added Zen/Go entries) carry no
+    effort metadata, so the Desktop catalog falls back to its invented
+    low/medium/high picker set. models.dev publishes the real per-model effort
+    list for OpenCode-hosted models; copy it onto the route so the picker matches
+    what OpenCode itself serves (minus ``default`` — the provider default, not an
+    effort). Explicit ``reasoning_efforts`` on a row always wins; non-opencode
+    hosts and models.dev misses are left untouched so the fallback stays.
+    """
+    if not (
+        discover_enabled(settings_data, "zen", has_template=True)
+        or discover_enabled(settings_data, "zen_public", has_template=True)
+    ):
+        return models
+    if not any(
+        _is_opencode_hosted_base_url(model.base_url) and _explicit_reasoning_efforts(model) is None
+        for model in models
+    ):
+        return models
+    catalog = fetch_models_dev_catalog()
+    if not isinstance(catalog, dict) or not catalog:
+        return models
+    enriched: list[ShimModel] = []
+    changed = False
+    for model in models:
+        if not _is_opencode_hosted_base_url(model.base_url) or _explicit_reasoning_efforts(model):
+            enriched.append(model)
+            continue
+        row = lookup_models_dev_row(catalog, providers=("opencode",), model_id=model.model)
+        meta = metadata_from_models_dev_row(row)
+        efforts = meta.get("reasoning_efforts")
+        if not isinstance(efforts, list) or not efforts:
+            enriched.append(model)
+            continue
+        changed = True
+        enriched.append(replace(model, raw={**model.raw, "reasoning_efforts": list(efforts)}))
+    return enriched if changed else models
 
 
 def refresh_local_explicit_models(
