@@ -40,6 +40,66 @@ def test_is_parallel_tool_calls_unsupported_error_matches_opencode_message():
     assert not is_parallel_tool_calls_unsupported_error(500, "internal error")
 
 
+def test_console_chat_compat_skips_junk_and_repairs_tool_names():
+    body = {
+        "messages": [
+            "junk-not-a-dict",
+            {"role": "assistant", "content": None},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "exec", "arguments": "{}"},
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call_1", "content": "ok"},
+        ]
+    }
+    prepared = apply_console_chat_compat(body, enabled=True)
+    messages = prepared["messages"]
+    assert all(isinstance(message, dict) for message in messages)
+    # Assistant content None flattens to "" so console hosts accept the row.
+    assert messages[0]["role"] == "assistant"
+    assert messages[0]["content"] == ""
+    # A tool message without a name gets it from the earlier tool_call.
+    tool = next(message for message in messages if message.get("role") == "tool")
+    assert tool["name"] == "exec"
+    # No user turn survives the cleanup: console needs one to continue.
+    assert messages[-1] == {"role": "user", "content": CONSOLE_CONTINUE_USER}
+
+
+def test_should_omit_parallel_tool_calls_honors_raw_support_flag():
+    route = _route(raw={"supports_parallel_tool_calls": False})
+    assert should_omit_parallel_tool_calls(route) is True
+    assert supports_parallel_tool_calls_in_catalog(route) is False
+
+
+def test_remember_flag_is_idempotent_for_identical_writes(tmp_path, monkeypatch):
+    from datetime import datetime as _datetime
+    from codex_shim.upstream_compat import _remember_flag
+
+    class _FixedDatetime:
+        @staticmethod
+        def now(tz=None):
+            return _datetime(2026, 1, 1, 12, 0, 0, tzinfo=tz)
+
+    monkeypatch.setattr("codex_shim.upstream_compat.datetime", _FixedDatetime)
+    compat = tmp_path / "compat.json"
+    route = _route()
+    assert (
+        _remember_flag(route, flag="console_chat_compat", reason="console 400", compat_path=compat)
+        is True
+    )
+    assert (
+        _remember_flag(route, flag="console_chat_compat", reason="console 400", compat_path=compat)
+        is False
+    )
+
+
 def test_apply_openai_chat_compat_strips_parallel_tool_calls_when_requested():
     body = {"model": "x", "messages": [], "parallel_tool_calls": True}
     out = apply_openai_chat_compat(body, omit_parallel_tool_calls=True)

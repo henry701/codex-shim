@@ -219,6 +219,47 @@ def test_refresh_nous_oauth_skips_without_refresh_token(tmp_path, monkeypatch):
     assert calls["n"] == 0
 
 
+def test_refresh_nous_oauth_returns_false_when_refresh_times_out(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    def fake_locked(*_args, **_kwargs):
+        raise TimeoutError("portal did not answer in time")
+
+    monkeypatch.setattr("codex_shim.nous_auth._refresh_nous_oauth_locked", fake_locked)
+    assert refresh_nous_oauth(hermes_dir=tmp_path) is False
+
+
+def test_refresh_nous_oauth_uses_shared_refresh_token_when_home_lacks_one(tmp_path, monkeypatch):
+    monkeypatch.delenv("NOUS_API_KEY", raising=False)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    (tmp_path / "auth.json").write_text(
+        json.dumps({"providers": {"nous": {"access_token": "eyJ-only"}}})
+    )
+    shared_dir = tmp_path / "shared"
+    shared_dir.mkdir(parents=True, exist_ok=True)
+    (shared_dir / "nous_auth.json").write_text(
+        json.dumps({"access_token": "eyJ-shared-old", "refresh_token": "rt_shared"})
+    )
+    captured: dict = {}
+
+    def fake_urlopen(request, timeout=None):
+        captured["headers"] = {key.lower(): value for key, value in request.header_items()}
+        captured["body"] = request.data.decode() if request.data else ""
+        return _TokenResponse(
+            {
+                "access_token": "eyJ-new",
+                "refresh_token": "rt_new",
+                "expires_in": 3600,
+                "token_type": "Bearer",
+                "scope": "inference:invoke",
+            }
+        )
+
+    monkeypatch.setattr("codex_shim.nous_auth.urlopen", fake_urlopen)
+    assert refresh_nous_oauth(hermes_dir=tmp_path) is True
+    assert captured["headers"]["x-nous-refresh-token"] == "rt_shared"
+
+
 def test_refresh_nous_oauth_leaves_tokens_on_http_error(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     _write_auth(tmp_path / "auth.json", access="eyJ-old")

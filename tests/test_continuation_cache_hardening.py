@@ -526,9 +526,20 @@ async def test_expand_retry_still_fails_falls_back_to_http(
                 "stream": True,
             }
         )
-        for _ in range(2):
+        received: list[dict[str, Any]] = []
+        for _ in range(4):
             msg = await ws.receive(timeout=2)
             assert msg.type == WSMsgType.TEXT
+            received.append(json.loads(msg.data))
+        # The expand retry forwards the upstream prev_id error, closes the turn
+        # with a synthetic response.failed (Codex ignores bare error frames),
+        # then the shim falls back to HTTP+SSE and relays that turn's events.
+        assert received[0]["type"] == "error"
+        assert received[0]["error"]["code"] == "previous_response_not_found"
+        assert received[1]["type"] == "response.failed"
+        assert received[2]["type"] == "response.created"
+        assert received[3]["type"] == "response.completed"
+        assert received[3]["response"]["id"] == "resp_http"
         await ws.close()
     finally:
         await shim_client.close()
@@ -537,5 +548,12 @@ async def test_expand_retry_still_fails_falls_back_to_http(
     assert captured_http["body"] is not None
     assert "previous_response_id" not in captured_http["body"]
     assert captured_http["body"]["input"][0] == first_input[0]
+    # Stateless replay re-mints the tool-call id; the server-minted id is gone.
+    replayed_call = captured_http["body"]["input"][1]
+    assert {key: value for key, value in replayed_call.items() if key != "id"} == {
+        key: value for key, value in tool_call.items() if key != "id"
+    }
+    assert replayed_call["id"] != tool_call["id"]
+    assert captured_http["body"]["input"][2] == tool_output
     assert len(upstream_state.received_frames) == 3
     assert len(upstream_state.handshakes) == 2

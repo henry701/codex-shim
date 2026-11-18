@@ -231,6 +231,39 @@ def test_opencode_go_model_row_uses_messages_when_chat_fails():
     assert row["opencode_go_endpoint"] == "messages"
 
 
+def test_request_json_wraps_urlerror_as_runtime_error(monkeypatch):
+    from urllib.error import URLError
+
+    from codex_shim import opencode_go
+    from codex_shim.net.retry import RetryPolicy
+
+    def fake_urlopen(*_args, **_kwargs):
+        raise URLError("connection refused")
+
+    monkeypatch.setattr(opencode_go, "urlopen", fake_urlopen)
+    monkeypatch.setattr(opencode_go, "retry_policy_from_env", lambda: RetryPolicy(attempts=1))
+
+    with pytest.raises(RuntimeError, match="Could not reach OpenCode Go"):
+        opencode_go._request_json("GET", "http://upstream.invalid/v1/models", {})
+
+
+def test_resolve_api_key_reads_cursor_key_file_and_survives_unreadable(monkeypatch, tmp_path):
+    from codex_shim import settings as settings_module
+
+    key_file = tmp_path / "cursor-api-key"
+    key_file.write_text("crsr-file-key\n")
+    monkeypatch.setattr(settings_module, "DEFAULT_CURSOR_API_KEY_FILE", key_file)
+    monkeypatch.delenv("CURSOR_API_KEY", raising=False)
+    assert settings_module._resolve_api_key("") == "crsr-file-key"
+
+    # An unreadable cursor key file (e.g. a directory) must fall back to env.
+    broken = tmp_path / "cursor-api-key-broken"
+    broken.mkdir()
+    monkeypatch.setattr(settings_module, "DEFAULT_CURSOR_API_KEY_FILE", broken)
+    monkeypatch.setenv("CURSOR_API_KEY", "crsr-env-key")
+    assert settings_module._resolve_api_key("") == "crsr-env-key"
+
+
 def test_write_opencode_go_models_replaces_previous_generated_rows(monkeypatch, tmp_path):
     monkeypatch.setenv("OPENCODE_GO_API_KEY", "ocgo-secret")
     settings = tmp_path / "models.json"

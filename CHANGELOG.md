@@ -28,6 +28,23 @@ and this project does not yet follow semantic versioning (pre-1.0).
 
 ### Fixed
 
+- Test-suite repair: the stateless-replay id-drop fixes and the WS
+  error-frame handling change landed without updating their tests, leaving
+  four suites red at HEAD. Expansion/compaction tests now expect re-minted
+  `fc_` tool ids on replay (call_id stable), the WS expand-retry test stays
+  open through the synthetic `response.failed` + HTTP fallback frames, the
+  live cursor listing became an opt-in integration smoke
+  (`CODEX_SHIM_LIVE_CURSOR=1`), and the unused `tool_call` in the WS
+  expansion test is gone (ruff F841). Removed
+  `test_live_goal_session_luna_responses_after_last_bind`, which asserted
+  user traffic since the last shim bind rather than any code property; the
+  Luna use-case is driven explicitly via
+  `scripts/smoke_chatgpt_passthrough.sh`. Coverage restored past the CI 95%
+  gate: added upstream-error passthrough tests (BYOK anthropic routes,
+  ChatGPT tool proxies), a compaction-v2 401 test, `_dump_debug_request`
+  truncation tests, and error-path tests across nous_auth,
+  upstream_compat, opencode_go, quota_dashboard, and settings.
+
 - Explicit `opencode.ai`-hosted rows (OpenCode Go `ocgo-*` from
   `opencode-go refresh`, hand-added Zen `zen-*`) carried no
   `reasoning_efforts`, so the Desktop catalog invented `low/medium/high`

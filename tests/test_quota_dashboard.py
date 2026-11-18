@@ -89,6 +89,54 @@ def test_discover_log_files_reads_gz_and_filters_by_mtime(tmp_path: Path):
     assert old not in paths
 
 
+def test_discover_log_files_filters_out_files_newer_than_until(tmp_path: Path):
+    import os
+
+    within = tmp_path / "shim.log"
+    within.write_text("[req] noop\n")
+    newer = tmp_path / "shim.log.1"
+    newer.write_text("[req] newer\n")
+    cutoff = datetime(2026, 7, 10, 12, 0, 0, tzinfo=timezone.utc).timestamp()
+    os.utime(within, (cutoff, cutoff))
+    os.utime(newer, (datetime(2026, 7, 12, tzinfo=timezone.utc).timestamp(),) * 2)
+
+    paths = discover_log_files(tmp_path, since=None, until=date(2026, 7, 10))
+    assert within in paths
+    assert newer not in paths
+
+
+def test_parse_log_files_skips_malformed_usage_lines(tmp_path: Path):
+    log = tmp_path / "shim.log"
+    log.write_text(
+        "\n".join(
+            [
+                # Non-dict usages: regex misses, literal_eval fails, or fields
+                # have the wrong shape — every row must be skipped, not crash.
+                "[upstream-headers] source=chatgpt-passthrough-ws usage=42",
+                "[upstream-headers] source=chatgpt-passthrough-ws usage={definitely not python}",
+                "[upstream-headers] source=chatgpt-passthrough-ws usage=[1, 2, 3]",
+                "[upstream-headers] source=chatgpt-passthrough-ws "
+                "usage={'input_tokens':5,'input_tokens_details':'nope',"
+                "'output_tokens':1,'output_tokens_details':3,'total_tokens':6}",
+            ]
+        )
+        + "\n"
+    )
+    report = parse_log_files([log])
+    # Only the dict row with wrong-typed detail fields survives; its details
+    # are coerced to empty dicts rather than dropped.
+    assert len(report.usage_turns) == 1
+    assert report.usage_turns[0].input_tokens == 5
+
+
+def test_main_prints_text_report(tmp_path: Path, capsys):
+    log = tmp_path / "shim.log"
+    _write_sample_log(log)
+    code = main(["--log-dir", str(tmp_path)])
+    assert code == 0
+    assert capsys.readouterr().out
+
+
 def test_parse_gzip_log_contents(tmp_path: Path):
     gz = tmp_path / "shim.log.1.gz"
     with gzip.open(gz, "wt", encoding="utf-8") as handle:

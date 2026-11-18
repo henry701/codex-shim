@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -65,7 +66,11 @@ def test_live_nvidia_integrate_ids_exclude_flux_when_opencode_installed():
     assert not any("flux" in model_id.lower() for model_id in ids)
 
 
+@pytest.mark.integration
 def test_live_cursor_chatgpt_listing_when_installed():
+    """Run only when explicitly requested: CODEX_SHIM_LIVE_CURSOR=1."""
+    if os.environ.get("CODEX_SHIM_LIVE_CURSOR") != "1":
+        pytest.skip("set CODEX_SHIM_LIVE_CURSOR=1 to run live cursor-agent listing")
     if shutil.which("cursor-agent") is None:
         pytest.skip("cursor-agent not installed")
     rows = discover_chatgpt_models_from_cursor()

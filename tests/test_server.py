@@ -592,6 +592,50 @@ async def test_alpha_search_proxies_to_chatgpt_codex_and_rewrites_catalog_slug(
     await shim_client.close()
 
 
+async def test_alpha_search_upstream_error_status_passes_through(
+    monkeypatch, tmp_path, auth_present
+):
+    class _Resp:
+        async def read(self):
+            return b'{"error":{"message":"quota exhausted"}}'
+
+        def release(self):
+            pass
+
+    class _Posted:
+        status = 429
+        error_text = '{"error":{"message":"quota exhausted"}}'
+        content_type = "application/json"
+        response = _Resp()
+
+    async def fake_post(session, url, *, json, headers, disconnect_fn=None, **kwargs):
+        return _Posted()
+
+    monkeypatch.setattr("codex_shim.server.post_chatgpt_with_retry", fake_post)
+    monkeypatch.setattr(
+        "codex_shim.server.is_chatgpt_passthrough_slug",
+        lambda slug: slug == "codex-gpt-6-luna",
+    )
+    monkeypatch.setattr(
+        "codex_shim.server.chatgpt_upstream_model",
+        lambda slug: "gpt-6-luna" if slug == "codex-gpt-6-luna" else slug,
+    )
+    shim_client = TestClient(TestServer(ShimServer(tmp_path / "settings.json").app()))
+    await shim_client.start_server()
+    resp = await shim_client.post(
+        "/v1/alpha/search",
+        json={
+            "id": "search-1",
+            "model": "codex-gpt-6-luna",
+            "commands": {"search_query": [{"q": "Cielo pagamentos"}]},
+        },
+    )
+    assert resp.status == 429
+    assert "quota exhausted" in await resp.text()
+    assert resp.headers["Content-Type"].startswith("application/json")
+    await shim_client.close()
+
+
 async def test_session_title_request_routes_byok_model_to_chatgpt_passthrough(
     monkeypatch, tmp_path, auth_present
 ):
@@ -1166,14 +1210,46 @@ async def test_chatgpt_compaction_expands_previous_response_id_from_cache(
         "name": UNKNOWN_FUNCTION_TOOL_NAME,
         "arguments": "{}",
     }
-    assert compact_input == [
-        *first_input,
-        tool_call,
+    assert compact_input[:1] == first_input
+    replayed_call = compact_input[1]
+    # Stateless replay drops server-minted item ids and re-mints tool-call ids
+    # (rustponsesapi cannot look them up); call_id stays stable.
+    assert {key: value for key, value in replayed_call.items() if key != "id"} == {
+        key: value for key, value in tool_call.items() if key != "id"
+    }
+    assert replayed_call["id"].startswith("fc_")
+    assert replayed_call["id"] != tool_call["id"]
+    assert compact_input[2:] == [
         tool_output,
         synth_call_2,
         tail_output,
         {"type": "compaction_trigger"},
     ]
+
+    await shim_client.close()
+
+
+async def test_compaction_v2_chatgpt_passthrough_requires_auth(
+    monkeypatch, tmp_path, auth_missing
+):
+    settings = tmp_path / "settings.json"
+    settings.write_text("{}")
+    shim_client = TestClient(TestServer(ShimServer(settings).app()))
+    await shim_client.start_server()
+
+    resp = await shim_client.post(
+        "/v1/responses",
+        json={
+            "model": "codex-gpt-5-5",
+            "input": [
+                {"type": "message", "role": "user", "content": "summarize"},
+                {"type": "compaction_trigger"},
+            ],
+        },
+        headers={"session-id": "compact-no-auth"},
+    )
+    assert resp.status == 401
+    assert "auth.json" in await resp.text()
 
     await shim_client.close()
 
@@ -1239,7 +1315,18 @@ async def test_chatgpt_passthrough_expands_from_disk_after_restart(
         headers=session_headers,
     )
     assert second.status == 200
-    assert captured[1]["input"] == [*first_input, tool_call, tool_output]
+    sent_input = captured[1]["input"]
+    assert sent_input[0] == first_input[0]
+    replayed_call = sent_input[1]
+    # Stateless replay drops server-minted item ids and re-mints tool-call ids
+    # (rustponsesapi cannot look them up); call_id stays stable.
+    assert {key: value for key, value in replayed_call.items() if key != "id"} == {
+        key: value for key, value in tool_call.items() if key != "id"
+    }
+    assert replayed_call["id"].startswith("fc_")
+    assert replayed_call["id"] != tool_call["id"]
+    assert sent_input[2] == tool_output
+    assert len(sent_input) == 3
     await second_client.close()
 
 
@@ -1580,13 +1667,6 @@ async def test_chatgpt_passthrough_websocket_expands_previous_response_id(monkey
     monkeypatch.setenv("CODEX_SHIM_WS_PASSTHROUGH", "0")
     captured = []
     first_input = [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "run"}]}]
-    tool_call = {
-        "type": "function_call",
-        "id": "fc_1",
-        "call_id": "call_1",
-        "name": "exec_command",
-        "arguments": "{\"cmd\":\"printf ok\"}",
-    }
     tool_output = {"type": "function_call_output", "call_id": "call_1", "output": "ok"}
 
     class FakeUpstream:
@@ -5421,6 +5501,122 @@ async def test_chat_routes_to_anthropic(tmp_path):
     await upstream_client.close()
 
 
+async def test_anthropic_messages_upstream_error_passes_through(tmp_path):
+    async def messages(request):
+        return web.json_response(
+            {"type": "error", "error": {"type": "invalid_request_error", "message": "bad input"}},
+            status=400,
+        )
+
+    upstream = web.Application()
+    upstream.router.add_post("/v1/messages", messages)
+    upstream_client = TestClient(TestServer(upstream))
+    await upstream_client.start_server()
+
+    settings = tmp_path / "settings.json"
+    settings.write_text(
+        json.dumps(
+            {
+                "customModels": [
+                    {
+                        "model": "claude-real",
+                        "displayName": "Claude Real",
+                        "provider": "anthropic",
+                        "baseUrl": str(upstream_client.make_url("")),
+                        "apiKey": "secret",
+                    }
+                ]
+            }
+        )
+    )
+    shim_client = TestClient(TestServer(ShimServer(settings).app()))
+    await shim_client.start_server()
+
+    resp = await shim_client.post(
+        "/v1/messages",
+        json={
+            "model": "claude-real",
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 16,
+        },
+    )
+    assert resp.status == 400
+    payload = await resp.json()
+    assert payload["error"]["type"] == "invalid_request_error"
+
+    await shim_client.close()
+    await upstream_client.close()
+
+
+async def test_responses_anthropic_route_upstream_error_passes_through(tmp_path):
+    async def messages(request):
+        return web.json_response(
+            {"type": "error", "error": {"type": "invalid_request_error", "message": "bad input"}},
+            status=400,
+        )
+
+    upstream = web.Application()
+    upstream.router.add_post("/v1/messages", messages)
+    upstream_client = TestClient(TestServer(upstream))
+    await upstream_client.start_server()
+
+    settings = tmp_path / "settings.json"
+    settings.write_text(
+        json.dumps(
+            {
+                "customModels": [
+                    {
+                        "model": "claude-real",
+                        "displayName": "Claude Real",
+                        "provider": "anthropic",
+                        "baseUrl": str(upstream_client.make_url("")),
+                        "apiKey": "secret",
+                    }
+                ]
+            }
+        )
+    )
+    shim_client = TestClient(TestServer(ShimServer(settings).app()))
+    await shim_client.start_server()
+
+    resp = await shim_client.post(
+        "/v1/responses",
+        json={
+            "model": "claude-real",
+            "input": [{"type": "message", "role": "user", "content": "hi"}],
+        },
+    )
+    assert resp.status == 400
+    body = await resp.text()
+    assert "invalid_request_error" in body or "bad input" in body
+
+    stream = await shim_client.post(
+        "/v1/responses",
+        json={
+            "model": "claude-real",
+            "stream": True,
+            "input": [{"type": "message", "role": "user", "content": "hi"}],
+        },
+    )
+    assert stream.status == 200
+    text = await stream.text()
+    events = []
+    for line in text.splitlines():
+        if line.startswith("data:"):
+            raw = line[len("data:") :].strip()
+            if raw and raw != "[DONE]":
+                events.append(json.loads(raw))
+    failed = [event for event in events if event.get("type") == "response.failed"]
+    assert failed, events
+    assert any(
+        event.get("type") == "error" and event.get("code") == "invalid_request_error"
+        for event in events
+    )
+
+    await shim_client.close()
+    await upstream_client.close()
+
+
 async def test_anthropic_messages_routes_to_openai_chat(tmp_path):
     captured = {}
 
@@ -6454,3 +6650,41 @@ async def test_byok_chat_completions_still_uses_http_bridge(tmp_path, monkeypatc
     finally:
         await shim_client.close()
         await upstream_client.close()
+
+
+def test_dump_debug_request_truncates_oversized_bodies(monkeypatch, tmp_path):
+    from codex_shim import server as server_module
+
+    debug_dir = tmp_path / "debug"
+    monkeypatch.setattr(server_module, "DEBUG_DIR", debug_dir)
+    big_message = {"role": "user", "content": "x" * 2_100_000}
+    body = {"messages": [big_message, {"role": "user", "content": "second"}], "tools": [{"type": "function"}]}
+
+    server_module._dump_debug_request("big-slug", "http://upstream/v1/chat", body)
+
+    dump = json.loads((debug_dir / "last_request.json").read_text())
+    assert dump["_truncated"] is True
+    assert dump["slug"] == "big-slug"
+    assert dump["message_count"] == 2
+    assert dump["tool_count"] == 1
+    assert dump["last_3_messages"] == [big_message, {"role": "user", "content": "second"}]
+
+
+def test_dump_debug_request_writes_small_bodies_and_swallows_errors(monkeypatch, tmp_path):
+    from codex_shim import server as server_module
+
+    debug_dir = tmp_path / "debug"
+    monkeypatch.setattr(server_module, "DEBUG_DIR", debug_dir)
+    body = {"messages": [{"role": "user", "content": "hi"}]}
+
+    server_module._dump_debug_request("small-slug", "http://upstream/v1/chat", body)
+
+    dump = json.loads((debug_dir / "last_request.json").read_text())
+    assert dump["slug"] == "small-slug"
+    assert dump["body"] == body
+
+    # A DEBUG_DIR that cannot be created must not raise into the request path.
+    blocker = tmp_path / "blocker"
+    blocker.write_text("i am a file")
+    monkeypatch.setattr(server_module, "DEBUG_DIR", blocker / "sub")
+    server_module._dump_debug_request("oops-slug", "http://upstream/v1/chat", body)
