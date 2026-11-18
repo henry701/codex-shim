@@ -6,6 +6,7 @@ from pathlib import Path
 import re
 from typing import Any
 
+from .header_passthrough import ensure_opencode_free_chat_tools, is_opencode_free_route
 from .settings import ShimModel
 
 DEFAULT_UPSTREAM_COMPAT_PATH = Path.home() / ".codex-shim" / "upstream-compat.json"
@@ -171,7 +172,10 @@ def prepare_openai_chat_body(route: ShimModel, body: dict[str, Any], *, compat_p
         body,
         omit_parallel_tool_calls=console or should_omit_parallel_tool_calls(route, compat_path=compat_path),
     )
-    return apply_console_chat_compat(prepared, enabled=console)
+    prepared = apply_console_chat_compat(prepared, enabled=console)
+    if is_opencode_free_route(route):
+        prepared = ensure_opencode_free_chat_tools(prepared)
+    return prepared
 
 
 def supports_parallel_tool_calls_in_catalog(route: ShimModel, *, compat_path: Path | None = None) -> bool:

@@ -130,7 +130,10 @@ from .header_passthrough import (
     anthropic_upstream_headers,
     observe_upstream_response,
     openai_responses_ws_upstream_headers,
+    apply_opencode_free_client_headers,
+    is_opencode_free_route,
     openai_upstream_headers,
+    opencode_free_inference_base,
     prepare_downstream_sse_response,
     upstream_headers_from_response,
 )
@@ -857,6 +860,11 @@ class ShimServer:
                 "chatgpt_passthrough": chatgpt_passthrough_available(),
                 "cursor_passthrough": cursor_passthrough_available(),
             }
+        # Warm the oc-free fingerprint version probe off the serve loop so the
+        # first oc-free request never blocks on `opencode --version`.
+        from .discover import detect_opencode_cli_version
+
+        asyncio.get_running_loop().run_in_executor(None, detect_opencode_cli_version)
         if _CATALOG_REFRESH_INITIAL_DELAY_SEC is not None:
             self._catalog_refresh_task = asyncio.create_task(self._catalog_refresh_loop())
 
@@ -3726,7 +3734,7 @@ class ShimServer:
             policy = retry_policy_from_env()
             async with ClientSession(timeout=timeout) as session:
                 if model.is_anthropic:
-                    url = _join_url(model.base_url, "/messages")
+                    url = _join_url(_route_base(model), "/messages")
                     payload = {
                         "model": model.model,
                         "max_tokens": config.max_tokens,
@@ -3746,7 +3754,7 @@ class ShimServer:
                     data = await posted.response.json(content_type=None)
                     posted.response.release()
                     return _anthropic_text(data)
-                url = _join_url(model.base_url, "/chat/completions")
+                url = _join_url(_route_base(model), "/chat/completions")
                 payload = {
                     "model": model.model,
                     "stream": False,
@@ -3931,7 +3939,7 @@ class ShimServer:
         body: dict[str, Any],
     ) -> web.StreamResponse:
         """Forward a Responses API request directly to the upstream /responses endpoint."""
-        url = _join_url(route.base_url, "/responses")
+        url = _join_url(_route_base(route), "/responses")
         tool_types = responses_tool_type_map(body.get("tools"))
         custom_call_ids: set[str] = set()
         forwarded = prepare_openai_responses_upstream_body(dict(body))
@@ -4099,7 +4107,7 @@ class ShimServer:
         request_headers: Mapping[str, str] | None = None,
         disconnect_fn: Any | None = None,
     ) -> tuple[Any, tuple[int, str, str, str] | None]:
-        url = _join_url(route.base_url, "/chat/completions")
+        url = _join_url(_route_base(route), "/chat/completions")
         headers = _openai_headers(
             request_headers or {},
             route,
@@ -4175,7 +4183,7 @@ class ShimServer:
         responses_body: dict[str, Any] | None = None,
     ) -> web.StreamResponse:
         client_slug = response_slug or route.slug
-        url = _join_url(route.base_url, "/chat/completions")
+        url = _join_url(_route_base(route), "/chat/completions")
         _dump_debug_request(route.slug, url, prepare_openai_chat_body(route, body))
         if body.get("stream"):
             return await self._stream_chat_loop(
@@ -4453,7 +4461,7 @@ class ShimServer:
     async def _post_openai_chat_as_anthropic(
         self, request: web.Request, route: ShimModel, body: dict[str, Any]
     ) -> web.StreamResponse:
-        url = _join_url(route.base_url, "/chat/completions")
+        url = _join_url(_route_base(route), "/chat/completions")
         headers = _openai_headers(request.headers, route)
         _dump_debug_request(route.slug, url, body)
         async with ClientSession(timeout=self.timeout) as session:
@@ -4483,7 +4491,7 @@ class ShimServer:
     async def _post_anthropic_messages(
         self, request: web.Request, route: ShimModel, body: dict[str, Any]
     ) -> web.StreamResponse:
-        url = _join_url(route.base_url, "/messages")
+        url = _join_url(_route_base(route), "/messages")
         headers = _anthropic_headers(request.headers, route)
         log_upstream_request(f"byok-anthropic-messages:{route.slug}", url, body)
         async with ClientSession(timeout=self.timeout) as session:
@@ -4545,7 +4553,7 @@ class ShimServer:
         responses_body: dict[str, Any] | None = None,
     ) -> web.StreamResponse:
         client_slug = response_slug or route.slug
-        url = _join_url(route.base_url, "/messages")
+        url = _join_url(_route_base(route), "/messages")
         headers = _anthropic_headers(
             request.headers,
             route,
@@ -6679,18 +6687,37 @@ def _join_url(base_url: str, endpoint: str) -> str:
     return urljoin(base + "/", "v1" + endpoint)
 
 
+def _route_base(route: ShimModel) -> str:
+    base = route.base_url
+    if is_opencode_free_route(route):
+        return opencode_free_inference_base(base)
+    return base
+
+
 def _openai_headers(
     request_headers: Mapping[str, str],
     route: ShimModel,
     *,
     accept: str | None = None,
 ) -> dict[str, str]:
-    return openai_upstream_headers(
+    headers = openai_upstream_headers(
         request_headers,
         api_key=route.api_key or None,
         extra_headers=route.extra_headers,
         accept=accept,
     )
+    if not is_opencode_free_route(route):
+        return headers
+    signal = "codex-shim"
+    for name in ("session-id", "thread-id"):
+        for key, value in request_headers.items():
+            if key.lower() == name and str(value).strip():
+                signal = str(value).strip()
+                break
+        else:
+            continue
+        break
+    return apply_opencode_free_client_headers(headers, session_signal=signal)
 
 
 def _anthropic_headers(

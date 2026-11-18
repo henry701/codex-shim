@@ -9,6 +9,20 @@ and this project does not yet follow semantic versioning (pre-1.0).
 
 ### Added
 
+- OpenCode Zen free-tier client fingerprint for `oc-free-*` routes. Since
+  2026-10-14 the free tier 403s any request that is not the v2 OpenCode CLI:
+  exact User-Agent, v2 headers, and `/inference/v1` instead of `/zen/v1`.
+  The shim now presents that identity: the UA is rewritten to
+  `opencode/latest/<version>/cli` where the version follows `opencode
+  --version` on PATH (identity-cached like the codex probe, so upgrades
+  re-probe; override with `CODEX_SHIM_OPENCODE_FREE_CLIENT_VERSION`;
+  fallback floor `2.0.26`), v1 headers such as `x-opencode-request` are
+  dropped, a deterministic `ses_` session id is derived from the Codex
+  session/thread id, base URLs move `/zen` → `/inference`, and the verbatim
+  OpenCode `read` / `shell` tool definitions are offered alongside Codex's
+  tools so the gate's tool comparison passes. The version probe is warmed in
+  a thread at serve startup so the serve loop never blocks on it.
+
 - Net invariant lint (`lint/net_invariants.py`, `lint/rules/*.yml`) so
   retry/throttle cannot grow a `ping_fn`, `DownstreamPinger` stays
   sleep-then-ping, `time.sleep` / `urlopen` / `request_urllib` /

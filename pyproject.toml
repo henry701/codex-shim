@@ -51,6 +51,7 @@ asyncio_mode = "auto"
 markers = [
   "enable_model_discovery: allow live provider discovery during tests",
   "nous_portal: exercise Nous Portal credential resolution and discovery",
+  "opencode_cli_version: run the real opencode CLI version probe (stubbed out by default)",
   "integration: live external tool tests (cursor-agent, tmux); skipped in CI by default",
 ]
 

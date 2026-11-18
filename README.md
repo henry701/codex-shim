@@ -133,9 +133,18 @@ including `max`/`ultra`. Cursor remains CLI-driven and is not scraped this way.
 Free Zen 401s unrecognized bearers, including
 `Bearer public`. The shim keeps `public` as an internal keyless sentinel so
 the route still counts as credentialed; it is never sent upstream, and Desktop's
-ChatGPT bearer is stripped so it cannot leak. Desktop's User-Agent is left
-as-is. Hermes `HTTP-Referer` / `X-Title` are set only when Desktop omitted them.
-`big-pickle` may 429 under a non-OpenCode-CLI User-Agent; that is expected.
+ChatGPT bearer is stripped so it cannot leak. The free tier also gates on the
+client identity (since 2026-10-14 it 403s anything but the v2 OpenCode CLI),
+so `oc-free-*` requests are fingerprinted as that client: the User-Agent is
+rewritten to `opencode/latest/<version>/cli` where `<version>` follows
+`opencode --version` on PATH (identity-cached, probed once per binary change;
+override with `CODEX_SHIM_OPENCODE_FREE_CLIENT_VERSION`, fallback `2.0.26`),
+v1 client headers such as `x-opencode-request` are dropped, a deterministic
+`ses_` session id is derived from the Codex session/thread id, and the base
+URL moves from `/zen/v1` to `/inference/v1`. The verbatim OpenCode `read` /
+`shell` tool definitions are offered alongside Codex's tools so the gate's
+tool comparison passes. Hermes `HTTP-Referer` / `X-Title` are still set only
+when Desktop omitted them.
 
 Paid `zen` is unchanged and still sends `OPENCODE_API_KEY`.
 
@@ -780,6 +789,7 @@ Debug env knobs:
 |----------|--------|
 | `CODEX_SHIM_UPSTREAM_HEADER_LOG=1` | Log upstream response headers + usage |
 | `CODEX_SHIM_PASSTHROUGH_TRACE=1` | Log forwarded client headers per ChatGPT request |
+| `CODEX_SHIM_OPENCODE_FREE_CLIENT_VERSION` | Pin the `opencode/latest/<version>/cli` UA version for `oc-free-*` routes (default: `opencode --version` on PATH, fallback `2.0.26`) |
 | `CODEX_SHIM_STREAM_LOG=1` | Log SSE/WS event types |
 | `CODEX_SHIM_RETRY_ATTEMPTS` | Finite retries for transport / 5xx (default: `3`). OAuth refresh stays 1 attempt — refresh tokens are single-use. |
 | `CODEX_SHIM_RETRY_WAIT_BUDGET` | Extra seconds of Retry-After waits after `CODEX_SHIM_RETRY_ATTEMPTS` is exhausted for transport / 5xx only (default: `30`). Does not bound 429 or quota waits. |

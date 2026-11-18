@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import re
+
 from multidict import CIMultiDict
 
 from codex_shim.header_passthrough import (
@@ -217,6 +219,100 @@ def test_openai_upstream_headers_public_keeps_desktop_referer():
     assert merged["User-Agent"] == "ChatGPT/Desktop"
     assert merged["HTTP-Referer"] == "https://chatgpt.com/"
     assert merged["X-Title"] == "Hermes Agent"
+
+
+def test_opencode_free_headers_replace_desktop_identity():
+    from types import SimpleNamespace
+
+    from codex_shim.header_passthrough import (
+        OPENCODE_FREE_USER_AGENT,
+        apply_opencode_free_client_headers,
+        ensure_opencode_free_chat_tools,
+        is_opencode_free_route,
+        opencode_free_inference_base,
+        opencode_free_session_id,
+    )
+    from codex_shim.server import _openai_headers, _route_base
+
+    route = SimpleNamespace(
+        slug="oc-free-beam-free",
+        model="beam-free",
+        base_url="https://opencode.ai/zen/v1",
+        api_key="public",
+        extra_headers={"HTTP-Referer": "https://hermes-agent.nousresearch.com", "X-Title": "Hermes Agent"},
+    )
+    assert is_opencode_free_route(route)
+    assert not is_opencode_free_route(
+        SimpleNamespace(slug="zen-glm", model="glm", base_url="https://opencode.ai/zen/go/v1", api_key="sk", extra_headers={})
+    )
+    assert opencode_free_inference_base(route.base_url) == "https://opencode.ai/inference/v1"
+    assert opencode_free_inference_base("https://opencode.ai/zen/go/v1") == "https://opencode.ai/zen/go/v1"
+    assert _route_base(route) == "https://opencode.ai/inference/v1"
+
+    merged = _openai_headers(
+        {
+            "User-Agent": "codex_cli_rs/0.160.0",
+            "Authorization": "Bearer chatgpt-token",
+            "x-opencode-request": "msg_old",
+            "x-session-affinity": "desktop-session",
+            "session-id": "01a12c76-thread",
+        },
+        route,
+        accept="text/event-stream",
+    )
+    assert merged["User-Agent"] == OPENCODE_FREE_USER_AGENT
+    assert merged["Authorization"] == "Bearer public"
+    assert merged["x-opencode-client"] == "cli"
+    assert merged["x-opencode-project"] == "global"
+    session = merged["x-opencode-session"]
+    assert session == merged["x-opencode-session-id"] == merged["x-session-affinity"] == merged["x-session-id"]
+    assert session == opencode_free_session_id("01a12c76-thread")
+    assert re.fullmatch(r"ses_[0-9a-f]{9}f[c-f][0-9a-f][0-9A-Za-z]{14}", session)
+    assert not any(key.lower() == "x-opencode-request" for key in merged)
+    again = apply_opencode_free_client_headers({}, session_signal="01a12c76-thread")
+    assert again["x-opencode-session"] == session
+
+    body = ensure_opencode_free_chat_tools(
+        {"model": "beam-free", "tools": [{"type": "function", "function": {"name": "exec_command"}}], "tool_choice": "none"}
+    )
+    names = [tool["function"]["name"] for tool in body["tools"]]
+    assert names == ["exec_command", "read", "shell"]
+    assert "tool_choice" not in body
+    assert body["tools"][1]["function"]["parameters"]["required"] == ["path"]
+    assert body["tools"][2]["function"]["parameters"]["required"] == ["command"]
+
+
+def test_opencode_free_user_agent_tracks_installed_cli_version(monkeypatch):
+    from codex_shim.header_passthrough import opencode_free_user_agent
+
+    monkeypatch.delenv("CODEX_SHIM_OPENCODE_FREE_CLIENT_VERSION", raising=False)
+    monkeypatch.setattr(
+        "codex_shim.discover.detect_opencode_cli_version", lambda **_kwargs: "2.3.0"
+    )
+    assert opencode_free_user_agent() == "opencode/latest/2.3.0/cli"
+
+
+def test_opencode_free_user_agent_env_override_wins(monkeypatch):
+    from codex_shim.header_passthrough import opencode_free_user_agent
+
+    monkeypatch.setenv("CODEX_SHIM_OPENCODE_FREE_CLIENT_VERSION", "9.9.9")
+    monkeypatch.setattr(
+        "codex_shim.discover.detect_opencode_cli_version", lambda **_kwargs: "2.3.0"
+    )
+    assert opencode_free_user_agent() == "opencode/latest/9.9.9/cli"
+
+
+def test_opencode_free_user_agent_falls_back_without_cli(monkeypatch):
+    from codex_shim.header_passthrough import (
+        OPENCODE_FREE_USER_AGENT,
+        opencode_free_user_agent,
+    )
+
+    monkeypatch.delenv("CODEX_SHIM_OPENCODE_FREE_CLIENT_VERSION", raising=False)
+    monkeypatch.setattr(
+        "codex_shim.discover.detect_opencode_cli_version", lambda **_kwargs: None
+    )
+    assert opencode_free_user_agent() == OPENCODE_FREE_USER_AGENT
 
 
 def test_log_upstream_response_headers_includes_usage(monkeypatch, capsys):

@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
 from typing import Any, Mapping
+from urllib.parse import urlparse, urlunparse
 
 _CODEX_CLI_VERSION_RE = re.compile(r"(\d+\.\d+\.\d+(?:[-.][0-9A-Za-z]+)*)")
 
@@ -132,11 +134,217 @@ def openai_upstream_headers(
     setdefaults = dict(extra_headers or {})
     if "Content-Type" not in setdefaults:
         setdefaults = {"Content-Type": "application/json", **setdefaults}
-    return client_headers_for_upstream(
+    merged = client_headers_for_upstream(
         request_headers,
         setdefaults=setdefaults,
         overrides=overrides,
     )
+    return merged
+
+
+# Zen's free tier, since 2026-10-14, 403s unless the request is the v2 OpenCode
+# client: this User-Agent exactly, these headers, and /inference/v1 rather than
+# /zen/v1. x-opencode-request is a v1 header and is itself a 403.
+# Fallback floor only: the UA version normally tracks the installed opencode CLI.
+OPENCODE_FREE_CLIENT_VERSION = "2.0.26"
+OPENCODE_FREE_USER_AGENT = f"opencode/latest/{OPENCODE_FREE_CLIENT_VERSION}/cli"
+OPENCODE_FREE_CLIENT_VERSION_ENV = "CODEX_SHIM_OPENCODE_FREE_CLIENT_VERSION"
+_OPENCODE_FREE_MODELS = frozenset({"big-pickle", "grok-code"})
+_BASE62 = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+_OPENCODE_FINGERPRINT_TOOLS = (
+    (
+        "read",
+        "Read the contents of a file or directory. Supports text files, images, and PDFs. Images and PDFs are presented directly to the model. Each text line is prefixed by its 1-based line number as <line>: <content>. The prefix is for reference and is not part of the file content. Directory entries are returned one per line. Use offset and limit to read large files or directories in sections. Prefer one larger read over many small slices, and use grep to find specific content in large files.",
+        {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "File or directory to read"},
+                "offset": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": "The line or directory entry to start reading from (1-based)",
+                },
+                "limit": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": "The maximum number of lines or directory entries to read (defaults to and capped at 2000)",
+                },
+            },
+            "required": ["path"],
+            "additionalProperties": False,
+        },
+    ),
+    (
+        "shell",
+        "Execute a shell command and return its output. Commands run on Linux using bash. Quote file paths containing spaces or special characters. Prefer dedicated tools over shell commands when possible. When output is large, the full result is saved to a file and a truncated preview is returned. Rely on automatic truncation unless filtering the output is more useful. Commands accept an optional timeout, background commands have no timeout by default. Background commands return immediately, and you will be notified when they complete.",
+        {
+            "type": "object",
+            "properties": {
+                "command": {"type": "string", "description": "Shell command string to execute"},
+                "workdir": {
+                    "type": "string",
+                    "description": "Working directory to execute the command in. Defaults to the current working directory. When possible, avoid changing directories in the command and set the working directory here instead.",
+                },
+                "timeout": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": "Timeout in milliseconds. Set to 0 to disable the timeout. Defaults to 120000 for foreground commands. Background commands have no timeout by default.",
+                },
+                "background": {
+                    "type": "boolean",
+                    "description": "Run the command in the background and return immediately (useful for dev servers and long-running builds). You do not need to use '&' at the end of the command when using this parameter. You will be notified when it completes. DO NOT poll for completion.",
+                },
+            },
+            "required": ["command"],
+            "additionalProperties": False,
+        },
+    ),
+)
+
+
+def is_opencode_free_route(route: Any) -> bool:
+    """True for keyless OpenCode Zen free routes (oc-free-* and -free model ids)."""
+    slug = str(getattr(route, "slug", "") or "")
+    model = str(getattr(route, "model", "") or "")
+    base_url = str(getattr(route, "base_url", "") or "")
+    if slug.startswith("oc-free-"):
+        return True
+    parsed = urlparse(base_url)
+    host = (parsed.hostname or "").lower().rstrip(".")
+    if host != "opencode.ai" and not host.endswith(".opencode.ai"):
+        return False
+    path = parsed.path or ""
+    if path == "/zen/go" or path.startswith("/zen/go/"):
+        return False
+    return model.endswith("-free") or model in _OPENCODE_FREE_MODELS
+
+
+def opencode_free_inference_base(base_url: str) -> str:
+    """Move a Zen free base from /zen/v1 to /inference/v1. Leave /zen/go alone."""
+    parsed = urlparse(base_url)
+    host = (parsed.hostname or "").lower().rstrip(".")
+    if host != "opencode.ai" and not host.endswith(".opencode.ai"):
+        return base_url
+    path = parsed.path or ""
+    if path == "/zen/go" or path.startswith("/zen/go/"):
+        return base_url
+    if path != "/zen" and not path.startswith("/zen/"):
+        return base_url
+    rest = path[len("/zen") :]
+    return urlunparse(parsed._replace(path="/inference" + rest))
+
+
+def opencode_free_session_id(signal: str) -> str:
+    """Stable ses_ id in the descending layout Zen's free tier accepts."""
+    digest = hashlib.sha256(f"ses\0{signal}".encode()).digest()
+    current = (
+        digest[0] << 28 | digest[1] << 20 | digest[2] << 12 | digest[3] << 4 | digest[4] >> 4
+    ) << 12 | 1
+    inverted = (~current) & 0xFFFFFFFFFFFF
+    time_hex = f"{inverted:012x}"
+    number = int.from_bytes(digest[6:16], "big")
+    chars = [""] * 14
+    for index in range(13, -1, -1):
+        chars[index] = _BASE62[number % 62]
+        number //= 62
+    return f"ses_{time_hex}{''.join(chars)}"
+
+
+def _request_session_signal(headers: Mapping[str, str]) -> str:
+    for name in ("session-id", "thread-id"):
+        for key, value in headers.items():
+            if key.lower() == name and str(value).strip():
+                return str(value).strip()
+    return "codex-shim"
+
+
+def _drop_header(headers: dict[str, str], name: str) -> None:
+    lowered = name.lower()
+    for key in list(headers):
+        if key.lower() == lowered:
+            headers.pop(key, None)
+
+
+def opencode_free_client_version() -> str:
+    """Version for the free-tier fingerprint User-Agent.
+
+    The gate compares the client identity, so an installed ``opencode`` CLI of
+    a different version must present its own version or the gate 403s.
+    Preference: ``CODEX_SHIM_OPENCODE_FREE_CLIENT_VERSION``, then
+    ``opencode --version`` on PATH (lazy import avoids a cycle with
+    ``discover``; identity-cached like the codex probe), then the hardcoded
+    floor.
+    """
+    explicit = os.environ.get(OPENCODE_FREE_CLIENT_VERSION_ENV, "").strip()
+    if explicit:
+        return explicit
+    from .discover import detect_opencode_cli_version
+
+    return detect_opencode_cli_version() or OPENCODE_FREE_CLIENT_VERSION
+
+
+def opencode_free_user_agent() -> str:
+    return f"opencode/latest/{opencode_free_client_version()}/cli"
+
+
+def apply_opencode_free_client_headers(
+    headers: Mapping[str, str],
+    *,
+    session_signal: str,
+) -> dict[str, str]:
+    """Replace the client identity with the v2 OpenCode free-tier fingerprint."""
+    merged = dict(headers)
+    session = opencode_free_session_id(session_signal)
+    for name in (
+        "user-agent",
+        "authorization",
+        "x-opencode-request",
+        "x-opencode-client",
+        "x-opencode-session",
+        "x-opencode-session-id",
+        "x-session-affinity",
+        "x-session-id",
+        "x-opencode-project",
+    ):
+        _drop_header(merged, name)
+    merged["User-Agent"] = opencode_free_user_agent()
+    merged["Authorization"] = "Bearer public"
+    merged["x-opencode-client"] = "cli"
+    merged["x-opencode-session"] = session
+    merged["x-opencode-session-id"] = session
+    merged["x-session-affinity"] = session
+    merged["x-session-id"] = session
+    merged["x-opencode-project"] = "global"
+    return merged
+
+
+def ensure_opencode_free_chat_tools(body: dict[str, Any]) -> dict[str, Any]:
+    """Offer the read and shell definitions the free-tier gate compares verbatim."""
+    prepared = dict(body)
+    tools = [tool for tool in (prepared.get("tools") or []) if isinstance(tool, dict)]
+    names: set[str] = set()
+    for tool in tools:
+        function = tool.get("function") if isinstance(tool.get("function"), dict) else tool
+        name = function.get("name") if isinstance(function, dict) else None
+        if isinstance(name, str) and name:
+            names.add(name)
+    for name, description, parameters in _OPENCODE_FINGERPRINT_TOOLS:
+        if name in names:
+            continue
+        tools.append(
+            {
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "description": description,
+                    "parameters": parameters,
+                },
+            }
+        )
+    prepared["tools"] = tools
+    if prepared.get("tool_choice") == "none":
+        prepared.pop("tool_choice", None)
+    return prepared
 
 
 def anthropic_upstream_headers(

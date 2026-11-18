@@ -10,7 +10,7 @@ import shutil
 import subprocess
 import threading
 import time
-from typing import Any
+from typing import Any, Callable
 from datetime import datetime, timezone
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode, urlparse
@@ -38,8 +38,9 @@ DEFAULT_CHATGPT_CODEX_CLIENT_VERSION = "0.167.0"
 CHATGPT_DESKTOP_CODEX_CLI = "/usr/lib/chatgpt/resources/codex"
 _CODEX_CLI_VERSION_RE = re.compile(r"(\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.]+)?)")
 _UNSET = object()
-_CodexBinaryIdentity = tuple[str | None, tuple[int, int] | None]
-_detected_codex_cli_version: tuple[tuple[_CodexBinaryIdentity, ...], str | None] | object = _UNSET
+_CliBinaryIdentity = tuple[str | None, tuple[int, int] | None]
+_detected_codex_cli_version: tuple[tuple[_CliBinaryIdentity, ...], str | None] | object = _UNSET
+_detected_opencode_cli_version: tuple[tuple[_CliBinaryIdentity, ...], str | None] | object = _UNSET
 CODEX_OAUTH_TOKEN_URL = "https://auth.openai.com/oauth/token"
 CODEX_OAUTH_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
 DISCOVER_INDEX_BASE = 10_000
@@ -790,14 +791,23 @@ def refresh_codex_auth_tokens(auth_path: Any | None = None, *, timeout: float = 
     return True
 
 
-def parse_codex_cli_version(output: str) -> str | None:
-    """Extract ``major.minor.patch`` (optional pre-release) from ``codex --version`` text."""
+def _parse_cli_version(output: str, pattern: re.Pattern[str]) -> str | None:
     text = str(output or "").strip()
     if not text:
         return None
     first = text.splitlines()[0]
-    match = _CODEX_CLI_VERSION_RE.search(first) or _CODEX_CLI_VERSION_RE.search(text)
+    match = pattern.search(first) or pattern.search(text)
     return match.group(1) if match else None
+
+
+def parse_codex_cli_version(output: str) -> str | None:
+    """Extract ``major.minor.patch`` (optional pre-release) from ``codex --version`` text."""
+    return _parse_cli_version(output, _CODEX_CLI_VERSION_RE)
+
+
+def parse_opencode_cli_version(output: str) -> str | None:
+    """Extract ``major.minor.patch`` (optional pre-release) from ``opencode --version`` text."""
+    return _parse_cli_version(output, _CODEX_CLI_VERSION_RE)
 
 
 def clear_detected_codex_cli_version() -> None:
@@ -805,8 +815,13 @@ def clear_detected_codex_cli_version() -> None:
     _detected_codex_cli_version = _UNSET
 
 
-def _codex_binary_identity(binary: str | None) -> tuple[str | None, tuple[int, int] | None]:
-    """Cache key for ``codex`` on PATH: resolved path plus mtime/size, so upgrades invalidate."""
+def clear_detected_opencode_cli_version() -> None:
+    global _detected_opencode_cli_version
+    _detected_opencode_cli_version = _UNSET
+
+
+def _cli_binary_identity(binary: str | None) -> _CliBinaryIdentity:
+    """Cache key for a CLI on PATH: resolved path plus mtime/size, so upgrades invalidate."""
     if not binary:
         return (None, None)
     try:
@@ -839,7 +854,12 @@ def _codex_cli_candidates() -> list[str]:
     return candidates
 
 
-def _probe_codex_cli_version(binary: str, *, timeout: float) -> str | None:
+def _probe_cli_version(
+    binary: str,
+    *,
+    timeout: float,
+    parse: Callable[[str], str | None],
+) -> str | None:
     try:
         result = subprocess.run(
             [binary, "--version"],
@@ -850,7 +870,7 @@ def _probe_codex_cli_version(binary: str, *, timeout: float) -> str | None:
         )
     except (OSError, subprocess.TimeoutExpired):
         return None
-    return parse_codex_cli_version(f"{result.stdout or ''}\n{result.stderr or ''}")
+    return parse(f"{result.stdout or ''}\n{result.stderr or ''}")
 
 
 def detect_codex_cli_version(*, timeout: float = 5.0) -> str | None:
@@ -863,16 +883,43 @@ def detect_codex_cli_version(*, timeout: float = 5.0) -> str | None:
     """
     global _detected_codex_cli_version
     candidates = _codex_cli_candidates()
-    identity = tuple(_codex_binary_identity(binary) for binary in candidates)
+    identity = tuple(_cli_binary_identity(binary) for binary in candidates)
     cached = _detected_codex_cli_version
     if isinstance(cached, tuple) and cached[0] == identity:
         return cached[1]
     parsed: str | None = None
     for binary in candidates:
-        parsed = _probe_codex_cli_version(binary, timeout=timeout)
+        parsed = _probe_cli_version(binary, timeout=timeout, parse=parse_codex_cli_version)
         if parsed:
             break
     _detected_codex_cli_version = (identity, parsed)
+    return parsed
+
+
+def _opencode_cli_candidates() -> list[str]:
+    binary = shutil.which("opencode")
+    return [binary] if binary else []
+
+
+def detect_opencode_cli_version(*, timeout: float = 5.0) -> str | None:
+    """Return the installed ``opencode`` CLI version, or ``None`` when unavailable.
+
+    Mirrors the codex detection: PATH binary, identity cache keyed on the
+    resolved path plus mtime/size, so an upgraded binary re-probes. Feeds the
+    oc-free fingerprint User-Agent (see ``header_passthrough``).
+    """
+    global _detected_opencode_cli_version
+    candidates = _opencode_cli_candidates()
+    identity = tuple(_cli_binary_identity(binary) for binary in candidates)
+    cached = _detected_opencode_cli_version
+    if isinstance(cached, tuple) and cached[0] == identity:
+        return cached[1]
+    parsed = (
+        _probe_cli_version(candidates[0], timeout=timeout, parse=parse_opencode_cli_version)
+        if candidates
+        else None
+    )
+    _detected_opencode_cli_version = (identity, parsed)
     return parsed
 
 

@@ -63,6 +63,19 @@ def _disable_nous_portal_by_default(monkeypatch, request):
 
 
 @pytest.fixture(autouse=True)
+def _stub_opencode_cli_version_by_default(monkeypatch, request):
+    # oc-free fingerprint tests pin the version explicitly; everything else
+    # must never spawn the real `opencode --version` from the serve path.
+    if request.node.get_closest_marker("opencode_cli_version"):
+        return
+    monkeypatch.setattr(
+        "codex_shim.discover.detect_opencode_cli_version",
+        lambda **_kwargs: None,
+        raising=False,
+    )
+
+
+@pytest.fixture(autouse=True)
 def _reset_nous_oauth_startup_state():
     from codex_shim.nous_auth import reset_nous_oauth_startup_state
 

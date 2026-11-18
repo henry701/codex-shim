@@ -16,9 +16,12 @@ from codex_shim.discover import (
     DEFAULT_CHATGPT_CODEX_CLIENT_VERSION,
     chatgpt_codex_client_version,
     clear_detected_codex_cli_version,
+    clear_detected_opencode_cli_version,
+    detect_opencode_cli_version,
     fetch_chatgpt_codex_backend_models,
     fetch_http_json,
     parse_codex_cli_version,
+    parse_opencode_cli_version,
     persist_chatgpt_models_cache,
     refresh_codex_auth_tokens,
 )
@@ -70,6 +73,92 @@ def test_fallback_chatgpt_passthrough_includes_gpt_6_astra():
 )
 def test_parse_codex_cli_version(output, expected):
     assert parse_codex_cli_version(output) == expected
+
+
+@pytest.mark.parametrize(
+    "output, expected",
+    [
+        ("opencode v2.3.0", "2.3.0"),
+        ("opencode 2.3.0", "2.3.0"),
+        ("opencode v2.3.0 (linux x64)", "2.3.0"),
+        ("2.0.26-beta.1", "2.0.26-beta.1"),
+        ("not a version", None),
+        ("", None),
+    ],
+)
+def test_parse_opencode_cli_version(output, expected):
+    assert parse_opencode_cli_version(output) == expected
+
+
+def _stub_opencode_cli(monkeypatch, *, path: str | None, stdout: str = ""):
+    monkeypatch.delenv("CODEX_SHIM_OPENCODE_FREE_CLIENT_VERSION", raising=False)
+    monkeypatch.setattr(
+        "codex_shim.discover.shutil.which",
+        lambda name: path if name == "opencode" else None,
+    )
+    if path is None:
+        monkeypatch.setattr("codex_shim.discover.os.path.isfile", lambda _path: False)
+
+        def boom(*_args, **_kwargs):
+            raise AssertionError("must not spawn opencode when it is missing from PATH")
+
+        monkeypatch.setattr("codex_shim.discover.subprocess.run", boom)
+        return
+
+    class _Result:
+        def __init__(self):
+            self.returncode = 0
+            self.stdout = stdout
+            self.stderr = ""
+
+    monkeypatch.setattr("codex_shim.discover.subprocess.run", lambda *_args, **_kwargs: _Result())
+
+
+@pytest.mark.opencode_cli_version
+def test_detect_opencode_cli_version_uses_installed_cli(monkeypatch):
+    _stub_opencode_cli(monkeypatch, path="/usr/bin/opencode", stdout="opencode v2.3.0\n")
+    clear_detected_opencode_cli_version()
+    assert detect_opencode_cli_version() == "2.3.0"
+
+
+@pytest.mark.opencode_cli_version
+def test_detect_opencode_cli_version_missing_binary_returns_none(monkeypatch):
+    _stub_opencode_cli(monkeypatch, path=None)
+    clear_detected_opencode_cli_version()
+    assert detect_opencode_cli_version() is None
+
+
+@pytest.mark.opencode_cli_version
+def test_detect_opencode_cli_version_reprobes_after_upgrade(monkeypatch, tmp_path):
+    binary = tmp_path / "opencode"
+    binary.write_text("old")
+    monkeypatch.setattr(
+        "codex_shim.discover.shutil.which",
+        lambda name: str(binary) if name == "opencode" else None,
+    )
+    versions = iter(["opencode v2.3.0\n", "opencode v2.4.0\n"])
+    calls = []
+
+    class _Result:
+        def __init__(self, stdout):
+            self.returncode = 0
+            self.stdout = stdout
+            self.stderr = ""
+
+    def fake_run(*_args, **_kwargs):
+        calls.append(1)
+        return _Result(next(versions))
+
+    monkeypatch.setattr("codex_shim.discover.subprocess.run", fake_run)
+    clear_detected_opencode_cli_version()
+    assert detect_opencode_cli_version() == "2.3.0"
+    assert detect_opencode_cli_version() == "2.3.0"
+    assert len(calls) == 1
+
+    binary.write_text("upgraded binary")
+    os.utime(binary, ns=(binary.stat().st_atime_ns, binary.stat().st_mtime_ns + 1_000_000_000))
+    assert detect_opencode_cli_version() == "2.4.0"
+    assert len(calls) == 2
 
 
 def _stub_codex_cli(monkeypatch, *, path: str | None, stdout: str = "", stderr: str = "", returncode: int = 0):
