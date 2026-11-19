@@ -64,6 +64,25 @@ and this project does not yet follow semantic versioning (pre-1.0).
 
 ### Fixed
 
+- Multi-agent conversations stalled after sub-agent handoffs. Codex opens
+  every new conversation WebSocket (the parent and each spawned sub-agent)
+  with an empty `response.create` handshake; the ChatGPT Codex backend
+  answers it with a 400 `missing_required_parameter` error frame and the
+  client just follows with the real first turn. On a direct connection the
+  client only ever sees that bare error frame, but the shim additionally
+  synthesized a `response.failed` terminal (the "end the turn on upstream
+  error frames Codex ignores" fix), which races the client's next create —
+  Codex Desktop could mark the live parent turn failed right after a
+  sub-agent finished, leaving the thread stopped mid-flow (lcs-new-age
+  parent-agent, twice on 2026-11-18; 367 such probe rejections in the log).
+  Handshake probes (no `input` items and no `previous_response_id`) now
+  relay only the bare upstream error frame — full direct-wire parity —
+  on both the native WS passthrough and the HTTP fallback; real turns keep
+  the synthesized terminal so errored turns still end cleanly. Verified live:
+  a spawn_agent/wait_agent round trip through the shim now shows probe
+  `error` followed directly by the real turn's `response.created`, with no
+  synthetic terminals, and the turn completes.
+
 - Test-suite repair: the stateless-replay id-drop fixes and the WS
   error-frame handling change landed without updating their tests, leaving
   four suites red at HEAD. Expansion/compaction tests now expect re-minted

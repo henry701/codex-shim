@@ -372,6 +372,7 @@ class WsPassthroughSession:
         rewrite_model: Callable[[Any, str | None], None] | None = None,
         write_event: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
         forward_terminal: Callable[[dict[str, Any]], bool] | None = None,
+        emit_failed_on_unmapped_error: bool = True,
     ) -> dict[str, Any] | None:
         upstream_ws = self.upstream_by_url.get(upstream_url)
         if upstream_ws is None or upstream_ws.closed:
@@ -385,7 +386,11 @@ class WsPassthroughSession:
             else:
                 await self.client_ws.send_str(json.dumps(event, separators=(",", ":")))
 
-        emitter = WsRelayEmitter(_write_event, model=model_override or source)
+        emitter = WsRelayEmitter(
+            _write_event,
+            model=model_override or source,
+            emit_failed_on_unmapped_error=emit_failed_on_unmapped_error,
+        )
         client_gone = asyncio.ensure_future(self._wait_client_gone())
 
         try:

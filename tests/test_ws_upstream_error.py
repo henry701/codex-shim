@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from typing import Any
 
 import pytest
 
@@ -112,6 +113,63 @@ async def test_emitter_unmapped_error_then_upstream_failed_adds_nothing():
 
 
 @pytest.mark.asyncio
+async def test_handshake_probe_error_relays_bare_frame_without_synthetic_terminal(
+    monkeypatch, tmp_path
+):
+    # Codex opens each new conversation WS with an empty response.create; the
+    # upstream answers with a 400 missing_required_parameter error frame and the
+    # client simply follows with the real first turn. Direct connections
+    # deliver only the bare error frame — a synthesized response.failed races
+    # the client's next create and can kill the real turn (lcs-new-age parent
+    # stalls after sub-agent handoffs).
+    install_chatgpt_auth(monkeypatch, tmp_path)
+    probe_error = {
+        "type": "error",
+        "code": "invalid_request_error",
+        "message": (
+            "One of \"input\" or \"previous_response_id\" or 'prompt' or "
+            "'conversation' must be provided."
+        ),
+    }
+    state = MockUpstreamWsState(
+        response_sequences=[
+            [probe_error],
+            completed_events("resp_first"),
+        ]
+    )
+    shim_client, upstream_client = await start_shim_with_mock_chatgpt_ws(
+        monkeypatch, tmp_path, state
+    )
+    try:
+        ws = await shim_client.ws_connect(
+            "/v1/responses", headers={"session-id": "ws-handshake-probe"}
+        )
+        await ws.send_json({"type": "response.create", "model": "codex-gpt-5-5"})
+        events: list[dict[str, Any]] = []
+        while True:
+            msg = await ws.receive(timeout=2)
+            assert msg.type.name == "TEXT", msg
+            event = json.loads(msg.data)
+            events.append(event)
+            if event.get("type") == "error":
+                break
+        # Wire parity: only the bare upstream error frame, no response.failed.
+        assert events == [probe_error]
+
+        # The client follows the rejected handshake with the real first turn.
+        await ws.send_json(
+            {
+                "type": "response.create",
+                "model": "codex-gpt-5-5",
+                "input": [{"type": "message", "role": "user", "content": "hi"}],
+            }
+        )
+        assert (await recv_until_terminal(ws, 2))[-1]["type"] == "response.completed"
+    finally:
+        await shim_client.close()
+        await upstream_client.close()
+
+
 async def test_mid_stream_upstream_error_ends_turn_without_advancing_cache_or_chain(
     monkeypatch, tmp_path, capsys
 ):

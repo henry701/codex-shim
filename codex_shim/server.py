@@ -269,6 +269,18 @@ def _search_log_summary(body: dict[str, Any]) -> str:
     return f"model={body.get('model')!r} queries={texts!r}"
 
 
+def _is_ws_handshake_probe(body: Mapping[str, Any]) -> bool:
+    """Codex opens each new conversation WS with an empty ``response.create``.
+
+    The upstream answers the handshake with a 400 ``missing_required_parameter``
+    error frame, and the client simply follows with the real first turn. Relaying
+    the bare error frame matches the direct wire; synthesizing a terminal on top
+    of it races the client's next create (Codex Desktop marks the live turn
+    failed and the parent conversation stalls after sub-agent handoffs).
+    """
+    return not body.get("previous_response_id") and not responses_input_items(body.get("input"))
+
+
 class ShimServer:
     def __init__(self, settings_path: Path = DEFAULT_SETTINGS, host: str = DEFAULT_HOST):
         self.settings = ModelSettings(settings_path)
@@ -1521,6 +1533,7 @@ class ShimServer:
             return True
 
         force_expand = False
+        handshake_probe = _is_ws_handshake_probe(raw_body)
         for attempt in range(2):
             forwarded = self._prepare_chatgpt_passthrough_body_ws(
                 raw_body,
@@ -1559,6 +1572,7 @@ class ShimServer:
                         rewrite_model=_rewrite_response_model,
                         write_event=write_event,
                         forward_terminal=forward_terminal,
+                        emit_failed_on_unmapped_error=not handshake_probe,
                     )
                     break
                 except WsPassthroughConnectError as exc:
@@ -1726,6 +1740,7 @@ class ShimServer:
                 response_model_override=target.response_model_override,
                 collector=collector,
                 upstream_forward_headers=upstream_forward_headers,
+                emit_failed_on_unmapped_error=not _is_ws_handshake_probe(raw_body),
             )
         finally:
             cache_store(collector.completed_response_id, collector.output_items(), terminal=True)
@@ -6945,13 +6960,18 @@ async def _relay_sse_response_to_ws(
     response_model_override: str | None = None,
     collector: ChatgptPassthroughResponseCollector | None = None,
     upstream_forward_headers: dict[str, str] | None = None,
+    emit_failed_on_unmapped_error: bool = True,
 ) -> None:
     _ = upstream_forward_headers
 
     async def _emit(event: dict[str, Any]) -> None:
         await _write_ws_json(ws, event)
 
-    emitter = WsRelayEmitter(_emit, model=response_model_override or "chatgpt")
+    emitter = WsRelayEmitter(
+        _emit,
+        model=response_model_override or "chatgpt",
+        emit_failed_on_unmapped_error=emit_failed_on_unmapped_error,
+    )
     async for line in _sse_lines(upstream, request):
         if line == "[DONE]":
             break

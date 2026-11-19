@@ -255,9 +255,10 @@ class WsRelayEmitter:
     closes the turn with a ``response.failed`` carrying the same code/message.
     """
 
-    def __init__(self, write_event, *, model: str = "chatgpt"):
+    def __init__(self, write_event, *, model: str = "chatgpt", emit_failed_on_unmapped_error: bool = True):
         self._write_event = write_event
         self.model = model
+        self.emit_failed_on_unmapped_error = emit_failed_on_unmapped_error
         self.saw_terminal = False
         self.last_response: dict[str, Any] | None = None
         self.already_emitted = False
@@ -282,6 +283,12 @@ class WsRelayEmitter:
         if self.saw_terminal:
             return self.terminal_event or "response.completed"
         if self.upstream_error is not None:
+            if not self.emit_failed_on_unmapped_error:
+                # Handshake probes carry no turn to close. The direct wire only
+                # delivers the bare upstream error frame; synthesizing a
+                # response.failed here races the client's next real create and
+                # can fail that turn on Codex Desktop.
+                return "unmapped-error-relayed"
             code, message = ws_error_code_message(self.upstream_error)
             return await self._emit_failed(code, message, error_frame=False)
         # Do not invent response.incomplete. Codex treats that event as a finished
