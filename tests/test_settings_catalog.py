@@ -12,11 +12,9 @@ import pytest
 from codex_shim import cli
 from codex_shim.catalog import catalog_entry, assign_catalog_display_priorities, sort_catalog_entries, write_catalog
 from codex_shim.catalog import CATALOG_TIER_BYOK
-from codex_shim.catalog_slugs import codex_catalog_slug
 from codex_shim.opencode_go import opencode_go_model_row, write_opencode_go_models
 from codex_shim.settings import (
     DEFAULT_PASSTHROUGH_ERROR_FALLBACK_SOURCES,
-    FALLBACK_CHATGPT_PASSTHROUGH_SLUGS,
     ModelSettings,
     chatgpt_passthrough_available,
     load_passthrough_error_fallback,
@@ -578,18 +576,16 @@ def test_write_catalog_omits_gpt55_when_auth_missing(tmp_path, auth_missing):
     assert data == {"models": []}
 
 
-def test_write_catalog_includes_gpt_models_when_auth_present(tmp_path, auth_present, monkeypatch):
+def test_write_catalog_without_sources_serves_only_route_default(tmp_path, auth_present, monkeypatch):
     missing_cache = tmp_path / "missing-models-cache.json"
     monkeypatch.setattr("codex_shim.settings.DEFAULT_CODEX_MODELS_CACHE", missing_cache)
     catalog_path = tmp_path / "catalog.json"
     write_catalog([], catalog_path)
     data = json.loads(catalog_path.read_text())
-    expected = sorted(codex_catalog_slug(slug) for slug in FALLBACK_CHATGPT_PASSTHROUGH_SLUGS)
-    assert [model["slug"] for model in data["models"]] == expected
-    for entry in data["models"]:
-        assert not entry.get("use_responses_lite"), (
-            f"passthrough catalog entry {entry['slug']} must not set use_responses_lite"
-        )
+    # Live sources only: no invented model rows, but the passthrough route
+    # default stays usable so a passthrough-only install keeps working.
+    assert [model["slug"] for model in data["models"]] == ["codex-gpt-5-5"]
+    assert not data["models"][0].get("use_responses_lite")
 
 
 def test_write_catalog_enables_chatgpt_passthrough_websockets(tmp_path, auth_present, monkeypatch):
@@ -620,8 +616,18 @@ def test_write_catalog_enables_chatgpt_passthrough_websockets(tmp_path, auth_pre
 
 
 def test_write_catalog_byok_does_not_set_use_responses_lite(tmp_path, auth_present, monkeypatch):
-    missing_cache = tmp_path / "missing-models-cache.json"
-    monkeypatch.setattr("codex_shim.settings.DEFAULT_CODEX_MODELS_CACHE", missing_cache)
+    cache = tmp_path / "models-cache.json"
+    cache.write_text(
+        json.dumps(
+            {
+                "models": [
+                    {"slug": "gpt-5.5", "display_name": "GPT-5.5", "visibility": "list"},
+                    {"slug": "gpt-6-astra", "display_name": "GPT-6-Astra", "visibility": "list"},
+                ]
+            }
+        )
+    )
+    monkeypatch.setattr("codex_shim.settings.DEFAULT_CODEX_MODELS_CACHE", cache)
     models = ModelSettingsFixture.one()
     models = [models]
     catalog_path = tmp_path / "catalog.json"
@@ -629,8 +635,8 @@ def test_write_catalog_byok_does_not_set_use_responses_lite(tmp_path, auth_prese
     data = json.loads(catalog_path.read_text())
     by_slug = {entry["slug"]: entry for entry in data["models"]}
     assert not by_slug["claude-opus"].get("use_responses_lite")
-    for slug in FALLBACK_CHATGPT_PASSTHROUGH_SLUGS:
-        assert not by_slug[codex_catalog_slug(slug)].get("use_responses_lite")
+    assert not by_slug["codex-gpt-5-5"].get("use_responses_lite")
+    assert not by_slug["codex-gpt-6-astra"].get("use_responses_lite")
 
 
 def test_load_passthrough_error_fallback_accepts_map_and_shorthand(tmp_path):

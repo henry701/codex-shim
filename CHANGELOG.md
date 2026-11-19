@@ -7,6 +7,28 @@ and this project does not yet follow semantic versioning (pre-1.0).
 
 ## Unreleased
 
+### Changed
+
+- The ChatGPT passthrough catalog is built from live sources only. The
+  hardcoded `FALLBACK_CHATGPT_PASSTHROUGH_SLUGS` list (gpt-6-astra …
+  gpt-5.2, codex-auto-review) is gone: model rows come from the ChatGPT
+  backend `/models` listing, then the persisted `models_cache.json` /
+  previously published Desktop catalog when the listing is briefly down.
+  A boot where every source fails now serves only the passthrough route
+  default (`codex-gpt-5-5`, with a warning) instead of stale hardcoded
+  rows; the next `/models` refresh fills the rest in. Tests that drove
+  non-default passthrough slugs now seed the models cache the way the
+  live listing would.
+
+- Free-tier smoke tests no longer hardcode model slugs.
+  `scripts/smoke_opencode_free.sh` auto-picks a free model live from
+  models.dev (`opencode` provider, `cost.input == 0`, not deprecated,
+  preferring fast/flash slugs) and errors with a manual-SMOKE_MODEL hint
+  when models.dev is unreachable — the old defaults
+  (`oc-free-ling-3-0-flash-fin-free`, `oc-free-muse-spark-1-3-contributor-free`)
+  had both left the catalog. The net-surfaces `muse` surface (Muse Spark is
+  gone) now runs the same auto-picked free model, or `SMOKE_MUSE_MODEL`.
+
 ### Added
 
 - OpenCode Zen free-tier client fingerprint for `oc-free-*` routes. Since

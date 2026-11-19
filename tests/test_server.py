@@ -27,8 +27,6 @@ from codex_shim.server import (
     _set_active_model,
     parse_upstream_error,
 )
-from codex_shim.catalog_slugs import codex_catalog_slug
-from codex_shim.settings import FALLBACK_CHATGPT_PASSTHROUGH_SLUGS
 from codex_shim.translate import SHIM_ENCRYPTED_CONTENT_PREFIX
 from codex_shim.ws_passthrough import WsPassthroughSession
 from ws_test_support import MockUpstreamWsState, start_mock_upstream_ws
@@ -55,6 +53,26 @@ def chatgpt_cache_dir(monkeypatch, tmp_path):
     cache_root = tmp_path / "chatgpt-conversations"
     monkeypatch.setattr(server_module, "_chatgpt_conversations_dir", lambda: cache_root)
     return cache_root
+
+
+def _seed_chatgpt_models_cache(monkeypatch, tmp_path, *upstream_slugs: str) -> None:
+    """List ChatGPT passthrough models the way a live /models call would.
+
+    The passthrough tier is built from live sources only (no hardcoded slug
+    list), so tests driving non-default slugs must seed the models cache.
+    """
+    cache = tmp_path / "models-cache.json"
+    cache.write_text(
+        json.dumps(
+            {
+                "models": [
+                    {"slug": slug, "display_name": f"GPT {slug}", "visibility": "list"}
+                    for slug in upstream_slugs
+                ]
+            }
+        )
+    )
+    monkeypatch.setattr("codex_shim.settings.DEFAULT_CODEX_MODELS_CACHE", cache)
 
 
 def test_sanitize_chatgpt_passthrough_body_drops_shim_reasoning():
@@ -639,6 +657,7 @@ async def test_alpha_search_upstream_error_status_passes_through(
 async def test_session_title_request_routes_byok_model_to_chatgpt_passthrough(
     monkeypatch, tmp_path, auth_present
 ):
+    _seed_chatgpt_models_cache(monkeypatch, tmp_path, "gpt-5.4-mini")
     captured = {}
 
     class FakeUpstream:
@@ -717,6 +736,7 @@ async def test_session_title_request_routes_byok_model_to_chatgpt_passthrough(
 async def test_session_title_falls_back_to_luna_low_when_mini_fails(
     monkeypatch, tmp_path, auth_present
 ):
+    _seed_chatgpt_models_cache(monkeypatch, tmp_path, "gpt-5.4-mini", "gpt-5.6-luna")
     posts: list[dict[str, Any]] = []
 
     class FakeFail:
@@ -951,6 +971,7 @@ async def test_chatgpt_passthrough_http_always_expands_even_when_expand_env_disa
 async def test_chatgpt_passthrough_http_forwards_service_tier_and_output_caps(
     monkeypatch, tmp_path, auth_present
 ):
+    _seed_chatgpt_models_cache(monkeypatch, tmp_path, "gpt-5.6-luna")
     captured = {}
 
     class FakeUpstream:
@@ -997,6 +1018,7 @@ async def test_chatgpt_passthrough_http_forwards_service_tier_and_output_caps(
 async def test_chatgpt_passthrough_http_forwards_reasoning_effort_verbatim(
     monkeypatch, tmp_path, auth_present
 ):
+    _seed_chatgpt_models_cache(monkeypatch, tmp_path, "gpt-5.6-luna")
     captured = {}
 
     class FakeUpstream:
@@ -1803,6 +1825,7 @@ async def test_responses_websocket_bridges_byok_models_through_http_route(tmp_pa
 
 
 async def test_chatgpt_passthrough_falls_back_to_byok_on_error(monkeypatch, tmp_path, auth_present):
+    _seed_chatgpt_models_cache(monkeypatch, tmp_path, "gpt-5.4-mini")
     calls: list[str] = []
 
     async def fake_sleep(_seconds: float) -> None:
@@ -4551,6 +4574,7 @@ async def test_chatgpt_ws_compaction_v2_proxies_to_codex_responses(monkeypatch, 
 
 
 async def test_chatgpt_http_compaction_v2_proxies_to_codex_responses(monkeypatch, tmp_path, auth_present):
+    _seed_chatgpt_models_cache(monkeypatch, tmp_path, "gpt-5.6-luna")
     captured = {}
 
     async def fake_post(self, url, json=None, headers=None):
@@ -4712,6 +4736,7 @@ async def test_chatgpt_legacy_compact_retries_503_then_returns_404_without_summa
 async def test_chatgpt_http_compaction_v2_relays_lite_output_item_done(
     monkeypatch, tmp_path, auth_present
 ):
+    _seed_chatgpt_models_cache(monkeypatch, tmp_path, "gpt-5.6-luna")
     captured: dict[str, Any] = {}
     item = {
         "type": "compaction",
@@ -5180,7 +5205,9 @@ async def test_responses_compact_chatgpt_passthrough_uses_compact_endpoint(monke
     await shim_client.close()
 
 
-async def test_health_and_models_include_chatgpt_passthrough_when_auth_present(tmp_path, auth_present, monkeypatch):
+async def test_health_and_models_without_catalog_sources_serve_route_default_only(
+    tmp_path, auth_present, monkeypatch
+):
     missing_cache = tmp_path / "missing-models-cache.json"
     monkeypatch.setattr("codex_shim.settings.DEFAULT_CODEX_MODELS_CACHE", missing_cache)
     settings = tmp_path / "settings.json"
@@ -5191,14 +5218,15 @@ async def test_health_and_models_include_chatgpt_passthrough_when_auth_present(t
     health = await shim_client.get("/health")
     assert health.status == 200
     body = await health.json()
-    assert body["models"] == len(FALLBACK_CHATGPT_PASSTHROUGH_SLUGS)
+    # Live sources only: no invented speculative slugs; the passthrough route
+    # default stays listed so a passthrough-only install keeps working.
+    assert body["models"] == 1
     assert body["chatgpt_passthrough"] is True
 
     models = await shim_client.get("/v1/models")
     assert models.status == 200
     payload = await models.json()
-    expected = [codex_catalog_slug(slug) for slug in FALLBACK_CHATGPT_PASSTHROUGH_SLUGS]
-    assert sorted(model["id"] for model in payload["data"]) == sorted(expected)
+    assert [model["id"] for model in payload["data"]] == ["codex-gpt-5-5"]
 
     await shim_client.close()
 

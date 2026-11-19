@@ -38,6 +38,10 @@ def test_smoke_opencode_free_script_is_valid_bash():
     assert "oc-free-" in text
     assert "smoke_chatgpt_passthrough.sh" in text
     assert "8765" in text
+    # No hardcoded default model: free slugs rotate fast, so the script picks
+    # one live from models.dev unless SMOKE_MODEL pins a slug.
+    assert "models.dev/api.json" in text
+    assert "SMOKE_MODEL" in text
 
 
 def test_smoke_net_surfaces_script_is_valid_bash():
@@ -47,7 +51,10 @@ def test_smoke_net_surfaces_script_is_valid_bash():
     assert "SMOKE_RESTART=1 on port 8765" in text
     assert "nvidia-nvidia-nemotron-3-5-lightning-30b-a3b" in text
     assert "or-nvidia-nemotron-3-5-lightning-free" in text
-    assert "oc-free-muse-spark-1-3-contributor-free" in text
+    # Muse Spark left the models.dev catalog; the muse surface now runs the
+    # auto-picked free model (or SMOKE_MUSE_MODEL), not a hardcoded slug.
+    assert "oc-free-muse-spark" not in text
+    assert "SMOKE_MUSE_MODEL" in text
     assert "OPENCODE_API_KEY" in text
     assert "nvidia|openrouter|muse|zai" in text
 

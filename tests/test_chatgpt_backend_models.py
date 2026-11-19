@@ -25,11 +25,7 @@ from codex_shim.discover import (
     persist_chatgpt_models_cache,
     refresh_codex_auth_tokens,
 )
-from codex_shim.settings import (
-    FALLBACK_CHATGPT_DISPLAY_NAMES,
-    FALLBACK_CHATGPT_PASSTHROUGH_SLUGS,
-    load_chatgpt_passthrough_catalog_models,
-)
+from codex_shim.settings import load_chatgpt_passthrough_catalog_models
 
 
 def _client_version_parts(version: str) -> tuple[int, ...]:
@@ -54,9 +50,16 @@ def test_default_chatgpt_codex_client_version_meets_gpt_6_astra_minimum():
     assert _client_version_parts(DEFAULT_CHATGPT_CODEX_CLIENT_VERSION) >= (0, 162, 1)
 
 
-def test_fallback_chatgpt_passthrough_includes_gpt_6_astra():
-    assert "gpt-6-astra" in FALLBACK_CHATGPT_PASSTHROUGH_SLUGS
-    assert FALLBACK_CHATGPT_DISPLAY_NAMES["gpt-6-astra"] == "GPT-6-Astra"
+def test_no_source_chatgpt_passthrough_serves_only_route_default(tmp_path):
+    # Live sources only: when the backend listing and every cache are
+    # unavailable, no speculative slugs are invented — just the passthrough
+    # route default, which exists regardless of the catalog listing.
+    rows = load_chatgpt_passthrough_catalog_models(
+        tmp_path / "missing-cache.json",
+        catalog_path=tmp_path / "missing-catalog.json",
+        skip_live=True,
+    )
+    assert [row["slug"] for row in rows] == ["codex-gpt-5-5"]
 
 
 @pytest.mark.parametrize(

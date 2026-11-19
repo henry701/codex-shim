@@ -22,8 +22,8 @@ for surface in "${ITEMS[@]}"; do
         bash "${ROOT}/scripts/smoke_chatgpt_passthrough.sh" || FAILED=1
       ;;
     opencode|oc-free|zen_public)
-      echo "=== surface: OpenCode Free (${SMOKE_OPENCODE_MODEL:-oc-free-deepseek-v4-1-flash-free}) ==="
-      SMOKE_MODEL="${SMOKE_OPENCODE_MODEL:-oc-free-deepseek-v4-1-flash-free}" \
+      echo "=== surface: OpenCode Free (${SMOKE_OPENCODE_MODEL:-auto from models.dev}) ==="
+      SMOKE_MODEL="${SMOKE_OPENCODE_MODEL:-}" \
         bash "${ROOT}/scripts/smoke_opencode_free.sh" || FAILED=1
       ;;
     nvidia|nemotron)
@@ -37,9 +37,11 @@ for surface in "${ITEMS[@]}"; do
         bash "${ROOT}/scripts/smoke_chatgpt_passthrough.sh" || FAILED=1
       ;;
     muse)
-      echo "=== surface: Muse Spark (${SMOKE_MUSE_MODEL:-oc-free-muse-spark-1-3-contributor-free}) ==="
-      SMOKE_MODEL="${SMOKE_MUSE_MODEL:-oc-free-muse-spark-1-3-contributor-free}" \
-        bash "${ROOT}/scripts/smoke_chatgpt_passthrough.sh" || FAILED=1
+      # Muse Spark left the models.dev catalog; the surface now runs whatever
+      # free OpenCode model models.dev serves (or SMOKE_MUSE_MODEL when pinned).
+      echo "=== surface: OpenCode Free via Muse slot (${SMOKE_MUSE_MODEL:-auto from models.dev}) ==="
+      SMOKE_MODEL="${SMOKE_MUSE_MODEL:-}" \
+        bash "${ROOT}/scripts/smoke_opencode_free.sh" || FAILED=1
       ;;
     zai|z.ai)
       echo "=== surface: z.ai on OpenCode ==="

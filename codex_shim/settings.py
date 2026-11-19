@@ -23,32 +23,9 @@ DEFAULT_PORT = 8765
 PROVIDER_NAME = "codex_shim"
 OPENAI_PROVIDER_ID = "openai"
 CHATGPT_MODEL_SLUG = CHATGPT_UPSTREAM_DEFAULT
-FALLBACK_CHATGPT_PASSTHROUGH_SLUGS = (
-    "gpt-6-astra",
-    "gpt-5.6-terra",
-    "gpt-5.6-sol",
-    "gpt-5.6-luna",
-    "gpt-5.5",
-    "gpt-5.4",
-    "gpt-5.4-mini",
-    "gpt-5.3-codex",
-    "gpt-5.3-codex-spark",
-    "gpt-5.2",
-    "codex-auto-review",
-)
-FALLBACK_CHATGPT_DISPLAY_NAMES = {
-    "gpt-6-astra": "GPT-6-Astra",
-    "gpt-5.6-terra": "GPT-5.6-Terra",
-    "gpt-5.6-sol": "GPT-5.6-Sol",
-    "gpt-5.6-luna": "GPT-5.6-Luna",
-    "gpt-5.5": "GPT-5.5",
-    "gpt-5.4": "gpt-5.4",
-    "gpt-5.4-mini": "GPT-5.4-Mini",
-    "gpt-5.3-codex": "gpt-5.3-codex",
-    "gpt-5.3-codex-spark": "GPT-5.3-Codex-Spark",
-    "gpt-5.2": "gpt-5.2",
-    "codex-auto-review": "Codex Auto Review",
-}
+# No hardcoded ChatGPT slug list: the catalog is built from live sources only
+# (ChatGPT backend /models, then the persisted models_cache.json / published
+# Desktop catalog). Hardcoded model rows go stale as providers rotate.
 DEFAULT_PASSTHROUGH_ERROR_FALLBACK_SOURCES = (
     "gpt-5.4-mini",
     "codex-auto-review",
@@ -228,8 +205,7 @@ def _entries_from_upstream_models(upstream_models: list[dict[str, Any]]) -> list
         by_upstream[upstream] = _codex_passthrough_entry(
             upstream,
             str(
-                entry.get("display_name")
-                or FALLBACK_CHATGPT_DISPLAY_NAMES.get(upstream, display_name_from_slug(upstream))
+                entry.get("display_name") or display_name_from_slug(upstream)
             ),
             cache_entry=entry,
         )
@@ -258,12 +234,13 @@ def load_chatgpt_passthrough_catalog_models(
 ) -> list[dict[str, Any]]:
     """Build ChatGPT passthrough catalog entries.
 
-    Preference order:
+    Preference order (live sources only — no hardcoded slug list, which goes
+    stale as providers rotate):
       1. Live ``chatgpt.com/backend-api/codex/models`` (Codex OAuth token; refreshes on 401)
          — also persists into ``models_cache.json`` so boot-time syncs stay fresh
       2. Union of local ``models_cache.json`` + previously published Desktop catalog
          (anti-regression when live fetch fails during ``ExecStartPre sync-desktop``)
-      3. Hardcoded ``FALLBACK_CHATGPT_PASSTHROUGH_SLUGS``
+      3. Nothing: an empty list until the next /models refresh succeeds
     """
     from .discover import fetch_chatgpt_codex_backend_models, persist_chatgpt_models_cache
 
@@ -291,15 +268,12 @@ def load_chatgpt_passthrough_catalog_models(
 
     logger.warning(
         "ChatGPT Codex backend /models unavailable and no local chatgpt catalog/cache; "
-        "using hardcoded FALLBACK_CHATGPT_PASSTHROUGH_SLUGS"
+        "serving only the passthrough route default until the next /models refresh succeeds"
     )
-    return [
-        _codex_passthrough_entry(
-            upstream,
-            FALLBACK_CHATGPT_DISPLAY_NAMES.get(upstream, upstream),
-        )
-        for upstream in FALLBACK_CHATGPT_PASSTHROUGH_SLUGS
-    ]
+    # No hardcoded catalog rows: speculative slugs (astra/terra/sol/…) go stale.
+    # The route default is kept because the passthrough route exists regardless
+    # of the listing; it is the shim's configured default upstream, not a guess.
+    return [_codex_passthrough_entry(CHATGPT_UPSTREAM_DEFAULT, "GPT-5.5")]
 
 
 def chatgpt_passthrough_slugs(cache_path: Path | None = None, *, skip_live: bool = False) -> set[str]:

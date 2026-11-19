@@ -429,8 +429,12 @@ codex-shim disable
 After this, Codex Desktop sees every entry from `~/.codex-shim/models.json`,
 plus ChatGPT passthrough models listed from
 `chatgpt.com/backend-api/codex/models` when `~/.codex/auth.json` holds a valid
-`tokens.access_token` (falls back to `~/.codex/models_cache.json` / hardcoded
-slugs only if that listing fails).
+`tokens.access_token`. That ChatGPT tier is built from live sources only: the
+backend listing first, then the persisted `~/.codex/models_cache.json` and the
+previously published Desktop catalog when the listing is briefly unreachable.
+There is **no hardcoded slug list** — model names rotate too fast to hardcode —
+so a fresh boot where every source fails serves only the passthrough route
+default (`codex-gpt-5-5`) until the next `/models` refresh succeeds.
 
 If your Codex Desktop's model picker only shows `default` and refuses to render
 the catalog entries, apply the macOS picker patch below.
@@ -824,9 +828,13 @@ SMOKE_SURFACES=nvidia,openrouter SMOKE_PORT=8767 bash scripts/smoke_net_surfaces
 ```
 
 Single-surface wrappers: `scripts/smoke_chatgpt_passthrough.sh` (default
-`codex-gpt-5-6-luna`) and `scripts/smoke_opencode_free.sh` (default
-`oc-free-ling-3-0-flash-fin-free`). Extra surfaces: `nvidia`, `openrouter`,
-`muse`, `zai`. Set `CODEX_SHIM_LIVE_SMOKE=1` to run the same execs from
+`codex-gpt-5-6-luna`) and `scripts/smoke_opencode_free.sh`, which auto-picks a
+free model live from models.dev (`provider opencode`, `cost.input == 0`, not
+deprecated, preferring fast/flash slugs) — pass `SMOKE_MODEL=<oc-free-slug>` to
+pin one manually; free slugs rotate too fast for a hardcoded default. Extra
+surfaces: `nvidia`, `openrouter`, `muse` (Muse Spark left the catalog; the
+surface now runs the auto-picked free model, or `SMOKE_MUSE_MODEL`), `zai`.
+Set `CODEX_SHIM_LIVE_SMOKE=1` to run the same execs from
 pytest (`tests/test_smoke_chatgpt_passthrough.py`).
 `uv run python lint/net_invariants.py` guards the keepalive split and
 blocks `time.sleep` on the aiohttp loop.
@@ -1467,8 +1475,10 @@ stay under Codex's built-in OpenAI provider namespace.
 ### `~/.codex-shim/models.json` is missing
 
 That is fine for ChatGPT passthrough-only use, **provided** `~/.codex/auth.json`
-has a valid `tokens.access_token`. In that case `codex-shim generate` writes a
-catalog containing just `gpt-5.5`. If neither file is present, the catalog will
+has a valid `tokens.access_token` **and** the ChatGPT backend `/models` listing
+(or the persisted `~/.codex/models_cache.json`) yields rows — the catalog is
+built from live sources only, with no hardcoded slug list. If neither file is
+present (or every source is briefly unreachable), the catalog will
 be empty and `codex-shim list` will exit non-zero with a hint to run
 `codex login` or pass a compatible settings file:
 
