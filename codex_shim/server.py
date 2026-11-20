@@ -2582,6 +2582,14 @@ class ShimServer:
             strip_previous_response_id=True,
         )
         input_items = responses_input_items(prepared.get("input"))
+        # The compaction_trigger is a consumed request marker, not conversation
+        # state. Storing it poisons snapshots: replayed non-final triggers 400
+        # every later append ("must be the final input item").
+        input_items = [
+            item
+            for item in input_items
+            if not (isinstance(item, dict) and item.get("type") == "compaction_trigger")
+        ]
         if not input_items and not output_items:
             return []
         return [*input_items, *copy.deepcopy(output_items)]

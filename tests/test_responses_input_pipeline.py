@@ -326,3 +326,63 @@ def test_native_delta_keeps_client_ids_and_drops_hex_ids():
     assert repaired[1]["id"].startswith("fc_")
     assert "-" in repaired[1]["id"]
     assert any("persisted item id" in warning for warning in warnings)
+
+
+def test_expansion_drops_replayed_compaction_trigger_items():
+    # Old snapshots stored the trigger mid-list (cache input + stored outputs
+    # after it). Replaying one shipped a non-final compaction_trigger upstream
+    # and every later append 400'd: "The 'compaction_trigger' item must be the
+    # final input item".
+    cached = [
+        {"type": "message", "role": "user", "content": "prior"},
+        {"type": "compaction_trigger"},
+        {"type": "message", "role": "assistant", "content": "stored output"},
+    ]
+    delta = [{"type": "function_call_output", "call_id": "call_1", "output": "ok"}]
+    repaired, _warnings = prepare_responses_input_items(
+        cache=_FakeCache(cached),
+        session_key="s",
+        previous_response_id="resp_1",
+        input_items=delta,
+        expand_enabled=True,
+        context="turn",
+    )
+    types = [item.get("type") for item in repaired]
+    assert "compaction_trigger" not in types
+    assert repaired[0]["content"] == "prior"
+    assert repaired[-1]["call_id"] == "call_1"
+
+
+def test_live_trailing_trigger_survives_pipeline_as_final_item():
+    from codex_shim.responses_input_pipeline import relocate_terminal_compaction_trigger
+
+    trigger = {"type": "compaction_trigger"}
+    user = {"type": "message", "role": "user", "content": "compact please"}
+    repaired, warnings = prepare_responses_input_items(
+        cache=None,
+        session_key="s",
+        previous_response_id=None,
+        input_items=[user, trigger],
+        expand_enabled=False,
+        context="turn",
+    )
+    assert repaired[-1] == trigger
+    assert warnings == []
+
+    # Already-final trigger stays put; no trigger -> unchanged.
+    assert relocate_terminal_compaction_trigger([user, trigger]) == [user, trigger]
+    assert relocate_terminal_compaction_trigger([user]) == [user]
+
+
+def test_relocate_terminal_compaction_trigger_moves_displaced_trigger_final():
+    from codex_shim.responses_input_pipeline import relocate_terminal_compaction_trigger
+
+    trigger = {"type": "compaction_trigger"}
+    items = [
+        {"type": "message", "role": "user", "content": "hi"},
+        trigger,
+        {"type": "message", "role": "developer", "content": "appended after trigger"},
+    ]
+    relocated = relocate_terminal_compaction_trigger(items)
+    assert relocated[-1] == trigger
+    assert [item.get("role") for item in relocated[:-1]] == ["user", "developer"]

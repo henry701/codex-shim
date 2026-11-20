@@ -64,6 +64,21 @@ and this project does not yet follow semantic versioning (pre-1.0).
 
 ### Fixed
 
+- ChatGPT passthrough turns 400'd with ``The 'compaction_trigger' item must be
+  the final input item`` after a compact-v2 turn. The conversation cache
+  stored the compact request's ``compaction_trigger`` with the turn's output
+  items after it, so any later stateless expansion replayed the history with a
+  mid-list trigger — poisoning the upstream conversation so every subsequent
+  native append on that connection 400'd (lcs-new-age parent thread, twice).
+  Three layers now hold the upstream invariant: cached history replay drops
+  ``compaction_trigger`` items (consumed request markers, not conversation
+  state — also heals the already-poisoned on-disk snapshots), a live
+  client-sent trailing trigger is relocated back to the final position if
+  orphan synthesis appends after it, and the turn cache no longer stores
+  triggers at all. Also broke a latent import cycle
+  (``responses_input_pipeline`` ↔ ``compaction``) that made
+  ``tests/test_responses_input_pipeline.py`` uncollectable in isolation.
+
 - Multi-agent conversations stalled after sub-agent handoffs. Codex opens
   every new conversation WebSocket (the parent and each spawned sub-agent)
   with an empty `response.create` handshake; the ChatGPT Codex backend

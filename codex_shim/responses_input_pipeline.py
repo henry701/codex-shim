@@ -14,15 +14,16 @@ import copy
 import re
 import uuid
 from collections.abc import Callable
-from typing import Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
 
-from .compaction.input_audit import CompactionSanitizationAudit, compaction_input_item_ref
-from .compaction.logging import log_compaction_cache_expansion
 from .tool_translate import (
     apply_function_call_ids,
     responses_function_call_ids,
     strip_function_call_output_item_id,
 )
+
+if TYPE_CHECKING:
+    from .compaction.input_audit import CompactionSanitizationAudit
 
 UNKNOWN_FUNCTION_TOOL_NAME = "unknown_tool"
 UNKNOWN_CUSTOM_TOOL_NAME = "unknown_custom_tool"
@@ -93,6 +94,8 @@ def synthesize_orphan_tool_calls(
     """
     if not input_items:
         return [], []
+
+    from .compaction.input_audit import compaction_input_item_ref
 
     warnings: list[str] = []
     seen_call_ids: set[str] = set()
@@ -222,6 +225,31 @@ def synthesize_missing_tool_outputs(
     return repaired, warnings
 
 
+def _drop_replayed_compaction_triggers(cached: list[Any]) -> list[Any]:
+    """Drop ``compaction_trigger`` items from replayed cached history.
+
+    The trigger is a consumed request marker, not conversation state. Old
+    snapshots stored it mid-list (cache input + stored outputs after it), and
+    replaying such a history puts a non-final trigger into the upstream
+    conversation — every later append then 400s with ``The 'compaction_trigger'
+    item must be the final input item``.
+    """
+    kept: list[Any] = []
+    dropped = 0
+    for item in cached:
+        if isinstance(item, dict) and item.get("type") == "compaction_trigger":
+            dropped += 1
+            continue
+        kept.append(item)
+    if dropped:
+        print(
+            f"[warn] responses-input: dropped {dropped} replayed compaction_trigger "
+            "item(s); the upstream requires the trigger to be final",
+            flush=True,
+        )
+    return kept
+
+
 def expand_cached_responses_input(
     *,
     cache: ConversationCache | None,
@@ -237,6 +265,7 @@ def expand_cached_responses_input(
         return delta_input
 
     from .compaction.input_audit import summarize_compaction_input_items
+    from .compaction.logging import log_compaction_cache_expansion
 
     _, delta_summary = summarize_compaction_input_items(delta_input, tail=6)
     cached = cache.get(session_key, previous_response_id)
@@ -269,7 +298,8 @@ def expand_cached_responses_input(
             flush=True,
         )
 
-    expanded = [*copy.deepcopy(cached), *copy.deepcopy(delta_input)]
+    cached_items = _drop_replayed_compaction_triggers(copy.deepcopy(cached))
+    expanded = [*cached_items, *copy.deepcopy(delta_input)]
     if context == "compaction":
         log_compaction_cache_expansion(
             context=context,
@@ -326,6 +356,25 @@ def clear_persisted_lookup_ids(items: list[Any], *, drop_all: bool = False) -> t
     return output, cleared
 
 
+def relocate_terminal_compaction_trigger(items: list[Any]) -> list[Any]:
+    """Enforce the upstream contract: a live trigger must be the final item.
+
+    Orphan synthesis can append items after a client-sent trailing trigger;
+    move the last trigger back to the end (stale earlier ones are dropped).
+    """
+    trigger_indexes = [
+        index
+        for index, item in enumerate(items)
+        if isinstance(item, dict) and item.get("type") == "compaction_trigger"
+    ]
+    if not trigger_indexes or trigger_indexes[-1] == len(items) - 1:
+        return items
+    last_trigger = items[trigger_indexes[-1]]
+    stale = set(trigger_indexes)
+    kept = [item for index, item in enumerate(items) if index not in stale]
+    return [*kept, last_trigger]
+
+
 def prepare_responses_input_items(
     *,
     cache: ConversationCache | None,
@@ -351,6 +400,7 @@ def prepare_responses_input_items(
         aligned, warnings = synthesize_orphan_tool_calls(aligned, name_resolver=name_resolver)
         aligned, extra = synthesize_missing_tool_outputs(aligned)
         warnings = [*warnings, *extra]
+    aligned = relocate_terminal_compaction_trigger(aligned)
     stateless_replay = expand_enabled and isinstance(previous_response_id, str) and bool(previous_response_id)
     cleared_items, cleared = clear_persisted_lookup_ids(aligned, drop_all=stateless_replay)
     if cleared:
@@ -401,6 +451,8 @@ def apply_responses_input_pipeline_to_body(
 def sanitize_compaction_input_with_pipeline(
     input_items: list[Any],
 ) -> tuple[list[Any], list[str], CompactionSanitizationAudit]:
+    from .compaction.input_audit import CompactionSanitizationAudit
+
     audit = CompactionSanitizationAudit(incoming_items=len(input_items))
     if not input_items:
         audit.outgoing_items = 0
